@@ -41,12 +41,12 @@ pkgver=0.4.3
 pkgrel=1
 pkgdesc="Universal AI chat history database with full-text search"
 arch=('x86_64' 'aarch64')
-url="https://github.com/byteowlz/hstry"
+url="https://github.com/andrew05060414/chronicle"
 license=('MIT')
 depends=('gcc-libs' 'sqlite')
 optdepends=('bash: for shell completions' 'zsh: for shell completions')
-source_x86_64=("$pkgname-$pkgver.tar.gz::https://github.com/byteowlz/hstry/releases/download/v$pkgver/hstry-v$pkgver-x86_64-unknown-linux-gnu.tar.gz")
-source_aarch64=("$pkgname-$pkgver.tar.gz::https://github.com/byteowlz/hstry/releases/download/v$pkgver/hstry-v$pkgver-aarch64-unknown-linux-gnu.tar.gz")
+source_x86_64=("$pkgname-$pkgver.tar.gz::https://github.com/andrew05060414/chronicle/releases/download/v$pkgver/hstry-v$pkgver-x86_64-unknown-linux-gnu.tar.gz")
+source_aarch64=("$pkgname-$pkgver.tar.gz::https://github.com/andrew05060414/chronicle/releases/download/v$pkgver/hstry-v$pkgver-aarch64-unknown-linux-gnu.tar.gz")
 sha256sums_x86_64=('TBD')
 sha256sums_aarch64=('TBD')
 
@@ -67,7 +67,7 @@ pkgbase = hstry
 	pkgdesc = Universal AI chat history database with full-text search
 	pkgver = 0.4.3
 	pkgrel = 1
-	url = https://github.com/byteowlz/hstry
+	url = https://github.com/andrew05060414/chronicle
 	arch = x86_64
 	arch = aarch64
 	license = MIT
@@ -75,9 +75,9 @@ pkgbase = hstry
 	depends = sqlite
 	optdepends = bash: for shell completions
 	optdepends = zsh: for shell completions
-	source_x86_64 = hstry-0.4.3.tar.gz::https://github.com/byteowlz/hstry/releases/download/v0.4.3/hstry-v0.4.3-x86_64-unknown-linux-gnu.tar.gz
+	source_x86_64 = hstry-0.4.3.tar.gz::https://github.com/andrew05060414/chronicle/releases/download/v0.4.3/hstry-v0.4.3-x86_64-unknown-linux-gnu.tar.gz
 	sha256sums_x86_64 = TBD
-	source_aarch64 = hstry-0.4.3.tar.gz::https://github.com/byteowlz/hstry/releases/download/v0.4.3/hstry-v0.4.3-aarch64-unknown-linux-gnu.tar.gz
+	source_aarch64 = hstry-0.4.3.tar.gz::https://github.com/andrew05060414/chronicle/releases/download/v0.4.3/hstry-v0.4.3-aarch64-unknown-linux-gnu.tar.gz
 	sha256sums_aarch64 = TBD
 
 pkgname = hstry
@@ -100,7 +100,7 @@ echo "3. Test SSH connection:"
 echo "   ssh -i ~/.ssh/aur aur@aur.archlinux.org"
 echo ""
 echo "4. Add AUR_SSH_PRIVATE_KEY and AUR_EMAIL secrets to your hstry repository:"
-echo "   - Go to https://github.com/byteowlz/hstry/settings/secrets/actions"
+echo "   - Go to https://github.com/andrew05060414/chronicle/settings/secrets/actions"
 echo "   - Add AUR_SSH_PRIVATE_KEY with the content of ~/.ssh/aur"
 echo "   - Add AUR_EMAIL with your email address"
 echo ""

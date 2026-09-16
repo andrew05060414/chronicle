@@ -40,7 +40,7 @@ echo ""
 echo "Required secret: TAP_GITHUB_TOKEN"
 echo "  - Generate a PAT at: https://github.com/settings/tokens"
 echo "  - Add 'repo' scope"
-echo "  - Add secret at: https://github.com/byteowlz/hstry/settings/secrets/actions"
+echo "  - Add secret at: https://github.com/andrew05060414/chronicle/settings/secrets/actions"
 echo ""
 
 # Check if formula exists
@@ -73,7 +73,7 @@ echo ""
 echo "Required secrets for AUR:"
 echo "  - AUR_SSH_PRIVATE_KEY: Content of ~/.ssh/aur"
 echo "  - AUR_EMAIL: Your email address"
-echo "  Add secrets at: https://github.com/byteowlz/hstry/settings/secrets/actions"
+echo "  Add secrets at: https://github.com/andrew05060414/chronicle/settings/secrets/actions"
 echo ""
 
 # Check if package exists in AUR

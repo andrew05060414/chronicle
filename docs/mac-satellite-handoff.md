@@ -27,13 +27,13 @@
 ## 已确认事实（2026-08-22）
 
 - NAS：`admin@memini-b506.tail76a98f.ts.net`（备选：局域网 `memini-b506` / `192.168.0.102`）
-- NAS 二进制：`hstry 1.0.0`（fork `andrew05060414/hstry`，`release/1.0` @ `f33b831`）
+- NAS 二进制：`hstry 1.0.0`（fork `andrew05060414/chronicle`，`release/1.0` @ `f33b831`）
 - NAS live 配置：`~/.config/hstry/config.toml` 里
   `database = "/vol1/1000/Code/hstry backup/hstry-win.db"`
   `sync.mode = "hub"`
 - Live 库现状：仅 `arknights:*`，15 源 / 2768 会话 / 126047 消息
 - 同目录 `hstry.db`（195MB，8/16）是旧 Mac 冷档案。不是 live。不要 push 到它。
-- 仓库：https://github.com/andrew05060414/hstry  tag/branch `v1.0.0`
+- 仓库：https://github.com/andrew05060414/chronicle  tag/branch `v1.0.0`
 - 本机 staging：`~/.local/share/hstry/staging.db`
 - 本机配置：`~/.config/hstry/config.toml`
 - Adapters：`~/.config/hstry/adapters`，`js_runtime = "node"`
@@ -66,12 +66,12 @@ SSH 不通就停，把错误贴给我。不要改 NAS 上的 database 路径。
 
 ```bash
 # 已有 rustup 就用这个；没有再 brew install rust
-cargo install --git https://github.com/andrew05060414/hstry --tag v1.0.0 hstry-cli
+cargo install --git https://github.com/andrew05060414/chronicle --tag v1.0.0 hstry-cli
 hstry -V   # → 1.0.0
 
 brew install node   # 若还没有
 mkdir -p ~/.config/hstry/adapters ~/.local/share/hstry
-git clone --depth 1 --branch v1.0.0 https://github.com/andrew05060414/hstry /tmp/hstry-1.0.0
+git clone --depth 1 --branch v1.0.0 https://github.com/andrew05060414/chronicle /tmp/hstry-1.0.0
 cp -R /tmp/hstry-1.0.0/adapters/. ~/.config/hstry/adapters/
 cd ~/.config/hstry/adapters && npm install
 ```

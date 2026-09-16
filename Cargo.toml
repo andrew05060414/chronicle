@@ -13,7 +13,7 @@ members = [
 version = "1.0.0"
 edition = "2024"
 license = "MIT"
-repository = "https://github.com/andrew05060414/hstry"
+repository = "https://github.com/andrew05060414/chronicle"
 
 [workspace.dependencies]
 # Shared across workspace

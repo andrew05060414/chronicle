@@ -33,7 +33,7 @@ Upstream last consumed here is `v0.5.21` (`c8923f1`). Upstream `v0.5.22` (TUI ov
 
 ## [1.0.0] - 2026-08-21
 
-Fork 1.0: local agent archive + NAS hub/satellite. Canonical remote is `andrew05060414/hstry`.
+Fork 1.0: local agent archive + NAS hub/satellite. Canonical remote is `andrew05060414/chronicle`.
 
 ### Added
 

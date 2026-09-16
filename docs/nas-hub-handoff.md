@@ -44,7 +44,7 @@ node -v || echo "需 Node LTS（NAS 已有 fnm/Node LTS）"
 mkdir -p "$NAS_ROOT/adapters" "$NAS_ROOT/inbox" ~/.config/hstry
 
 # 3. 获取 adapters + 二进制（二选一）
-git clone --depth 1 --branch v1.0.0 https://github.com/andrew05060414/hstry /tmp/hstry
+git clone --depth 1 --branch v1.0.0 https://github.com/andrew05060414/chronicle /tmp/hstry
 cp -r /tmp/hstry/adapters/* "$NAS_ROOT/adapters/"
 # hstry 二进制：cargo install --path /tmp/hstry/crates/hstry-cli  或 release 下载
 

@@ -1,6 +1,8 @@
-# hstry
+# Chronicle
 
-Personal fork of [byteowlz/hstry](https://github.com/byteowlz/hstry). Canonical repo: [andrew05060414/hstry](https://github.com/andrew05060414/hstry).
+Chronicle is the public product name for this local-first history system. The
+implementation grew from the [byteowlz/hstry](https://github.com/byteowlz/hstry)
+engine and is maintained at [andrew05060414/chronicle](https://github.com/andrew05060414/chronicle).
 
 **Spoken / connecting-layer name: Chronicle.** Product home: [andrew05060414/chronicle](https://github.com/andrew05060414/chronicle). Commands: `chronicle` and `hstry` are the same binary. Crate names, `%APPDATA%\hstry\`, and the database path stay `hstry` so upstream merges do not explode. Upstream remains `byteowlz/hstry`.
 
@@ -30,8 +32,8 @@ This fork is installed from source. Upstream Homebrew / AUR / Scoop packages tra
 ### Cargo (this repo)
 
 ```bash
-git clone https://github.com/andrew05060414/hstry.git
-cd hstry
+git clone https://github.com/andrew05060414/chronicle.git
+cd chronicle
 cargo install --path crates/hstry-cli
 ```
 
@@ -50,8 +52,8 @@ cargo install --path crates/hstry-mcp
 ### Build from Source
 
 ```bash
-git clone https://github.com/andrew05060414/hstry.git
-cd hstry
+git clone https://github.com/andrew05060414/chronicle.git
+cd chronicle
 cargo build --release --workspace
 ```
 
@@ -446,7 +448,10 @@ chronicle skills audit
 chronicle tui
 ```
 
-3-2-1 backup uses the **configured live database** only (typically `D:/Data/hstry/staging.db` on this machine). `--encrypt` requires `CHRONICLE_BACKUP_KEY`; there is no default passphrase. If `rclone` is missing, the Google Drive step is `skipped` (not `ok`).
+3-2-1 backup uses the **configured live database** only. Set the database path
+in your own config; no private machine path is required or assumed.
+`--encrypt` requires `CHRONICLE_BACKUP_KEY`; there is no default passphrase. If
+`rclone` is missing, the Google Drive step is `skipped` (not `ok`).
 
 Not on this bus: CTX, AMS, Mem0, the jobs tracker, knowledge-hub.
 
@@ -454,7 +459,7 @@ Daily NAS sync can optionally chain offsite copies via `hstry-daily-sync.ps1 -Of
 
 ## Contributing
 
-This is a personal fork. Issues live in `.trx/`. See [CHANGELOG.md](CHANGELOG.md) for 1.0 notes.
+Issues live in `.trx/`. See [CHANGELOG.md](CHANGELOG.md) for release notes.
 
 ## Release Notes
 
@@ -462,11 +467,18 @@ See [CHANGELOG.md](CHANGELOG.md) for the full list of changes.
 
 ## Release Process
 
-Tags on this fork (`v1.0.0` and later) are cut from `release/1.0`. Upstream GitHub Actions still document Homebrew/AUR for `byteowlz/hstry`; this fork does not publish those packages. See [docs/RELEASE.md](docs/RELEASE.md) if you need the original automation layout.
+Tags are cut from the branch selected by the release owner. Upstream
+Homebrew/AUR references for `byteowlz/hstry` are retained as historical
+infrastructure notes; they are not a claim that Chronicle packages are
+published. See [docs/RELEASE.md](docs/RELEASE.md) before changing automation.
 
 ## Attribution
 
-This project is inspired by and references ideas from **cross-agent-session-search (cass)** by Jeffrey Emanuel. Source: https://github.com/Dicklesworthstone/coding_agent_session_search (MIT License).
+See [docs/ATTRIBUTION.md](docs/ATTRIBUTION.md) for the distinction between the
+upstream engine, fork changes, and Chronicle's product structure and
+integration. This project also references ideas from **cross-agent-session-search
+(cass)** by Jeffrey Emanuel. Source:
+https://github.com/Dicklesworthstone/coding_agent_session_search (MIT License).
 
 ## License
 

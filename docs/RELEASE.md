@@ -25,7 +25,7 @@ The Homebrew tap is already set up at `byteowlz/homebrew-tap`.
    - Generate and copy the token
 
 2. Add the secret to the hstry repository:
-   - Go to https://github.com/byteowlz/hstry/settings/secrets/actions
+   - Go to https://github.com/andrew05060414/chronicle/settings/secrets/actions
    - Click "New repository secret"
    - Name: `TAP_GITHUB_TOKEN`
    - Value: Your PAT
@@ -65,7 +65,7 @@ You should see a welcome message.
    ```
 
 2. Add secrets to the hstry repository:
-   - Go to https://github.com/byteowlz/hstry/settings/secrets/actions
+   - Go to https://github.com/andrew05060414/chronicle/settings/secrets/actions
    - Click "New repository secret"
    - Name: `AUR_SSH_PRIVATE_KEY`
    - Value: Content of `~/.ssh/aur` (the private key)
@@ -130,7 +130,7 @@ Note: You'll need an AUR account to do this.
 
 If you need to re-release or trigger manually:
 
-1. Go to https://github.com/byteowlz/hstry/actions
+1. Go to https://github.com/andrew05060414/chronicle/actions
 2. Click "Release" workflow
 3. Click "Run workflow"
 4. Select branch and enter the tag (e.g., `v0.4.4`)
@@ -164,7 +164,7 @@ Each release includes:
 
 ### Verify GitHub Release
 
-1. Go to https://github.com/byteowlz/hstry/releases
+1. Go to https://github.com/andrew05060414/chronicle/releases
 2. Download the binary for your platform
 3. Verify checksum:
    ```bash
@@ -199,7 +199,7 @@ makepkg -si
 ### Homebrew Update Failed
 
 Check the workflow run logs:
-- Go to https://github.com/byteowlz/hstry/actions
+- Go to https://github.com/andrew05060414/chronicle/actions
 - Find the "publish-homebrew" job
 - Check for errors
 
@@ -211,7 +211,7 @@ Common issues:
 ### AUR Update Failed
 
 Check the workflow run logs:
-- Go to https://github.com/byteowlz/hstry/actions
+- Go to https://github.com/andrew05060414/chronicle/actions
 - Find the "publish-aur" job
 - Check for errors
 

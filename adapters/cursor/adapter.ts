@@ -722,17 +722,18 @@ function loadAllCursorSessions(inputPath: string, opts?: ParseOptions): Conversa
     return true;
   };
 
-  const full = (): boolean => limit > 0 && conversations.length >= limit;
+  // NOTE: collect the FULL candidate set before sorting + slicing (#15).
+  // Short-circuiting collection at `limit` returns whichever sessions the
+  // filesystem walk happens to find first, not the newest ones.
   const roots = expandScanRoots(inputPath);
 
   for (const root of roots) {
-    if (!existsSync(root) || full()) continue;
+    if (!existsSync(root)) continue;
 
     // 1. Primary: load live sessions from SQLite state.vscdb
     if (root.endsWith('state.vscdb') || basename(root) === 'state.vscdb') {
       for (const conv of loadFromDb(root, opts)) {
         add(conv);
-        if (full()) break;
       }
     } else {
       const dbFiles = walkFiles(root, (name) => name === 'state.vscdb');
@@ -743,15 +744,11 @@ function loadAllCursorSessions(inputPath: string, opts?: ParseOptions): Conversa
       });
 
       for (const dbPath of dbFiles) {
-        if (full()) break;
         for (const conv of loadFromDb(dbPath, opts)) {
           add(conv);
-          if (full()) break;
         }
       }
     }
-
-    if (full()) continue;
 
     // 2. Secondary: fill in any historical sessions only present in offline snapshots (.json / .json.gz)
     const snapshots = walkFiles(root, isSnapshotFile).sort((a, b) => {
@@ -763,7 +760,6 @@ function loadAllCursorSessions(inputPath: string, opts?: ParseOptions): Conversa
     });
 
     for (const snap of snapshots) {
-      if (full()) break;
       try {
         add(parseSnapshotFile(snap, opts));
       } catch {

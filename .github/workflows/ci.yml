@@ -67,4 +67,7 @@ jobs:
       - run: bun run adapters/gemini-cli/test.js
       - run: bun run adapters/workbuddy/test.js
       - name: Node adapter regressions (*.regression.mjs)
-        run: ./scripts/ci/run-adapter-regressions.sh
+        # `bash` invocation (not `./`) so the runner executes even if the
+        # executable bit is ever lost in a checkout; the mode is also
+        # committed as 755 in git.
+        run: bash ./scripts/ci/run-adapter-regressions.sh

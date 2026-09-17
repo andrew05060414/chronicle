@@ -265,6 +265,53 @@ pub fn prune_checkpoints(dir: &Path, config: &CheckpointConfig) -> Result<Vec<Pa
     Ok(deleted)
 }
 
+/// Remove `path` if it exists, retrying briefly before giving up.
+///
+/// On Windows the OS may momentarily keep a file locked right after the last
+/// handle closed, even though every owner already released it correctly via
+/// `Database::close` (WAL checkpoint first, then pool shutdown). The retry
+/// is bounded (about 5s) and the last error propagates, so a genuine handle
+/// leak still fails loudly instead of being masked.
+fn remove_file_for_replace(path: &Path) -> Result<()> {
+    let mut last_err = None;
+    for _ in 0..50 {
+        match fs::remove_file(path) {
+            Ok(()) => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => {
+                last_err = Some(e);
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        }
+    }
+    Err(last_err
+        .map(Error::Io)
+        .unwrap_or_else(|| Error::Other("failed to remove file for restore".to_string())))
+}
+
+/// Create `path` for the restored database, retrying briefly: the create can
+/// race the same Windows handle-release latency as the removal above.
+/// Bounded, with the last error propagated.
+fn create_file_for_replace(path: &Path) -> Result<File> {
+    let mut last_err = None;
+    for _ in 0..50 {
+        match File::create(path) {
+            Ok(file) => return Ok(file),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Parent vanished mid-restore; do not spin on it.
+                return Err(Error::Io(e));
+            }
+            Err(e) => {
+                last_err = Some(e);
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        }
+    }
+    Err(last_err
+        .map(Error::Io)
+        .unwrap_or_else(|| Error::Other("failed to create file for restore".to_string())))
+}
+
 pub fn restore_checkpoint(dir: &Path, stem: &str, dest: &Path) -> Result<PathBuf> {
     let archive = archive_path(dir, stem);
     if !archive.exists() {
@@ -281,12 +328,10 @@ pub fn restore_checkpoint(dir: &Path, stem: &str, dest: &Path) -> Result<PathBuf
     // any stale `-wal`/`-shm`/`-journal` sidecars so a previous incarnation
     // of the file can never replay over the restored database — on Windows
     // a leftover sidecar also keeps the restore target logically locked.
-    if dest.exists() {
-        fs::remove_file(dest)?;
-    }
+    remove_file_for_replace(dest)?;
     crate::test_guard::remove_sidecars(dest);
     let input = BufReader::new(File::open(&archive)?);
-    let output = BufWriter::new(File::create(dest)?);
+    let output = BufWriter::new(create_file_for_replace(dest)?);
     zstd::stream::copy_decode(input, output)?;
     Ok(dest.to_path_buf())
 }

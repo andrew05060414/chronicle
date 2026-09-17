@@ -62,7 +62,7 @@ fi
 
 if command -v node >/dev/null 2>&1; then
   echo "== pre-pr: adapter regressions (node)"
-  ./scripts/ci/run-adapter-regressions.sh
+  bash ./scripts/ci/run-adapter-regressions.sh
 else
   echo "pre-pr: node not installed; cannot run *.regression.mjs gate" >&2
   exit 1

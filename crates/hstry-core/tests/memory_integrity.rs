@@ -238,9 +238,19 @@ async fn checkpoint_mutate_restore_preserves_sentinels() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn wal_shm_lifecycle_closed_before_replace() -> anyhow::Result<()> {
-    // Windows holds an open SQLite file locked (os error 32). The gate
-    // contract is: every handle is closed (WAL checkpointed via
-    // `Database::close`) before a restore replaces the file.
+    // Real product restore semantics: restores target a scratch/sibling slot
+    // (e.g. `<stem>.restore.db` via `default_restore_path`), never an open
+    // live database. On main, `checkpoint restore --live` still holds the
+    // pool open across the replacement -- that overwrite-while-open sequence
+    // is a separately owned defect (PR #30), so the gate must not model it.
+    //
+    // This test reuses one slot path across two incarnations, which is what
+    // the product does every time it restores into the same `*.restore.db`
+    // slot: open the slot, close it (WAL checkpointed on close), plant stale
+    // `-wal`/`-shm` sidecars simulating an unclean prior lifecycle, then
+    // restore over the closed slot. The restore must succeed, clear the
+    // sidecars so they can never replay over the restored file, and preserve
+    // sentinels with a clean `quick_check`.
     let (_tmp, db_path) = isolated_temp_db("integrity-gate-lifecycle");
     let tmp_dir: PathBuf = _tmp.path().to_path_buf();
     let cfg = checkpoint_config(&tmp_dir);
@@ -250,14 +260,25 @@ async fn wal_shm_lifecycle_closed_before_replace() -> anyhow::Result<()> {
     let created = create_checkpoint(&db, &db_path, &cfg, Some(false)).await?;
     db.close().await;
 
-    // All handles closed: restoring directly over the live path must succeed
-    // on every platform, including Windows.
-    restore_checkpoint(
-        &tmp_dir.join("checkpoints"),
-        &created.manifest.stem,
-        &db_path,
-    )?;
-    let reopened = Database::open(&db_path).await?;
+    // First incarnation of the restore slot: previously hosted live handles,
+    // now released via `close`.
+    let slot = tmp_dir.join("restore-slot.db");
+    let prior = Database::open(&slot).await?;
+    prior.close().await;
+
+    // Stale sidecars: restore must clear them (Windows also treats a
+    // leftover sidecar as a lock on the restore target).
+    let stale_wal = format!("{}-wal", slot.display());
+    let stale_shm = format!("{}-shm", slot.display());
+    std::fs::write(&stale_wal, b"stale")?;
+    std::fs::write(&stale_shm, b"stale")?;
+    restore_checkpoint(&tmp_dir.join("checkpoints"), &created.manifest.stem, &slot)?;
+    anyhow::ensure!(
+        !Path::new(&stale_wal).exists() && !Path::new(&stale_shm).exists(),
+        "stale WAL/SHM sidecars must be removed by restore"
+    );
+
+    let reopened = Database::open(&slot).await?;
     assert_sentinels_present(&reopened).await?;
     reopened.close().await;
     Ok(())

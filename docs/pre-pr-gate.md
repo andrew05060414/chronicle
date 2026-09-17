@@ -69,9 +69,18 @@ semantics differ (open SQLite files lock on Windows). No step uses
    conversation lands) -> restore over scratch again -> `quick_check` plus
    sentinel and row-count preservation; a planted stale `-wal` sidecar must
    be cleared by restore so it can never replay over the restored file.
-5. WAL/SHM-sensitive lifecycle: all handles closed (`Database::close`
-   checkpoints WAL first) before a restore replaces the file — restoring
-   directly over the live path must succeed on Windows.
+5. WAL/SHM-sensitive lifecycle on the real product pattern: restores
+   target a scratch/sibling slot (as `default_restore_path` does), never an
+   open live database. The test reuses one slot across two incarnations
+   (open -> close with WAL checkpoint -> plant stale `-wal`/`-shm` ->
+   restore over the closed slot), asserting the replace succeeds, stale
+   sidecars are cleared, and sentinels survive. Note: on `main`,
+   `checkpoint restore --live` still replaces the file while the pool is
+   open; that overwrite-while-open sequence is a separately owned defect
+   (PR #30) and is deliberately not modeled here. `restore_checkpoint`
+   additionally tolerates Windows handle-release latency with a bounded
+   (~5s) remove/create retry whose last error propagates, so a genuine
+   leak still fails loudly.
 6. Fetched/full-sync validation helpers
    (`Database::validate_hstry_database_file`, read-only, local temp files
    only): a valid archive passes; a corrupt file and a SQLite file without

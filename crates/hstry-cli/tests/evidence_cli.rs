@@ -171,3 +171,86 @@ async fn ssh_reads_enforce_peer_side_budgets_and_reject_old_peers() -> anyhow::R
     assert!(!c.output()?.status.success());
     Ok(())
 }
+
+#[tokio::test]
+async fn checkpoint_restore_live_closes_handles_and_creates_safety_snapshot() -> anyhow::Result<()>
+{
+    let (dir, config_path, _id) = fixture().await?;
+    let mut config: hstry_core::Config = toml::from_str(&fs::read_to_string(&config_path)?)?;
+    config.checkpoint.enabled = true;
+    let chk_dir = dir.path().join("checkpoints");
+    config.checkpoint.dir = Some(chk_dir.clone());
+    fs::write(&config_path, toml::to_string(&config)?)?;
+
+    // Create an initial checkpoint
+    let mut c = cmd(&config_path);
+    c.args(["checkpoint", "create", "--json"]);
+    let out = output(c)?;
+    assert_eq!(out["ok"], true);
+    let stem = out["result"]["stem"].as_str().unwrap().to_string();
+
+    // Verify initial count is 1 conversation
+    let db = Database::open(&config.database).await?;
+    let convs_before = db.list_conversations(Default::default()).await?;
+    assert_eq!(convs_before.len(), 1);
+
+    // Ingest a second conversation into the live database
+    let conv2 = serde_json::from_value(
+        json!({"externalId":"second-conv","createdAt":1767225700000_i64,"messages":[{"role":"user","content":"second query"}]}),
+    )?;
+    ingest_batch(&db, "test", vec![conv2]).await?;
+    let convs_after = db.list_conversations(Default::default()).await?;
+    assert_eq!(convs_after.len(), 2);
+    db.close().await;
+
+    // Perform live restore of the first checkpoint
+    let mut c = cmd(&config_path);
+    c.args(["checkpoint", "restore", &stem, "--live", "--json"]);
+    let restore_out = output(c)?;
+    assert_eq!(restore_out["ok"], true);
+    assert_eq!(restore_out["result"]["live"], true);
+
+    // Verify live DB was restored back to 1 conversation
+    let db = Database::open(&config.database).await?;
+    let convs_restored = db.list_conversations(Default::default()).await?;
+    assert_eq!(convs_restored.len(), 1);
+    assert_eq!(
+        convs_restored[0].id.to_string(),
+        convs_before[0].id.to_string()
+    );
+    db.close().await;
+
+    // Verify that the pre-restore safety snapshot was created in checkpoints directory (total 2 checkpoints)
+    let mut c = cmd(&config_path);
+    c.args(["checkpoint", "list", "--json"]);
+    let list_out = output(c)?;
+    assert_eq!(list_out["ok"], true);
+    let manifests = list_out["result"].as_array().unwrap();
+    assert_eq!(
+        manifests.len(),
+        2,
+        "must retain initial checkpoint and safety checkpoint"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn checkpoint_restore_refuses_staging_db() -> anyhow::Result<()> {
+    let (dir, config_path, _id) = fixture().await?;
+    let mut config: hstry_core::Config = toml::from_str(&fs::read_to_string(&config_path)?)?;
+    let staging_path = dir.path().join("staging.db");
+    config.database = staging_path.clone();
+    fs::write(&config_path, toml::to_string(&config)?)?;
+
+    let mut c = cmd(&config_path);
+    c.args(["checkpoint", "restore", "dummy-stem", "--live"]);
+    let res = c.output()?;
+    assert!(!res.status.success());
+    let stderr = String::from_utf8_lossy(&res.stderr);
+    assert!(
+        stderr.contains("refusing to restore a checkpoint onto staging.db"),
+        "stderr was: {stderr}"
+    );
+    Ok(())
+}

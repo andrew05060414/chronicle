@@ -333,10 +333,11 @@ pub fn fetch_remote(config: &RemoteConfig) -> Result<FetchResult> {
 fn merge_source_metadata(existing: &Source, incoming: &Source) -> Option<Source> {
     let incoming_ts = incoming.last_sync_at?;
 
-    if let Some(existing_ts) = existing.last_sync_at {
-        if incoming_ts < existing_ts {
-            return None;
-        }
+    if existing
+        .last_sync_at
+        .is_some_and(|existing_ts| incoming_ts < existing_ts)
+    {
+        return None;
     }
 
     let merged_last_sync = match existing.last_sync_at {
@@ -391,11 +392,12 @@ pub async fn merge_databases(
                 sources_added += 1;
             }
             Some(existing_source) => {
-                if let Some(merged) = merge_source_metadata(&existing_source, &remote_source) {
-                    if source_metadata_changed(&existing_source, &merged) {
+                match merge_source_metadata(&existing_source, &remote_source) {
+                    Some(merged) if source_metadata_changed(&existing_source, &merged) => {
                         target.upsert_source(&merged).await?;
                         sources_updated += 1;
                     }
+                    _ => {}
                 }
             }
         }

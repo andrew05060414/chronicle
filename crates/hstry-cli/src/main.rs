@@ -2517,10 +2517,10 @@ fn source_quality_rank(
     sources: &std::collections::HashMap<String, hstry_core::models::Source>,
     harness: Option<&str>,
 ) -> u8 {
-    if let Some(source) = sources.get(source_id) {
-        if source.adapter == "cursor" {
-            return cursor_source_path_rank(source.path.as_deref().unwrap_or(""));
-        }
+    if let Some(source) = sources.get(source_id)
+        && source.adapter == "cursor"
+    {
+        return cursor_source_path_rank(source.path.as_deref().unwrap_or(""));
     }
     source_preference(source_id, harness)
 }
@@ -6667,8 +6667,8 @@ async fn cmd_checkpoint(
                 return Ok(());
             }
             println!(
-                "{:<22} {:>8} {:>8} {:>8} {:>10} {}",
-                "STEM", "CONVS", "MSGS", "SRCS", "SIZE", "TAGS"
+                "{:<22} {:>8} {:>8} {:>8} {:>10} TAGS",
+                "STEM", "CONVS", "MSGS", "SRCS", "SIZE"
             );
             for item in listed {
                 let tag = if item.manifest.weekly {

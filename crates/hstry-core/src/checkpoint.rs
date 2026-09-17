@@ -147,7 +147,7 @@ pub fn list_checkpoints(dir: &Path) -> Result<Vec<CheckpointInfo>> {
             manifest_path: path,
         });
     }
-    out.sort_by(|a, b| b.manifest.created_at.cmp(&a.manifest.created_at));
+    out.sort_by_key(|a| std::cmp::Reverse(a.manifest.created_at));
     Ok(out)
 }
 

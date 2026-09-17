@@ -188,7 +188,7 @@ hstry resume --limit 10
 | `remote add/list/remove/test/fetch/sync/status` | Manage remote hosts and sync |
 | `checkpoint create/list/restore/prune` | Rolling compressed snapshots of the live database |
 | `backup` | 3-2-1 backup: integrity check, NAS remote push, Oracle `scp`, Google Drive `rclone` |
-| `skills audit/list/sync/bootstrap` | Proxy to Andrew-Skill / ASM (not a memory store) |
+| `skills audit/list/sync/bootstrap` | Optional Andrew-Skill / ASM proxy (not a memory store) |
 | `tui` | Launch `chronicle-tui` / `hstry-tui` |
 
 Adapter installs are version-pinned to the hstry binary. Run `hstry adapters update`
@@ -290,7 +290,7 @@ hstry follows XDG Base Directory specifications on Unix, and the platform defaul
 Default config: `~/.config/hstry/config.toml` (Windows: `%APPDATA%\hstry\config.toml`)
 
 ```toml
-"$schema" = "https://raw.githubusercontent.com/byteowlz/schemas/refs/heads/main/hstry/hstry.config.schema.json"
+"$schema" = "https://raw.githubusercontent.com/andrew05060414/chronicle/main/examples/config.schema.json"
 
 database = "~/.local/share/hstry/hstry.db"
 adapter_paths = ["~/.config/hstry/adapters"]
@@ -439,13 +439,20 @@ just update-adapters-windows # Windows: copy to %APPDATA%\hstry\adapters
 ```
 ## Chronicle connecting layer
 
-`chronicle` is the speakable name for this fork's CLI. It owns the conversation archive (`search` / `peek` / `show` / `sync` / `remote` / `checkpoint` / `backup`) and proxies skill install/audit to Andrew-Skill.
+`chronicle` is the speakable name for this fork's CLI. It owns the conversation archive (`search` / `peek` / `show` / `sync` / `remote` / `checkpoint` / `backup`) and can optionally proxy skill install/audit to an external Andrew-Skill checkout.
 
 ```bash
 chronicle search "query" --scope local
 chronicle backup --dry-run
-chronicle skills audit
 chronicle tui
+```
+
+The skills commands are opt-in and are not required by the core CLI. Set
+`CHRONICLE_SKILL_ROOT` to an Andrew-Skill checkout before using them; the
+integration also requires PowerShell and `asm` on `PATH`:
+
+```bash
+CHRONICLE_SKILL_ROOT=/path/to/Andrew-Skill chronicle skills audit
 ```
 
 3-2-1 backup uses the **configured live database** only. Set the database path

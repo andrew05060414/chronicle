@@ -35,7 +35,7 @@ mod path_expansion_tests {
 
 #[cfg(test)]
 mod default_config_tests {
-    use super::super::Config;
+    use super::super::{AdapterRepoSource, Config, DEFAULT_ADAPTER_REPO};
 
     #[test]
     fn default_has_database_path() {
@@ -53,8 +53,18 @@ mod default_config_tests {
     #[test]
     fn default_has_official_adapter_repo() {
         let config = Config::default();
-        assert!(!config.adapter_repos.is_empty());
-        assert!(config.adapter_repos.iter().any(|r| r.name == "official"));
+        let official = config
+            .adapter_repos
+            .iter()
+            .find(|repo| repo.name == "official")
+            .expect("default config should include the official adapter repo");
+        match &official.source {
+            AdapterRepoSource::Git { url, path, .. } => {
+                assert_eq!(url, DEFAULT_ADAPTER_REPO);
+                assert_eq!(path, "adapters");
+            }
+            _ => panic!("default official adapter repo must use git"),
+        }
     }
 
     #[test]
@@ -152,8 +162,10 @@ mod search_scope_tests {
         let nas = remote("nas");
         let home = remote("home");
         let all = vec![nas.clone(), home.clone()];
-        let mut no_hub = Config::default();
-        no_hub.remotes = all.clone();
+        let no_hub = Config {
+            remotes: all.clone(),
+            ..Config::default()
+        };
         assert_eq!(no_hub.remotes_for_default_search().unwrap(), all);
 
         let mut config = Config::default();
@@ -231,19 +243,22 @@ mod search_index_path_tests {
 
     #[test]
     fn uses_explicit_path_when_set() {
-        let mut config = Config::default();
-        config.search = SearchConfig {
-            index_path: Some(PathBuf::from("/custom/index")),
-            index_batch_size: 500,
+        let config = Config {
+            search: SearchConfig {
+                index_path: Some(PathBuf::from("/custom/index")),
+                index_batch_size: 500,
+            },
+            ..Config::default()
         };
         assert_eq!(config.search_index_path(), PathBuf::from("/custom/index"));
     }
 
     #[test]
     fn derives_from_database_path_when_not_set() {
-        let mut config = Config::default();
-        config.database = PathBuf::from("/data/hstry/hstry.db");
-        config.search.index_path = None;
+        let config = Config {
+            database: PathBuf::from("/data/hstry/hstry.db"),
+            ..Config::default()
+        };
 
         let index_path = config.search_index_path();
         assert!(index_path.to_string_lossy().contains("search"));
@@ -258,10 +273,12 @@ mod config_serialization_tests {
 
     #[test]
     fn toml_roundtrip() {
-        let mut config = Config::default();
-        config.database = PathBuf::from("/test/db.db");
-        config.js_runtime = "bun".to_string();
-        config.workspaces = vec!["~/projects".to_string()];
+        let config = Config {
+            database: PathBuf::from("/test/db.db"),
+            js_runtime: "bun".to_string(),
+            workspaces: vec!["~/projects".to_string()],
+            ..Config::default()
+        };
 
         let toml_str = toml::to_string(&config).unwrap_or_else(|err| panic!("serialize: {err}"));
         let parsed: Config =

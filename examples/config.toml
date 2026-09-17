@@ -1,4 +1,4 @@
-#:schema https://raw.githubusercontent.com/byteowlz/schemas/refs/heads/main/hstry/hstry.config.schema.json
+#:schema https://raw.githubusercontent.com/andrew05060414/chronicle/main/examples/config.schema.json
 
 # Example hstry configuration
 
@@ -21,8 +21,8 @@ workspaces = ["~/code", "~/work"]
 [[adapter_repos]]
 name = "official"
 type = "git"
-url = "https://github.com/byteowlz/hstry"
-# git_ref = "v0.5.5"  # defaults to current hstry version
+url = "https://github.com/andrew05060414/chronicle"
+# git_ref = "v1.0.0"  # defaults to the current Chronicle version
 path = "adapters"
 enabled = true
 
@@ -122,12 +122,12 @@ session_dir = "~/.codex/sessions"
 
 [resume.agents.hermes]
 format = "hermes"
-command = "hermes --session {session_id}"
+command = "hermes --resume {session_id}"
 session_dir = "~/.hermes/sessions"
 
 [resume.agents.opencode]
 format = "opencode"
-command = "opencode"
+command = "opencode --session {session_id}"
 session_dir = "~/.local/share/opencode"
 
 [resume.agents.goose]

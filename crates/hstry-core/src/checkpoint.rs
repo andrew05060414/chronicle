@@ -147,7 +147,7 @@ pub fn list_checkpoints(dir: &Path) -> Result<Vec<CheckpointInfo>> {
             manifest_path: path,
         });
     }
-    out.sort_by(|a, b| b.manifest.created_at.cmp(&a.manifest.created_at));
+    out.sort_by_key(|a| std::cmp::Reverse(a.manifest.created_at));
     Ok(out)
 }
 
@@ -345,10 +345,12 @@ mod tests {
         .await
         .unwrap();
 
-        let mut cfg = CheckpointConfig::default();
-        cfg.enabled = true;
-        cfg.dir = Some(dir.path().join("checkpoints"));
-        cfg.max_total_bytes = 10 * 1024 * 1024;
+        let cfg = CheckpointConfig {
+            enabled: true,
+            dir: Some(dir.path().join("checkpoints")),
+            max_total_bytes: 10 * 1024 * 1024,
+            ..Default::default()
+        };
 
         let created = create_checkpoint(&db, &db_path, &cfg, Some(false))
             .await

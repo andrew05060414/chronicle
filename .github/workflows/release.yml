@@ -13,7 +13,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  BINARY_NAMES: "hstry,hstry-tui,hstry-mcp"
+  BINARY_NAMES: "hstry,chronicle,hstry-tui,chronicle-tui,hstry-mcp"
   RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
 
 permissions:
@@ -77,7 +77,7 @@ jobs:
         run: |
           cd target/${{ matrix.target }}/release
           BINARY_FILES=""
-          for bin in hstry hstry-tui hstry-mcp; do
+          for bin in ${BINARY_NAMES//,/ }; do
             if [ -f "$bin" ]; then
               BINARY_FILES="$BINARY_FILES $bin"
             fi
@@ -125,6 +125,7 @@ jobs:
 
   publish-homebrew:
     name: Publish to Homebrew
+    if: ${{ vars.ENABLE_THIRD_PARTY_PUBLISHING == 'true' }}
     needs: release
     runs-on: ubuntu-latest
     steps:
@@ -143,6 +144,7 @@ jobs:
 
   publish-aur:
     name: Publish to AUR
+    if: ${{ vars.ENABLE_THIRD_PARTY_PUBLISHING == 'true' }}
     needs: release
     runs-on: ubuntu-latest
     steps:

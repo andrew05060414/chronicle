@@ -1,9 +1,9 @@
-# hstry 档案层模型（个人部署）
+# hstry 档案层模型（通用部署）
 
-自己机器上所有 AI 对话，自动收成一份能搜、能按设备分开、坏了能在那台电脑把库拿回来的档案。  
+把多台机器上的 AI 对话收成一份能搜、能按设备分开、坏了能在目标电脑恢复的档案。
 不是聊天 App，不是记忆系统。记忆（Agent Memory）是这份档案的客户。
 
-本页冻结个人部署合同。采集优先，备份脚本见 [`restore.md`](./restore.md)。
+本页描述通用部署合同。采集优先，恢复说明见 [`restore.md`](./restore.md)。
 
 ---
 
@@ -34,9 +34,9 @@
 
 | 角色 | 位置 | 作用 |
 |------|------|------|
-| Windows satellite `arknights` | `D:/Data/hstry/staging.db` | 只收这台机刚解析到的源 |
-| Mac satellite `macbook` | `~/.local/share/hstry/staging.db` | 同上 |
-| NAS hub | `/vol1/1000/Code/hstry backup/hstry-win.db` | **唯一 live 合并目标**（同目录 `hstry.db` 是旧冷档案） |
+| Windows satellite `<windows-device>` | `C:/path/to/staging.db` | 只收这台机刚解析到的源 |
+| Mac/Linux satellite `<unix-device>` | `~/.local/share/hstry/staging.db` | 同上 |
+| NAS hub | `<hub-db-path>` | **唯一 live 合并目标** |
 | 云盘 | Google Drive 等 | **冷快照**，不是第二份 live hub |
 
 `remote sync push` = 把本机 staging **merge** 进 hub（源变成 `{device_id}:{source_id}`）。  
@@ -52,7 +52,7 @@
 - 不要把 A 机的 Cursor/Codex/agy 目录还原到 B 机。环境不同，那不是 A。
 - B（`hstry resume` / export）只在同一类环境、本机 agent 路径还在或你愿意从档案写回去时做。
 
-硬规则：**禁止把带 `arknights:` / `macbook:` 前缀的 hub 全库覆盖 staging.db 然后再 push。**  
+硬规则：**禁止把带设备前缀的 hub 全库覆盖 staging.db 然后再 push。**
 恢复下来的副本只给本机搜索（或先救回 NAS）。本机继续 `hstry sync` 本地工具，只把**这台机新采到的**推回 hub。
 
 云盘同步用 rclone / NAS Cloud Sync。hstry 不实现 Drive API。

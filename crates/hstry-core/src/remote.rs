@@ -3,7 +3,7 @@
 //! Provides fetching and bidirectional merging of hstry databases across machines.
 
 use std::collections::HashSet;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -15,7 +15,8 @@ use uuid::Uuid;
 use crate::config::RemoteConfig;
 use crate::db::{Database, SearchOptions};
 use crate::error::{Error, Result};
-use crate::models::{Conversation, ConversationWithMessages, Message, SearchHit, Source};
+use crate::models::{Conversation, ConversationWithMessages, Message, Source};
+use crate::recall::SearchReport;
 
 /// Default remote database path (XDG standard).
 pub const DEFAULT_REMOTE_DB_PATH: &str = "~/.local/share/hstry/hstry.db";
@@ -35,6 +36,12 @@ struct RemoteSearchInput {
     source: Option<String>,
     workspace: Option<String>,
     mode: Option<String>,
+    after: Option<String>,
+    before: Option<String>,
+    role: Option<Vec<String>>,
+    model: Option<String>,
+    harness_filter: Option<String>,
+    tag: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -333,10 +340,11 @@ pub fn fetch_remote(config: &RemoteConfig) -> Result<FetchResult> {
 fn merge_source_metadata(existing: &Source, incoming: &Source) -> Option<Source> {
     let incoming_ts = incoming.last_sync_at?;
 
-    if let Some(existing_ts) = existing.last_sync_at {
-        if incoming_ts < existing_ts {
-            return None;
-        }
+    if existing
+        .last_sync_at
+        .is_some_and(|existing_ts| incoming_ts < existing_ts)
+    {
+        return None;
     }
 
     let merged_last_sync = match existing.last_sync_at {
@@ -391,11 +399,12 @@ pub async fn merge_databases(
                 sources_added += 1;
             }
             Some(existing_source) => {
-                if let Some(merged) = merge_source_metadata(&existing_source, &remote_source) {
-                    if source_metadata_changed(&existing_source, &merged) {
+                match merge_source_metadata(&existing_source, &remote_source) {
+                    Some(merged) if source_metadata_changed(&existing_source, &merged) => {
                         target.upsert_source(&merged).await?;
                         sources_updated += 1;
                     }
+                    _ => {}
                 }
             }
         }
@@ -450,6 +459,16 @@ pub async fn merge_databases(
         };
 
         if should_insert {
+            let source_messages = source.get_messages(conv.id).await?;
+            let mut metadata = conv.metadata.clone();
+            if !metadata.is_object() {
+                metadata = serde_json::json!({});
+            }
+            metadata["hstry_sync"] = serde_json::json!({
+                "machine": remote_name,
+                "captured_at": Utc::now(),
+                "message_count": source_messages.len(),
+            });
             let merged_conv = Conversation {
                 id: conv_id,
                 source_id: namespaced_source_id.clone(),
@@ -465,7 +484,7 @@ pub async fn merge_databases(
                 tokens_in: conv.tokens_in,
                 tokens_out: conv.tokens_out,
                 cost_usd: conv.cost_usd,
-                metadata: conv.metadata,
+                metadata,
                 harness: conv.harness,
                 version: 0,
                 message_count: 0,
@@ -477,8 +496,7 @@ pub async fn merge_databases(
             affected_ids.push(conv_id);
             batch_convs.push(merged_conv);
 
-            // Collect messages
-            let source_messages = source.get_messages(conv.id).await?;
+            // Collect messages from the same snapshot described by hstry_sync.
             for msg in source_messages {
                 let merged_msg = Message {
                     id: Uuid::new_v4(),
@@ -838,7 +856,7 @@ pub async fn search_remote(
     config: &RemoteConfig,
     query: &str,
     opts: &SearchOptions,
-) -> Result<Vec<SearchHit>> {
+) -> Result<SearchReport> {
     let transport = SshTransport::from_config(config);
     let input = RemoteSearchInput {
         query: query.to_string(),
@@ -846,14 +864,16 @@ pub async fn search_remote(
         offset: opts.offset,
         source: opts.source_id.clone(),
         workspace: opts.workspace.clone(),
-        mode: Some(
-            match opts.mode {
-                crate::db::SearchMode::Auto => "auto",
-                crate::db::SearchMode::NaturalLanguage => "natural",
-                crate::db::SearchMode::Code => "code",
-            }
-            .to_string(),
-        ),
+        mode: Some(opts.mode.label().to_string()),
+        after: opts.after.map(|d| d.to_rfc3339()),
+        before: opts.before.map(|d| d.to_rfc3339()),
+        role: opts
+            .role
+            .as_ref()
+            .map(|r| r.split(',').map(str::to_owned).collect()),
+        model: opts.model.clone(),
+        harness_filter: opts.harness.clone(),
+        tag: opts.tag.clone(),
     };
     let payload = serde_json::to_vec(&input)?;
     let host_name = config.name.clone();
@@ -865,6 +885,8 @@ pub async fn search_remote(
             .arg("hstry")
             .arg("search")
             .arg("--json")
+            .arg("--raw")
+            .arg("--include-system")
             .arg("--input")
             .arg("-");
 
@@ -891,7 +913,7 @@ pub async fn search_remote(
             )));
         }
 
-        let response: JsonResponse<Vec<SearchHit>> = serde_json::from_slice(&output.stdout)
+        let response: JsonResponse<SearchReport> = serde_json::from_slice(&output.stdout)
             .map_err(|e| Error::Remote(format!("Failed parsing remote response: {e}")))?;
 
         if !response.ok {
@@ -907,20 +929,23 @@ pub async fn search_remote(
     .await
     .map_err(|e| Error::Remote(format!("Remote search join error: {e}")))??;
 
-    Ok(hits
-        .into_iter()
-        .map(|mut hit| {
-            hit.host = Some(host_name.clone());
-            hit
-        })
-        .collect())
+    let mut report = hits;
+    report.scope = format!("remote:{host_name}");
+    for hit in &mut report.hits {
+        hit.host = Some(host_name.clone());
+        hit.provenance.machine = Some(host_name.clone());
+    }
+    for store in &mut report.stores {
+        store.machine = Some(host_name.clone());
+    }
+    Ok(report)
 }
 
 pub async fn search_remotes(
     remotes: &[RemoteConfig],
     query: &str,
     opts: &SearchOptions,
-) -> Result<Vec<SearchHit>> {
+) -> Result<SearchReport> {
     let mut set = JoinSet::new();
     for remote in remotes.iter().filter(|r| r.enabled) {
         let remote = remote.clone();
@@ -929,16 +954,57 @@ pub async fn search_remotes(
         set.spawn(async move { search_remote(&remote, &query, &opts).await });
     }
 
-    let mut hits = Vec::new();
+    let mut hits = SearchReport {
+        scope: "remote".into(),
+        ..Default::default()
+    };
     while let Some(result) = set.join_next().await {
         match result {
-            Ok(Ok(remote_hits)) => hits.extend(remote_hits),
+            Ok(Ok(remote)) => {
+                hits.filters = remote.filters;
+                hits.offset = remote.offset;
+                hits.hits.extend(remote.hits);
+                hits.stores.extend(remote.stores);
+                hits.attempts.extend(remote.attempts);
+                hits.warnings.extend(remote.warnings);
+                hits.has_more |= remote.has_more;
+            }
             Ok(Err(err)) => return Err(err),
             Err(err) => return Err(Error::Remote(format!("Remote search task failed: {err}"))),
         }
     }
 
     Ok(hits)
+}
+
+/// Read on the source. Older/unbounded peers are rejected, never silently hydrated.
+pub async fn read_remote(
+    config: &RemoteConfig,
+    id: &str,
+    options: &crate::read::ReadOptions,
+) -> Result<crate::read::ReadPage> {
+    let mut options = options.clone();
+    options.machine = Some(config.name.clone());
+    options.validate()?;
+    let max_chars = options.max_chars;
+    let payload = serde_json::to_vec(&serde_json::json!({"id":id,"options":options}))?;
+    let transport = SshTransport::from_config(config);
+    let host = config.host.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut command=transport.ssh_command();
+        let mut child=command.arg(host).arg("hstry read --json --input -").stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null()).spawn()?;
+        if let Some(mut stdin)=child.stdin.take() {stdin.write_all(&payload)?;}
+        let mut output=Vec::new();
+        let cap=max_chars*4+1;
+        if let Some(stdout)=child.stdout.take() {stdout.take(cap as u64).read_to_end(&mut output)?;}
+        if output.len()>=cap {let _=child.kill();let _=child.wait();return Err(Error::Remote("Peer exceeded bounded read protocol; upgrade the peer".into()));}
+        let status=child.wait()?;
+        if !status.success() {return Err(Error::Remote("Remote bounded read failed; verify ID/options and upgrade the peer if read is unsupported".into()));}
+        let response:JsonResponse<crate::read::ReadPage>=serde_json::from_slice(&output).map_err(|_|Error::Remote("Incompatible bounded read response; upgrade the peer".into()))?;
+        let page=response.result.filter(|p|response.ok && p.protocol==1 && p.machine==options.machine).ok_or_else(||Error::Remote("Peer rejected bounded read protocol".into()))?;
+        if String::from_utf8_lossy(&output).chars().count()>max_chars {return Err(Error::Remote("Peer exceeded serialized read budget".into()));}
+        Ok(page)
+    }).await.map_err(|e|Error::Remote(format!("Remote read task failed: {e}")))?
 }
 
 pub async fn show_remote(
@@ -957,6 +1023,7 @@ pub async fn show_remote(
         cmd.arg(host)
             .arg("hstry")
             .arg("show")
+            .arg("--full")
             .arg("--json")
             .arg("--input")
             .arg("-");

@@ -45,13 +45,13 @@ auto_sync_interval_secs = 300
 ```
 
 - **`database_path`** — absolute path to the hub’s SQLite file on the remote host. Must match the hub config exactly (including spaces).
-- **`device_id`** — stable per machine (`laptop`, `desktop`, `macbook`). Do not rely on the legacy hardcoded `local:` prefix.
+- **`device_id`** — stable per machine (`laptop`, `desktop`, `workstation`). Do not rely on the legacy hardcoded `local:` prefix.
 
 ---
 
 ## Hub paths with spaces
 
-If `database_path` contains spaces (e.g. `/vol1/data/hstry backup/hstry.db`):
+If `database_path` contains spaces (for example `/srv/chronicle data/hstry.db`):
 
 - Remote **shell** commands (`test -f`, `echo`) must quote the path.
 - **SCP** on Windows must pass `host:/path with spaces/file` as a **single argv element** — do not wrap the path in shell quotes (`host:'/path'` fails on Windows OpenSSH).
@@ -70,7 +70,7 @@ Symptom when broken: push “succeeds” but the hub only contains one machine�
 | **Checkpoints** | Hub `hstry checkpoint create` (and the hub service when `[checkpoint] enabled`) writes compressed rollbacks. |
 
 ```bash
-hstry hub ingest --file inbox/arknights-….db --namespace arknights --delete
+hstry hub ingest --file inbox/device-….db --namespace device-id --delete
 hstry checkpoint create
 hstry checkpoint list
 hstry checkpoint restore hstry-20260826-040000

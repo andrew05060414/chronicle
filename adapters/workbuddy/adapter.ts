@@ -111,8 +111,10 @@ async function parseSessionFile(
   let workspace: string | undefined;
   let model: string | undefined;
   const messages: Message[] = [];
-  let createdAt = Date.now();
-  let updatedAt = createdAt;
+  const fileStats = await stat(filePath).catch(() => null);
+  const fileModifiedAt = fileStats ? Math.floor(fileStats.mtimeMs) : Date.now();
+  let createdAt: number | undefined;
+  let updatedAt: number | undefined;
   let pendingThinking: string[] = [];
 
   const flushThinking = (): CanonPart[] => {
@@ -123,9 +125,9 @@ async function parseSessionFile(
   };
 
   for (const event of events) {
-    const ts = normalizeTimestamp(event.timestamp) ?? updatedAt;
-    if (ts < createdAt) createdAt = ts;
-    if (ts > updatedAt) updatedAt = ts;
+    const ts = normalizeTimestamp(event.timestamp) ?? updatedAt ?? fileModifiedAt;
+    if (createdAt === undefined || ts < createdAt) createdAt = ts;
+    if (updatedAt === undefined || ts > updatedAt) updatedAt = ts;
 
     if (event.cwd && !workspace) {
       workspace = event.cwd;
@@ -219,7 +221,10 @@ async function parseSessionFile(
 
   if (messages.length === 0) return null;
 
-  if (opts?.since && createdAt < opts.since && updatedAt < opts.since) {
+  const resolvedCreatedAt = createdAt ?? fileModifiedAt;
+  const resolvedUpdatedAt = updatedAt ?? resolvedCreatedAt;
+
+  if (opts?.since && resolvedCreatedAt < opts.since && resolvedUpdatedAt < opts.since) {
     return null;
   }
 
@@ -233,8 +238,8 @@ async function parseSessionFile(
   return {
     externalId,
     title,
-    createdAt,
-    updatedAt,
+    createdAt: resolvedCreatedAt,
+    updatedAt: resolvedUpdatedAt,
     model,
     workspace,
     messages,

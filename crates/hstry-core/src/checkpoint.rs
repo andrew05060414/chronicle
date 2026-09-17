@@ -345,10 +345,12 @@ mod tests {
         .await
         .unwrap();
 
-        let mut cfg = CheckpointConfig::default();
-        cfg.enabled = true;
-        cfg.dir = Some(dir.path().join("checkpoints"));
-        cfg.max_total_bytes = 10 * 1024 * 1024;
+        let cfg = CheckpointConfig {
+            enabled: true,
+            dir: Some(dir.path().join("checkpoints")),
+            max_total_bytes: 10 * 1024 * 1024,
+            ..Default::default()
+        };
 
         let created = create_checkpoint(&db, &db_path, &cfg, Some(false))
             .await

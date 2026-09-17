@@ -81,6 +81,11 @@ fn utf8_prefix(s: &str, max_bytes: usize) -> &str {
     &s[..end]
 }
 
+/// Returns the environment variable prefix for this application.
+pub fn env_prefix() -> String {
+    "HSTRY".to_string()
+}
+
 #[cfg(test)]
 mod lib_tests {
     use super::*;
@@ -89,7 +94,7 @@ mod lib_tests {
     fn utf8_prefix_handles_multibyte_at_boundary() {
         // 3-byte char '─' (U+2500) repeated; choose a length so 4096 lands
         // mid-character.
-        let s: String = std::iter::repeat('─').take(2000).collect();
+        let s = "─".repeat(2000);
         // 2000 * 3 = 6000 bytes. max_bytes 4096 lands inside a glyph.
         let p = utf8_prefix(&s, 4096);
         assert!(p.len() <= 4096);
@@ -102,9 +107,4 @@ mod lib_tests {
     fn utf8_prefix_passthrough_when_short() {
         assert_eq!(utf8_prefix("hello", 4096), "hello");
     }
-}
-
-/// Returns the environment variable prefix for this application.
-pub fn env_prefix() -> String {
-    "HSTRY".to_string()
 }

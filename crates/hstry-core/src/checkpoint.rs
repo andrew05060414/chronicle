@@ -246,7 +246,7 @@ pub async fn create_checkpoint(
     })
 }
 
-fn safe_remove_file(path: &Path) -> Result<()> {
+pub(crate) fn safe_remove_file(path: &Path) -> Result<()> {
     if !path.exists() {
         return Ok(());
     }
@@ -259,8 +259,8 @@ fn safe_remove_file(path: &Path) -> Result<()> {
                 attempts += 1;
                 let code = e.raw_os_error();
                 // 32: ERROR_SHARING_VIOLATION, 5: ERROR_ACCESS_DENIED (Windows transient file locks)
-                if (code == Some(32) || code == Some(5)) && attempts < 10 {
-                    std::thread::sleep(std::time::Duration::from_millis(25));
+                if (code == Some(32) || code == Some(5)) && attempts < 20 {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
                     continue;
                 }
                 return Err(Error::Io(e));

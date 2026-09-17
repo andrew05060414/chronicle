@@ -10,6 +10,11 @@ session/message anchors should go straight to a read, not another broad search.
 For the active Pi session after compaction, prefer HistorySearch with
 scope=current-branch when available; use hstry for cross-agent or broader recall.
 
+Recall is read-only: use `search`, `read`, `show`, `peek`, and `resume --dry-run`.
+Do not run `sync`, `import`, `index`, `remove`, `dedup`, `service`, `scan`, or any
+other command that writes to the archive or to a remote unless the user asks for
+that command by name.
+
 ## Discover
 
 ```sh

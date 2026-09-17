@@ -352,8 +352,14 @@ mod tests {
             .unwrap_or_else(|_| panic!("all ingestion tasks should release the database"));
         db.close().await;
         let _ = crate::checkpoint::safe_remove_file(&path);
-        let _ = crate::checkpoint::safe_remove_file(std::path::Path::new(&format!("{}-wal", path.display())));
-        let _ = crate::checkpoint::safe_remove_file(std::path::Path::new(&format!("{}-shm", path.display())));
+        let _ = crate::checkpoint::safe_remove_file(std::path::Path::new(&format!(
+            "{}-wal",
+            path.display()
+        )));
+        let _ = crate::checkpoint::safe_remove_file(std::path::Path::new(&format!(
+            "{}-shm",
+            path.display()
+        )));
         Ok(())
     }
 

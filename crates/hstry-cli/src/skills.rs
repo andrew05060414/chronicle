@@ -8,8 +8,6 @@ use std::process::{Command as ProcessCommand, Stdio};
 use anyhow::{Context, Result, bail};
 use which::which;
 
-const DEFAULT_SKILL_ROOT: &str = r"D:\Andrew\Code\Github\Andrew-Skill";
-
 #[derive(Debug, clap::Subcommand)]
 pub enum SkillsCommand {
     /// Run skill-management inventory audit
@@ -67,23 +65,15 @@ pub fn run(command: SkillsCommand) -> Result<()> {
 }
 
 fn skill_root() -> Result<PathBuf> {
-    if let Ok(p) = env::var("CHRONICLE_SKILL_ROOT") {
-        let path = PathBuf::from(p);
-        if path.is_dir() {
-            return Ok(path);
-        }
-        bail!(
-            "CHRONICLE_SKILL_ROOT is not a directory: {}",
-            path.display()
-        );
-    }
-    let default = PathBuf::from(DEFAULT_SKILL_ROOT);
-    if default.is_dir() {
-        return Ok(default);
+    let path = PathBuf::from(env::var("CHRONICLE_SKILL_ROOT").context(
+        "Andrew-Skill integration is disabled by default; set CHRONICLE_SKILL_ROOT to enable it",
+    )?);
+    if path.is_dir() {
+        return Ok(path);
     }
     bail!(
-        "Andrew-Skill root not found at {}; set CHRONICLE_SKILL_ROOT",
-        default.display()
+        "CHRONICLE_SKILL_ROOT is not a directory: {}",
+        path.display()
     );
 }
 

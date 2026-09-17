@@ -43,6 +43,7 @@ async fn fixture() -> anyhow::Result<(tempfile::TempDir, PathBuf, String)> {
     )?);
     let path = dir.path().join("config.toml");
     fs::write(&path, toml::to_string(&config)?)?;
+    db.close().await;
     Ok((dir, path, id))
 }
 fn cmd(config: &Path) -> Command {
@@ -210,14 +211,16 @@ async fn checkpoint_restore_live_closes_handles_and_creates_safety_snapshot() ->
     assert_eq!(restore_out["ok"], true);
     assert_eq!(restore_out["result"]["live"], true);
 
-    // Verify live DB was restored back to 1 conversation
+    // Verify live DB was restored back to 1 conversation and passes integrity check
     let db = Database::open(&config.database).await?;
+    assert_eq!(db.integrity_check().await?, "ok");
     let convs_restored = db.list_conversations(Default::default()).await?;
     assert_eq!(convs_restored.len(), 1);
     assert_eq!(
         convs_restored[0].id.to_string(),
         convs_before[0].id.to_string()
     );
+    assert_eq!(convs_restored[0].external_id.as_deref(), Some("foreign-id"));
     db.close().await;
 
     // Verify that the pre-restore safety snapshot was created in checkpoints directory (total 2 checkpoints)
@@ -230,6 +233,14 @@ async fn checkpoint_restore_live_closes_handles_and_creates_safety_snapshot() ->
         manifests.len(),
         2,
         "must retain initial checkpoint and safety checkpoint"
+    );
+    let conv_counts: Vec<u64> = manifests
+        .iter()
+        .map(|m| m["conversations"].as_u64().unwrap())
+        .collect();
+    assert!(
+        conv_counts.contains(&1) && conv_counts.contains(&2),
+        "manifests must record initial (1 conv) and pre-restore safety snapshot (2 convs)"
     );
 
     Ok(())

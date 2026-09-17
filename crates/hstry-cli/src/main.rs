@@ -1492,11 +1492,7 @@ async fn main() -> Result<()> {
             cmd_remote(&db, &config, &config_path, command, cli.json).await
         }
         Command::Hub { command } => cmd_hub(&config, command, cli.json).await,
-        Command::Checkpoint { command } => {
-            let db = Database::open(&config.database).await?;
-            apply_storage_config(&db, &config);
-            cmd_checkpoint(db, &config, command, cli.json).await
-        }
+        Command::Checkpoint { command } => cmd_checkpoint(&config, command, cli.json).await,
         Command::Web { command } => {
             let db = Database::open(&config.database).await?;
             apply_storage_config(&db, &config);
@@ -6867,12 +6863,7 @@ async fn cmd_hub(config: &Config, command: HubCommand, json: bool) -> Result<()>
     Ok(())
 }
 
-async fn cmd_checkpoint(
-    db: Database,
-    config: &Config,
-    command: CheckpointCommand,
-    json: bool,
-) -> Result<()> {
+async fn cmd_checkpoint(config: &Config, command: CheckpointCommand, json: bool) -> Result<()> {
     use hstry_core::checkpoint::{
         create_checkpoint, default_restore_path, list_checkpoints, prune_checkpoints,
         restore_checkpoint,
@@ -6881,6 +6872,8 @@ async fn cmd_checkpoint(
     let dir = config.checkpoint.resolve_dir(&config.database);
     match command {
         CheckpointCommand::Create { weekly } => {
+            let db = Database::open(&config.database).await?;
+            apply_storage_config(&db, config);
             let weekly = if weekly { Some(true) } else { None };
             let created = create_checkpoint(&db, &config.database, &config.checkpoint, weekly)
                 .await
@@ -6901,7 +6894,6 @@ async fn cmd_checkpoint(
             );
         }
         CheckpointCommand::List => {
-            db.close().await;
             let listed = list_checkpoints(&dir).map_err(|e| anyhow::anyhow!("{e}"))?;
             if json {
                 let manifests: Vec<_> = listed.iter().map(|c| &c.manifest).collect();
@@ -6946,17 +6938,24 @@ async fn cmd_checkpoint(
                 .and_then(|n| n.to_str())
                 .is_some_and(|n| n.eq_ignore_ascii_case("staging.db"))
             {
-                db.close().await;
                 anyhow::bail!("refusing to restore a checkpoint onto staging.db");
             }
             if live {
+                let db = Database::open(&config.database).await?;
+                apply_storage_config(&db, config);
                 create_checkpoint(&db, &config.database, &config.checkpoint, Some(false))
                     .await
                     .map_err(|e| anyhow::anyhow!("{e}"))?;
+                db.close().await;
             }
-            db.close().await;
             let restored =
                 restore_checkpoint(&dir, &stem, &dest).map_err(|e| anyhow::anyhow!("{e}"))?;
+            let check_db = Database::open(&restored).await?;
+            let integrity = check_db.integrity_check().await?;
+            check_db.close().await;
+            if integrity != "ok" {
+                anyhow::bail!("restored database failed integrity check: {integrity}");
+            }
             if json {
                 return emit_json(JsonResponse {
                     ok: true,
@@ -6974,7 +6973,6 @@ async fn cmd_checkpoint(
             }
         }
         CheckpointCommand::Prune => {
-            db.close().await;
             let deleted =
                 prune_checkpoints(&dir, &config.checkpoint).map_err(|e| anyhow::anyhow!("{e}"))?;
             if json {

@@ -207,7 +207,7 @@ pub async fn create_checkpoint(
     copy.close().await;
 
     if integrity != "ok" {
-        let _ = fs::remove_file(&raw_path);
+        let _ = safe_remove_file(&raw_path);
         return Err(Error::Other(format!(
             "checkpoint integrity_check failed: {integrity}"
         )));
@@ -217,11 +217,11 @@ pub async fn create_checkpoint(
     let zst_path = archive_path(&dir, &stem);
     {
         let input = BufReader::new(File::open(&raw_path)?);
-        let output = BufWriter::new(File::create(&zst_path)?);
+        let output = BufWriter::new(safe_create_file(&zst_path)?);
         zstd::stream::copy_encode(input, output, 3)?;
     }
     let compressed_bytes = fs::metadata(&zst_path)?.len();
-    fs::remove_file(&raw_path)?;
+    safe_remove_file(&raw_path)?;
 
     let manifest = CheckpointManifest {
         version: MANIFEST_VERSION,
@@ -246,6 +246,47 @@ pub async fn create_checkpoint(
     })
 }
 
+fn safe_remove_file(path: &Path) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let mut attempts = 0;
+    loop {
+        match fs::remove_file(path) {
+            Ok(()) => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => {
+                attempts += 1;
+                let code = e.raw_os_error();
+                // 32: ERROR_SHARING_VIOLATION, 5: ERROR_ACCESS_DENIED (Windows transient file locks)
+                if (code == Some(32) || code == Some(5)) && attempts < 10 {
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                    continue;
+                }
+                return Err(Error::Io(e));
+            }
+        }
+    }
+}
+
+fn safe_create_file(path: &Path) -> std::io::Result<File> {
+    let mut attempts = 0;
+    loop {
+        match File::create(path) {
+            Ok(f) => return Ok(f),
+            Err(e) => {
+                attempts += 1;
+                let code = e.raw_os_error();
+                if (code == Some(32) || code == Some(5)) && attempts < 10 {
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                    continue;
+                }
+                return Err(e);
+            }
+        }
+    }
+}
+
 pub fn prune_checkpoints(dir: &Path, config: &CheckpointConfig) -> Result<Vec<PathBuf>> {
     let listed = list_checkpoints(dir)?;
     let records: Vec<CheckpointRecord> = listed
@@ -266,9 +307,9 @@ pub fn prune_checkpoints(dir: &Path, config: &CheckpointConfig) -> Result<Vec<Pa
             .and_then(|n| n.strip_suffix(".db.zst"))
             .unwrap_or("");
         let json = manifest_path(dir, stem);
-        let _ = fs::remove_file(&json);
+        let _ = safe_remove_file(&json);
         if archive.exists() {
-            fs::remove_file(&archive)?;
+            safe_remove_file(&archive)?;
         }
         deleted.push(archive);
     }
@@ -286,19 +327,15 @@ pub fn restore_checkpoint(dir: &Path, stem: &str, dest: &Path) -> Result<PathBuf
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent)?;
     }
-    if dest.exists() {
-        fs::remove_file(dest)?;
-    }
+    safe_remove_file(dest)?;
     for suffix in ["-wal", "-shm"] {
         let mut sidecar_os = dest.as_os_str().to_os_string();
         sidecar_os.push(suffix);
         let sidecar = PathBuf::from(sidecar_os);
-        if sidecar.exists() {
-            fs::remove_file(&sidecar)?;
-        }
+        safe_remove_file(&sidecar)?;
     }
     let input = BufReader::new(File::open(&archive)?);
-    let output = BufWriter::new(File::create(dest)?);
+    let output = BufWriter::new(safe_create_file(dest)?);
     zstd::stream::copy_decode(input, output)?;
     Ok(dest.to_path_buf())
 }

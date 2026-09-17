@@ -402,6 +402,11 @@ impl Database {
 
     /// Close the database.
     pub async fn close(self) {
+        // Flush WAL contents before the last connection closes so callers that
+        // copy the database file receive a complete snapshot.
+        let _ = sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+            .execute(&self.pool)
+            .await;
         self.pool.close().await;
     }
 

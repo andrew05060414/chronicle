@@ -125,6 +125,7 @@ jobs:
 
   publish-homebrew:
     name: Publish to Homebrew
+    if: ${{ vars.ENABLE_THIRD_PARTY_PUBLISHING == 'true' }}
     needs: release
     runs-on: ubuntu-latest
     steps:
@@ -143,6 +144,7 @@ jobs:
 
   publish-aur:
     name: Publish to AUR
+    if: ${{ vars.ENABLE_THIRD_PARTY_PUBLISHING == 'true' }}
     needs: release
     runs-on: ubuntu-latest
     steps:

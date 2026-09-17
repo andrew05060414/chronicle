@@ -7,8 +7,13 @@ This guide covers how to release hstry binaries to GitHub, Homebrew, and AUR.
 The release process is automated via GitHub Actions:
 
 1. **GitHub Releases**: Automatically builds binaries for multiple platforms and creates a release
-2. **Homebrew**: Updates the formula in `byteowlz/homebrew-tap` via repository dispatch
-3. **AUR**: Updates the PKGBUILD in the AUR repository
+2. **Homebrew/AUR**: Optional third-party publishing jobs
+
+GitHub Releases are enabled by default. Homebrew and AUR jobs are skipped
+unless the repository variable `ENABLE_THIRD_PARTY_PUBLISHING` is exactly
+`true` and their destinations, credentials, and package metadata have been
+configured for this fork. The historical `byteowlz` destinations in the
+reference scripts are not Chronicle publishing targets.
 
 ## Setup Requirements
 

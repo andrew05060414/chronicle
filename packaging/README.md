@@ -1,6 +1,11 @@
 # Packaging Scripts
 
-This directory contains scripts for setting up and managing releases for hstry.
+This directory contains reference scripts for setting up and managing releases
+for Chronicle and its compatibility binaries.
+
+GitHub Release artifacts are the supported default. Third-party Homebrew/AUR
+publishing is opt-in and must be configured for the destination repository
+before enabling `ENABLE_THIRD_PARTY_PUBLISHING` in GitHub Actions.
 
 ## Scripts
 

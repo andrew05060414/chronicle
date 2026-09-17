@@ -6,6 +6,12 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
+if [[ "${ENABLE_THIRD_PARTY_PUBLISHING:-false}" != "true" ]]; then
+    echo "Third-party Homebrew/AUR publishing is disabled by default."
+    echo "Set ENABLE_THIRD_PARTY_PUBLISHING=true only after configuring fork-owned destinations and secrets."
+    exit 0
+fi
+
 echo "========================================="
 echo "HSTRY Release Infrastructure Setup"
 echo "========================================="

@@ -290,7 +290,7 @@ hstry follows XDG Base Directory specifications on Unix, and the platform defaul
 Default config: `~/.config/hstry/config.toml` (Windows: `%APPDATA%\hstry\config.toml`)
 
 ```toml
-"$schema" = "https://raw.githubusercontent.com/byteowlz/schemas/refs/heads/main/hstry/hstry.config.schema.json"
+"$schema" = "https://raw.githubusercontent.com/andrew05060414/chronicle/main/examples/config.schema.json"
 
 database = "~/.local/share/hstry/hstry.db"
 adapter_paths = ["~/.config/hstry/adapters"]

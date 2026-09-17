@@ -22,7 +22,7 @@ Web ChatGPT / Gemini live ingest is a later milestone; takeout export adapters a
 - Incremental adapter parsing with cursor-based batching
 - Export conversations to adapter formats (markdown/json, pi, opencode, codex, claude-code, etc.)
 - Resume past sessions in any coding agent with cross-format conversion
-- Deduplicate conversations and export memories to mmry
+- Deduplicate conversations
 - JSON output for scripting and MCP integration
 
 ## Installation
@@ -194,7 +194,7 @@ hstry resume --limit 10
 | `service enable/disable/start/run/restart/stop/status` | Control background sync service |
 | `config show/path/edit` | Manage configuration |
 | `stats` | Show database statistics |
-| `mmry extract` | Export memories to mmry |
+| `mmry extract` | Upstream compatibility only: verbatim copy to mmry (not Chronicle memory extraction; outside product boundary, retained for merge compatibility) |
 
 Adapter installs are version-pinned to the hstry binary. Run `hstry adapters update`
 whenever you upgrade, and the CLI will refuse to sync if adapter manifests do not
@@ -473,11 +473,13 @@ in your own config; no private machine path is required or assumed.
 
 Not on this bus: CTX, AMS, Mem0, the jobs tracker, knowledge-hub.
 
+`mmry extract` is upstream compatibility only, not a Chronicle memory-extraction feature. It copies messages verbatim into another store without summarization, scoring, or classification, and sits outside Chronicle's responsibility (conversation archive and retrieval). The command is retained without deletion to keep upstream merges cheap.
+
 Daily NAS sync can optionally chain offsite copies via `hstry-daily-sync.ps1 -Offsite`.
 
 ## Contributing
 
-Issues live in `.trx/`. See [CHANGELOG.md](CHANGELOG.md) for release notes.
+Planning and delivery source of truth is GitHub Issues (see #16 as the entry point for the v0.5.25 merge review). `.trx/`, `.pi/todos/`, and `.octo/` are frozen historical/upstream artifacts, not an active second board; they are preserved as-is. See [CHANGELOG.md](CHANGELOG.md) for release notes.
 
 ## Release Notes
 

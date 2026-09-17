@@ -150,7 +150,9 @@ The release workflow builds binaries for:
 Each release includes the following binaries (when built):
 
 - `hstry` - CLI tool
+- `chronicle` - CLI tool (product-name alias)
 - `hstry-tui` - Terminal UI (optional)
+- `chronicle-tui` - Terminal UI (product-name alias, optional)
 - `hstry-mcp` - MCP server (optional)
 
 ## Release Artifacts

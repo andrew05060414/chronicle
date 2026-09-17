@@ -90,7 +90,9 @@ Each release includes:
 
 The release packages the following binaries when available:
 - `hstry` - CLI tool (always included)
+- `chronicle` - CLI tool alias (always included)
 - `hstry-tui` - Terminal UI (optional)
+- `chronicle-tui` - Terminal UI alias (optional)
 - `hstry-mcp` - MCP server (optional)
 
 ## Support

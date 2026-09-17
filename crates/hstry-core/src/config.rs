@@ -8,7 +8,7 @@ use crate::Error;
 use crate::error::Result;
 
 /// Default GitHub repository for adapters.
-pub const DEFAULT_ADAPTER_REPO: &str = "https://github.com/byteowlz/hstry";
+pub const DEFAULT_ADAPTER_REPO: &str = "https://github.com/andrew05060414/chronicle";
 
 /// Main application configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -335,9 +335,9 @@ pub enum AdapterRepoSource {
     Git {
         /// Repository URL (HTTPS or SSH).
         /// Examples:
-        /// - https://github.com/byteowlz/hstry
+        /// - https://github.com/andrew05060414/chronicle
         /// - https://gitlab.com/user/adapters
-        /// - git@github.com:byteowlz/hstry.git
+        /// - git@github.com:andrew05060414/chronicle.git
         /// - https://gitea.example.com/org/adapters
         url: String,
 

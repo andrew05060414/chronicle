@@ -21,8 +21,8 @@ workspaces = ["~/code", "~/work"]
 [[adapter_repos]]
 name = "official"
 type = "git"
-url = "https://github.com/byteowlz/hstry"
-# git_ref = "v0.5.5"  # defaults to current hstry version
+url = "https://github.com/andrew05060414/chronicle"
+# git_ref = "v1.0.0"  # defaults to the current Chronicle version
 path = "adapters"
 enabled = true
 

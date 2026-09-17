@@ -35,7 +35,7 @@ mod path_expansion_tests {
 
 #[cfg(test)]
 mod default_config_tests {
-    use super::super::Config;
+    use super::super::{AdapterRepoSource, Config, DEFAULT_ADAPTER_REPO};
 
     #[test]
     fn default_has_database_path() {
@@ -53,8 +53,18 @@ mod default_config_tests {
     #[test]
     fn default_has_official_adapter_repo() {
         let config = Config::default();
-        assert!(!config.adapter_repos.is_empty());
-        assert!(config.adapter_repos.iter().any(|r| r.name == "official"));
+        let official = config
+            .adapter_repos
+            .iter()
+            .find(|repo| repo.name == "official")
+            .expect("default config should include the official adapter repo");
+        match &official.source {
+            AdapterRepoSource::Git { url, path, .. } => {
+                assert_eq!(url, DEFAULT_ADAPTER_REPO);
+                assert_eq!(path, "adapters");
+            }
+            _ => panic!("default official adapter repo must use git"),
+        }
     }
 
     #[test]

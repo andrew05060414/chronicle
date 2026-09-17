@@ -178,7 +178,7 @@ hstry resume --limit 10
 | `search <query>` | Full-text search across all messages |
 | `index` | Build or refresh the search index |
 | `list` | List conversations with optional filters (workspace uses substring match) |
-| `show <id>` | Display a conversation with all messages |
+| `show <id>` / `read` / `peek` | Display a conversation (bounded pages; `--full` for legacy) |
 | `export` | Export conversations to markdown/json or adapter format |
 | `resume` | Resume a past session in a coding agent (pi, claude-code, codex, etc.) |
 | `dedup` | Deduplicate conversations in the database |
@@ -189,15 +189,26 @@ hstry resume --limit 10
 | `checkpoint create/list/restore/prune` | Rolling compressed snapshots of the live database |
 | `backup` | 3-2-1 backup: integrity check, NAS remote push, Oracle `scp`, Google Drive `rclone` |
 | `skills audit/list/sync/bootstrap` | Optional Andrew-Skill / ASM proxy (not a memory store) |
+| `skill install/status/update` | Install the bundled agent retrieval skill |
 | `tui` | Launch `chronicle-tui` / `hstry-tui` |
-
-Adapter installs are version-pinned to the hstry binary. Run `hstry adapters update`
-whenever you upgrade, and the CLI will refuse to sync if adapter manifests do not
-match the current hstry version.
 | `service enable/disable/start/run/restart/stop/status` | Control background sync service |
 | `config show/path/edit` | Manage configuration |
 | `stats` | Show database statistics |
 | `mmry extract` | Export memories to mmry |
+
+Adapter installs are version-pinned to the hstry binary. Run `hstry adapters update`
+whenever you upgrade, and the CLI will refuse to sync if adapter manifests do not
+match the current hstry version.
+
+## Browser extension
+
+`extension/` contains **hstry sync**, a Chrome MV3 extension that background-syncs conversations from ChatGPT, Claude, Gemini, and Perplexity into your local database. It POSTs new conversations to a running `hstry-api` instance (`http://127.0.0.1:3000/ingest`, token-authenticated).
+
+```bash
+hstry-api --port 3000   # start the API, optionally with --token <secret>
+```
+
+Load it from `chrome://extensions` with Developer mode enabled (Load unpacked, select `extension/`). Provider toggles, port, and token are configured on the extension's options page. The `hstry web` Playwright commands are the headless alternative to the extension.
 
 ## Search Modes
 

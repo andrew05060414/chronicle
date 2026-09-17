@@ -6,7 +6,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 This repository is a personal fork of [byteowlz/hstry](https://github.com/byteowlz/hstry).
-Upstream last consumed here is `v0.5.21` (`c8923f1`). Upstream `v0.5.22` (TUI overhaul, cursor/web sync harden) is not merged; it may land later.
+Upstream last consumed here is `v0.5.25` (`a4be7c9`). Keep fork version at `1.0.0`.
 
 ## [Unreleased]
 
@@ -18,18 +18,21 @@ Upstream last consumed here is `v0.5.21` (`c8923f1`). Upstream `v0.5.22` (TUI ov
 - DeepSeek Harness adapter (`dsh`) for `~/.dsh/sessions` (`session.jsonl` / concatenated zstd).
 - Zcode / ZAI adapter (`zcode`) for `~/.zcode` (`cli/db/db.sqlite` session / message / part).
 - Restore runbook: [docs/restore.md](docs/restore.md) (hub snapshots to Google Drive; search-only restore on this PC).
+- Upstream v0.5.25 recall: exact/needle/regex with bounded evidence, shared bounded reads, installable retrieval skill (`hstry skill`), and opt-in content-free search diagnostics.
 
 ### Changed
 
 - Satellite push exports only conversations with `updated_at` since the last successful ingest (watermark in `search_state`). `--full` keeps the legacy whole-file replace for recovery.
-
 - Satellite search defaults to the hub remote (`sync.hub_remote`) instead of local staging (trx-1xsa). Pass `--scope local` to search only this machine.
+- Search JSON now returns a report object; upgrade service/API/remote binaries together. `show` is bounded by default; use `--full` for legacy output.
+- Resume uses structured arguments, fresh conversion identities, origin sidecars, and no-overwrite placement. JSON returns a non-executing plan; converted launches require `--allow-unverified`.
 
 ### Fixed
 
 - Antigravity SQLite conversations read timestamps from `step_payload` field 5 (`CortexStepMetadata` Timestamp, or a unix varint) when `metadata` is empty, instead of using wall-clock `Date.now()` per row.
 - Default remote search (CLI and TUI) uses `sync.hub_remote` and errors if that name is missing, instead of silently querying every remote. Explicit `--remote` is unchanged.
 - Windows MSVC debug builds reserve an 8MB stack so `hstry --help` no longer hits `STATUS_STACK_OVERFLOW`.
+- TUI compilation with remote search reports and OpenCode conversion layout/session IDs.
 
 ## [1.0.0] - 2026-08-21
 
@@ -53,6 +56,25 @@ Fork 1.0: local agent archive + NAS hub/satellite. Canonical remote is `andrew05
 - Upstream TUI overhaul (Resume / grouping / images) — current three-pane TUI remains.
 - Live ChatGPT / Gemini / Copilot web ingest (export adapters already exist for takeout files).
 - Antigravity IDE 2.0 session store.
+
+## [0.5.25] - 2026-09-06
+
+Upstream release consumed by this fork while remaining at `1.0.0`.
+
+### Added
+
+- Exact/needle/regex recall with bounded evidence, stable anchors, and explicit scope/completeness reporting.
+- Shared bounded reads across CLI, HTTP, MCP, and SSH, including field continuations and linked tool interactions.
+- Installable retrieval skill and opt-in content-free search diagnostics.
+
+### Changed
+
+- Search JSON now returns a report object; upgrade service/API/remote binaries together. `show` is bounded by default; use `--full` for legacy output.
+- Resume uses structured arguments, fresh conversion identities, origin sidecars, and no-overwrite placement. JSON returns a non-executing plan; converted launches require `--allow-unverified`.
+
+### Fixed
+
+- TUI compilation with remote search reports and OpenCode conversion layout/session IDs.
 
 ## [0.5.16] - 2026-04-26
 

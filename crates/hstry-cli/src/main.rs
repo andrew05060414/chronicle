@@ -2398,6 +2398,14 @@ async fn cmd_search_fast(
 
     if scope != SearchScopeArg::Local {
         let remote_list = config.remotes_for_search(&remotes)?;
+        for name in &remotes {
+            if !remote_list.iter().any(|r| r.enabled && r.name == *name) {
+                anyhow::bail!("Unknown or disabled remote: {name}");
+            }
+        }
+        if !remote_list.iter().any(|r| r.enabled) {
+            anyhow::bail!("No enabled remotes to search");
+        }
         let remote = hstry_core::remote::search_remotes(&remote_list, query, &opts).await?;
         if scope == SearchScopeArg::Remote {
             report.filters = remote.filters;

@@ -43,13 +43,16 @@ jobs:
         run: cargo fmt --all --check
 
       - name: Check workspace
-        run: cargo check --workspace
+        run: cargo check --workspace --all-targets
 
       - name: Lint workspace
-        run: cargo clippy --workspace -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Test workspace
-        run: cargo test --workspace
+        run: cargo test --workspace --all-targets --no-fail-fast
+
+      - name: Memory-integrity gate (explicit)
+        run: cargo test -p hstry-core --test memory_integrity --no-fail-fast -- --nocapture
 
   adapter-tests:
     name: Adapter fixtures
@@ -57,6 +60,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
       - run: bun run adapters/cursor/test.js
       - run: bun run adapters/gemini-cli/test.js
       - run: bun run adapters/workbuddy/test.js
+      - name: Node adapter regressions (*.regression.mjs)
+        run: ./scripts/ci/run-adapter-regressions.sh

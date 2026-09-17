@@ -310,8 +310,9 @@ mod tests {
     async fn concurrent_batches_queue_without_database_locked_errors() -> Result<()> {
         use std::sync::Arc;
 
-        let path =
-            std::env::temp_dir().join(format!("hstry-ingest-concurrent-{}.db", Uuid::new_v4()));
+        use crate::test_guard::{close_and_remove_db, isolated_temp_db};
+
+        let (_tmp, path) = isolated_temp_db("hstry-ingest-concurrent");
         let db = Arc::new(Database::open(&path).await?);
 
         for source_idx in 0..8 {
@@ -350,14 +351,15 @@ mod tests {
 
         let db = Arc::try_unwrap(db)
             .unwrap_or_else(|_| panic!("all ingestion tasks should release the database"));
-        db.close().await;
-        std::fs::remove_file(path)?;
+        close_and_remove_db(db, &path).await?;
         Ok(())
     }
 
     #[tokio::test]
     async fn outcome_distinguishes_created_from_updated_conversations() -> Result<()> {
-        let path = std::env::temp_dir().join(format!("hstry-ingest-{}.db", Uuid::new_v4()));
+        use crate::test_guard::{close_and_remove_db, isolated_temp_db};
+
+        let (_tmp, path) = isolated_temp_db("hstry-ingest");
         let db = Database::open(&path).await?;
         db.upsert_source(&Source {
             id: "web".to_string(),
@@ -379,6 +381,7 @@ mod tests {
             (second.conversations, second.created, second.updated),
             (1, 0, 1)
         );
+        close_and_remove_db(db, &path).await?;
         Ok(())
     }
 }

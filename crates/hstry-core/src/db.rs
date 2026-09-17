@@ -1009,6 +1009,78 @@ impl Database {
         Ok(row.get::<String, _>(0))
     }
 
+    /// Run `PRAGMA quick_check` and return the first result row.
+    ///
+    /// `quick_check` is the fast PR-gate counterpart of `integrity_check`:
+    /// it catches corruption without the full scan cost of `integrity_check`.
+    pub async fn quick_check(&self) -> Result<String> {
+        let row = sqlx::query("PRAGMA quick_check")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(row.get::<String, _>(0))
+    }
+
+    /// Verify the required archive tables exist, else return an error.
+    ///
+    /// This is the smallest maintainable schema contract for the pre-PR
+    /// memory-integrity gate: the authoritative archive must always expose
+    /// these tables. New migrations extend the schema but must never remove
+    /// them; the migration-protection test enforces this after upgrades.
+    pub async fn require_schema(&self) -> Result<()> {
+        for table in ["schema_migrations", "sources", "conversations", "messages"] {
+            let row: Option<(String,)> =
+                sqlx::query_as("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?")
+                    .bind(table)
+                    .fetch_optional(&self.pool)
+                    .await?;
+            if row.is_none() {
+                return Err(Error::Other(format!("required table missing: {table}")));
+            }
+        }
+        Ok(())
+    }
+
+    /// Validate a database *file* without running migrations and without any
+    /// network/SSH/remote access.
+    ///
+    /// Opens the file read-only, runs `PRAGMA quick_check`, and verifies the
+    /// required archive tables exist. Used by the memory-integrity gate to
+    /// validate fetched/full-sync database files against local temp files
+    /// only. Returns an error for corrupt files, non-SQLite files, and
+    /// SQLite files that are not hstry archives.
+    pub async fn validate_hstry_database_file(path: &Path) -> Result<()> {
+        let options = SqliteConnectOptions::new().filename(path).read_only(true);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .map_err(|e| Error::Other(format!("cannot open database file for validation: {e}")))?;
+        let check: (String,) = sqlx::query_as("PRAGMA quick_check")
+            .fetch_one(&pool)
+            .await
+            .map_err(|e| Error::Other(format!("quick_check failed: {e}")))?;
+        if check.0 != "ok" {
+            pool.close().await;
+            return Err(Error::Other(format!("quick_check failed: {}", check.0)));
+        }
+        for table in ["sources", "conversations", "messages"] {
+            let row: Option<(String,)> =
+                sqlx::query_as("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?")
+                    .bind(table)
+                    .fetch_optional(&pool)
+                    .await
+                    .map_err(|e| Error::Other(format!("schema check failed: {e}")))?;
+            if row.is_none() {
+                pool.close().await;
+                return Err(Error::Other(format!(
+                    "not a hstry database: table missing: {table}"
+                )));
+            }
+        }
+        pool.close().await;
+        Ok(())
+    }
+
     /// Consistent online copy of this database via `VACUUM INTO`.
     pub async fn backup_to(&self, dest: &Path) -> Result<()> {
         if let Some(parent) = dest.parent() {

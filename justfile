@@ -123,6 +123,14 @@ fix:
 # Run all checks
 check-all: fmt-check clippy lint-rust-ai-guardrails test
 
+# Run the full pre-PR memory-integrity gate (isolated HOME/config/database)
+pre-pr:
+    ./scripts/pre-pr.sh
+
+# Windows: run the full pre-PR memory-integrity gate via PowerShell
+pre-pr-windows:
+    @powershell -NoProfile -ExecutionPolicy Bypass -File scripts/pre-pr.ps1
+
 # === Documentation ===
 
 # Generate docs for all crates

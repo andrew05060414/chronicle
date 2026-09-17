@@ -8,6 +8,7 @@ use std::{
 
 async fn fixture() -> anyhow::Result<(tempfile::TempDir, PathBuf, String)> {
     let dir = tempfile::tempdir()?;
+    hstry_core::test_guard::assert_test_path_safe(&dir.path().join("history.db"));
     let mut config = Config {
         database: dir.path().join("history.db"),
         ..Default::default()
@@ -77,15 +78,12 @@ async fn cli_reads_are_bounded_and_full_requires_opt_in() -> anyhow::Result<()> 
         "--json",
     ]);
     let page = output(c)?;
-    assert!(page.to_string().chars().count() + 1 <= 1100);
-    assert_eq!(
-        page["result"]["records"][0]["next_offset_chars"].is_number(),
-        true
-    );
+    assert!(page.to_string().chars().count() < 1100);
+    assert!(page["result"]["records"][0]["next_offset_chars"].is_number());
     let mut c = cmd(&config);
     c.args(["show", &id, "--json"]);
     let page = output(c)?;
-    assert!(page.to_string().chars().count() + 1 <= 3000);
+    assert!(page.to_string().chars().count() < 3000);
     let mut c = cmd(&config);
     c.args(["show", &id, "--json", "--full"]);
     assert_eq!(
@@ -158,7 +156,7 @@ async fn ssh_reads_enforce_peer_side_budgets_and_reject_old_peers() -> anyhow::R
     .env("HSTRY_PEER_BIN", env!("CARGO_BIN_EXE_hstry"))
     .env("HSTRY_PEER_CONFIG", &config);
     let r = output(c)?;
-    assert!(r.to_string().chars().count() + 1 <= 1100);
+    assert!(r.to_string().chars().count() < 1100);
     assert_eq!(r["result"]["protocol"], 1);
     assert_eq!(r["result"]["machine"], "peer");
     fs::write(

@@ -276,9 +276,15 @@ pub fn restore_checkpoint(dir: &Path, stem: &str, dest: &Path) -> Result<PathBuf
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent)?;
     }
+    // All database handles to `dest` must be closed before this call (see
+    // `Database::close`, which checkpoints WAL first). Remove the target plus
+    // any stale `-wal`/`-shm`/`-journal` sidecars so a previous incarnation
+    // of the file can never replay over the restored database — on Windows
+    // a leftover sidecar also keeps the restore target logically locked.
     if dest.exists() {
         fs::remove_file(dest)?;
     }
+    crate::test_guard::remove_sidecars(dest);
     let input = BufReader::new(File::open(&archive)?);
     let output = BufWriter::new(File::create(dest)?);
     zstd::stream::copy_decode(input, output)?;

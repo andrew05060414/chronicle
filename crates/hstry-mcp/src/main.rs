@@ -248,12 +248,14 @@ impl ServerHandler for McpServer {
         ServerInfo {
             capabilities: ServerCapabilities::builder().enable_tools().build(),
             instructions: Some(
-                "Chronicle is a conversation archive: a read-only retrieval layer over AI chat \
-                 sessions already recorded on this machine and on its configured remotes. Use \
-                 `search` to locate evidence and `expand` to read a bounded window around a \
-                 match; both return a snapshot of what was stored, never proof that something \
-                 does not exist. Chronicle is not a task board and dispatches no work - it \
-                 answers what was said, and nothing here assigns, schedules, or tracks tasks."
+                "Chronicle is a conversation archive over AI chat sessions already recorded \
+                 on this machine and on its configured remotes. This MCP server exposes a \
+                 retrieval-only tool surface: use `search` to locate evidence and `expand` \
+                 to read a bounded window around a match, and no archive-mutating MCP tools \
+                 are exposed; both return a snapshot of what was stored, never proof that \
+                 something does not exist. Chronicle is not a task board and dispatches no \
+                 work - it answers what was said, and nothing here assigns, schedules, or \
+                 tracks tasks."
                     .to_string(),
             ),
             ..Default::default()

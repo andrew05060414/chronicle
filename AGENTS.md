@@ -1,6 +1,10 @@
 # AGENTS.md
 
-Guidance for coding agents working on this Rust CLI template.
+Guidance for coding agents working on Chronicle (`chronicle`, compatible name
+`hstry`): a conversation archive that indexes AI chat history from multiple
+agents and machines and serves it back for retrieval. It is not a task board and
+dispatches no work; it answers what was said and when, and every surface it
+exposes - CLI, MCP, API, TUI - exists to search, read, and sync that archive.
 
 ## Core Principles
 

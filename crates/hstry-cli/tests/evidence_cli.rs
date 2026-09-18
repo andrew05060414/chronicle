@@ -263,3 +263,35 @@ async fn checkpoint_restore_refuses_staging_db() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+/// Scope-all must still surface local results when no remote is enabled; only `--scope remote` has nothing left to return.
+#[tokio::test]
+async fn scope_all_keeps_local_hits_when_no_remote_is_enabled() -> anyhow::Result<()> {
+    let (dir, config, _id) = fixture().await?;
+    let mut parsed: Config = toml::from_str(&fs::read_to_string(&config)?)?;
+    for remote in &mut parsed.remotes {
+        remote.enabled = false;
+    }
+    assert!(!parsed.remotes.is_empty());
+    let disabled = dir.path().join("config-no-enabled-remotes.toml");
+    fs::write(&disabled, toml::to_string(&parsed)?)?;
+
+    let mut c = cmd(&disabled);
+    c.args(["search", "fixture request", "--scope", "all", "--json"]);
+    let page = output(c)?;
+    assert_eq!(page["result"]["scope"], "local_snapshot_and_remote");
+    assert!(!page["result"]["hits"].as_array().unwrap().is_empty());
+    assert!(
+        page["result"]["available_remotes"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+
+    let mut c = cmd(&disabled);
+    c.args(["search", "fixture request", "--scope", "remote", "--json"]);
+    let remote_only = c.output()?;
+    assert!(!remote_only.status.success());
+    assert!(String::from_utf8_lossy(&remote_only.stderr).contains("No enabled remotes to search"));
+    Ok(())
+}

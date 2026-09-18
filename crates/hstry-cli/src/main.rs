@@ -2399,7 +2399,9 @@ async fn cmd_search_fast(
                 anyhow::bail!("Unknown or disabled remote: {name}");
             }
         }
-        if !remote_list.iter().any(|r| r.enabled) {
+        // Only a remote-only search has nothing left to report when no remote is
+        // enabled. `--scope all` must still return the local report computed above.
+        if scope == SearchScopeArg::Remote && !remote_list.iter().any(|r| r.enabled) {
             anyhow::bail!("No enabled remotes to search");
         }
         let remote = hstry_core::remote::search_remotes(&remote_list, query, &opts).await?;

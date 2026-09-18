@@ -4,7 +4,7 @@ Chronicle is the public product name for this local-first history system. The
 implementation grew from the [byteowlz/hstry](https://github.com/byteowlz/hstry)
 engine and is maintained at [andrew05060414/chronicle](https://github.com/andrew05060414/chronicle).
 
-**Spoken / connecting-layer name: Chronicle.** Product home: [andrew05060414/chronicle](https://github.com/andrew05060414/chronicle). Commands: `chronicle` and `hstry` are the same binary. Crate names, `%APPDATA%\hstry\`, and the database path stay `hstry` so upstream merges do not explode. Upstream remains `byteowlz/hstry`.
+**Spoken / connecting-layer name: Chronicle.** Product home: [andrew05060414/chronicle](https://github.com/andrew05060414/chronicle). Commands: `chronicle` and `hstry` are the same binary. Crate names, `%APPDATA%\\hstry\\`, and the database path stay `hstry` so upstream merges do not explode. Upstream remains `byteowlz/hstry`.
 
 Universal AI chat history database. Aggregates conversations from local coding agents (Cursor, Codex, Claude Code, Pi, OpenCode, QClaw, WorkBuddy, Antigravity CLI, and others) into a single searchable SQLite database. Optional NAS hub/satellite sync keeps Windows and Mac histories namespaced.
 
@@ -63,9 +63,9 @@ Windows 11 is a first-class target. Paths follow the same `dirs` layout as other
 
 | Directory | Windows default |
 |-----------|-----------------|
-| Config / adapters | `%APPDATA%\hstry\` |
-| Database | `%LOCALAPPDATA%\hstry\hstry.db` |
-| Service state | `%LOCALAPPDATA%\hstry\` |
+| Config / adapters | `%APPDATA%\\hstry\\` |
+| Database | `%LOCALAPPDATA%\\hstry\\hstry.db` |
+| Service state | `%LOCALAPPDATA%\\hstry\\` |
 
 **Dependencies**
 
@@ -221,7 +221,7 @@ Force a mode with `--mode natural` or `--mode code`.
 
 Scope and filters:
 
-- `--scope local|remote|all` (satellite with `hub_remote` defaults to **remote**; otherwise local)
+- `--scope local|remote|all` (satellite with `hub_remote` defaults to **all** — local plus hub; otherwise local)
 - `--remote <name>` to target specific remotes (satellite default is `sync.hub_remote`)
 - `--source`, `--workspace`, `--role` filters
 - `--no-tools` to exclude tool calls
@@ -294,11 +294,11 @@ hstry follows XDG Base Directory specifications on Unix, and the platform defaul
 
 | Directory | Unix default | Windows default | Environment Override |
 |-----------|--------------|-----------------|---------------------|
-| Config | `~/.config/hstry/` | `%APPDATA%\hstry\` | `$XDG_CONFIG_HOME/hstry/` |
-| Data | `~/.local/share/hstry/` | `%LOCALAPPDATA%\hstry\` | `$XDG_DATA_HOME/hstry/` |
-| State | `~/.local/state/hstry/` | `%LOCALAPPDATA%\hstry\` | `$XDG_STATE_HOME/hstry/` |
+| Config | `~/.config/hstry/` | `%APPDATA%\\hstry\\` | `$XDG_CONFIG_HOME/hstry/` |
+| Data | `~/.local/share/hstry/` | `%LOCALAPPDATA%\\hstry\\` | `$XDG_DATA_HOME/hstry/` |
+| State | `~/.local/state/hstry/` | `%LOCALAPPDATA%\\hstry\\` | `$XDG_STATE_HOME/hstry/` |
 
-Default config: `~/.config/hstry/config.toml` (Windows: `%APPDATA%\hstry\config.toml`)
+Default config: `~/.config/hstry/config.toml` (Windows: `%APPDATA%\\hstry\\config.toml`)
 
 ```toml
 "$schema" = "https://raw.githubusercontent.com/andrew05060414/chronicle/main/examples/config.schema.json"
@@ -446,7 +446,7 @@ just check-all       # Format, lint, and test
 just test            # Run tests only
 just clippy          # Lint only
 just update-adapters # Copy latest adapters to ~/.config/hstry/adapters
-just update-adapters-windows # Windows: copy to %APPDATA%\hstry\adapters
+just update-adapters-windows # Windows: copy to %APPDATA%\\hstry\\adapters
 ```
 ## Chronicle connecting layer
 

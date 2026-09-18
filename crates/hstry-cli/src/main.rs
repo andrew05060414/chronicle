@@ -7282,7 +7282,7 @@ async fn cmd_remote(
 
                 let result = match direction {
                     hstry_core::remote::SyncDirection::Pull => {
-                        remote::sync_from_remote(db, remote_config)
+                        remote::sync_from_remote(db, remote_config, &config.sync.device_namespace())
                             .await
                             .map(|(_, sync)| sync)
                     }
@@ -7298,7 +7298,12 @@ async fn cmd_remote(
                     }
                     hstry_core::remote::SyncDirection::Bidirectional => {
                         // Pull first, then push
-                        let pull_result = remote::sync_from_remote(db, remote_config).await;
+                        let pull_result = remote::sync_from_remote(
+                            db,
+                            remote_config,
+                            &config.sync.device_namespace(),
+                        )
+                        .await;
                         match pull_result {
                             Ok((_, mut sync)) => {
                                 if let Ok(push_sync) = remote::sync_to_remote(

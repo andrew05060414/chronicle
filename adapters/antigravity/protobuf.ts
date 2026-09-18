@@ -19,8 +19,12 @@ export function readVarint(buf: Uint8Array, i: number): [number, number] {
       throw new RangeError(`varint at ${i} ran past end of buffer`);
     }
     const byte = buf[offset++];
-    result |= (byte & 0x7f) << shift;
-    if ((byte & 0x80) === 0) return [result >>> 0, offset];
+    // NOTE: arithmetic accumulation, NOT `result |= (byte & 0x7f) << shift`.
+    // Bitwise ops truncate to 32 bits (`<<` also masks the shift mod 32), so
+    // unix-millisecond timestamps (> 2^32, 6-byte varints) decoded as garbage.
+    // Doubles stay exact up to 2^53, which covers all realistic timestamps.
+    result += (byte & 0x7f) * 2 ** shift;
+    if ((byte & 0x80) === 0) return [result, offset];
     shift += 7;
   }
   throw new RangeError(`varint at ${i} exceeded 10 bytes`);

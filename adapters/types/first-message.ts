@@ -11,6 +11,13 @@
  * aligned when adding new markers.
  */
 
+/**
+ * Markers for whole-message bootstrap dumps (system prompts, AGENTS.md
+ * injections, skill lists). These only ever constitute the *entire* user turn
+ * when they are genuine bootstrap, so `includes()` matching is safe here —
+ * and it keeps these markers aligned with `is_system_context` in
+ * crates/hstry-cli/src/main.rs, which also uses `contains()`.
+ */
 const SYSTEM_CONTEXT_MARKERS = [
   '# AGENTS.md',
   '# Agent Configuration',
@@ -18,6 +25,17 @@ const SYSTEM_CONTEXT_MARKERS = [
   'Guidance for coding agents',
   '<SYSTEM_PROMPT>',
   '</SYSTEM_PROMPT>',
+];
+
+/**
+ * Markers for blocks that harnesses (Claude Code, Grok, ...) routinely
+ * *append* to an otherwise genuine user turn. Matching these with
+ * `includes()` misclassifies the whole turn as system context and the title
+ * silently falls through to a later message (or `undefined`). They only count
+ * when the message starts with them — mirroring how Rust's
+ * `is_continuation_fragment` uses `starts_with` for the compaction notice.
+ */
+const APPENDED_BLOCK_MARKERS = [
   'The conversation history before this point was compacted',
   '<system-reminder>',
   '<user_info>',
@@ -28,6 +46,10 @@ export function isSystemContext(content: string): boolean {
   if (!content) return false;
   for (const marker of SYSTEM_CONTEXT_MARKERS) {
     if (content.includes(marker)) return true;
+  }
+  const trimmed = content.trimStart();
+  for (const marker of APPENDED_BLOCK_MARKERS) {
+    if (trimmed.startsWith(marker)) return true;
   }
   if (content.includes('AGENTS.md') && content.includes('instructions')) return true;
   return false;

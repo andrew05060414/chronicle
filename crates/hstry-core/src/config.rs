@@ -1,5 +1,6 @@
 //! Configuration types and loading for hstry.
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -558,8 +559,17 @@ impl Default for SyncConfig {
 }
 
 /// Normalize a device label for use as a remote merge namespace (`{namespace}:{source_id}`).
+///
+/// Empty labels still map to `"unknown"` so existing `&str` call sites keep
+/// compiling. `device_namespace()` never uses that fallback for a satellite
+/// that has no `sync.device_id`.
 pub fn sanitize_device_namespace(value: &str) -> String {
+    parse_device_namespace(value).unwrap_or_else(|| "unknown".to_string())
+}
+
+fn parse_device_namespace(value: &str) -> Option<String> {
     let sanitized: String = value
+        .trim()
         .chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
@@ -570,17 +580,7 @@ pub fn sanitize_device_namespace(value: &str) -> String {
         })
         .collect();
     let trimmed = sanitized.trim_matches('-');
-    if trimmed.is_empty() {
-        "unknown".to_string()
-    } else {
-        trimmed.to_string()
-    }
-}
-
-fn default_hostname() -> String {
-    std::env::var("COMPUTERNAME")
-        .or_else(|_| std::env::var("HOSTNAME"))
-        .unwrap_or_else(|_| "unknown".to_string())
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
 /// Rolling SQLite checkpoints for a hub archive.
@@ -627,16 +627,62 @@ impl CheckpointConfig {
 impl SyncConfig {
     /// Namespace used when pushing a satellite database to a hub.
     ///
-    /// Prefers explicit `device_id` from config; falls back to the OS hostname.
+    /// Prefers explicit `device_id` from config. Otherwise persists a generated
+    /// `device-<uuid>` under the application state directory. Never returns the
+    /// literal `"unknown"` for an unconfigured satellite.
     pub fn device_namespace(&self) -> String {
-        if let Some(ref id) = self.device_id {
-            let trimmed = id.trim();
-            if !trimmed.is_empty() {
-                return sanitize_device_namespace(trimmed);
-            }
-        }
-        sanitize_device_namespace(&default_hostname())
+        let state_root = std::env::var_os("XDG_STATE_HOME").map_or_else(
+            || {
+                dirs::state_dir()
+                    .or_else(dirs::data_local_dir)
+                    .unwrap_or_else(|| PathBuf::from("."))
+            },
+            PathBuf::from,
+        );
+        self.device_namespace_at(&state_root.join("hstry").join("device-id"))
+            .unwrap_or_else(|error| panic!("{error}"))
     }
+
+    fn device_namespace_at(&self, path: &Path) -> Result<String> {
+        if let Some(configured) = self.device_id.as_deref() {
+            return parse_device_namespace(configured).ok_or_else(|| {
+                Error::Config("sync.device_id must contain a letter or number".to_string())
+            });
+        }
+
+        if path.exists() {
+            return read_device_namespace(path);
+        }
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        let generated = format!("device-{}", uuid::Uuid::new_v4());
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+        {
+            Ok(mut file) => {
+                file.write_all(generated.as_bytes())?;
+                Ok(generated)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                read_device_namespace(path)
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+}
+
+fn read_device_namespace(path: &Path) -> Result<String> {
+    let stored = std::fs::read_to_string(path)?;
+    parse_device_namespace(&stored).ok_or_else(|| {
+        Error::Config(format!(
+            "Stored device ID at {} is invalid; delete it to regenerate",
+            path.display()
+        ))
+    })
 }
 
 impl Config {

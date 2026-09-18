@@ -58,7 +58,7 @@ pub fn plan_prune(
     let keep_weekly = keep_weekly.max(1);
 
     while total > max_total_bytes && records.len() > 1 {
-        let idx = records.iter().position(|r| !r.weekly);
+        let idx = records[..records.len() - 1].iter().position(|r| !r.weekly);
         let Some(idx) = idx else {
             break;
         };
@@ -181,7 +181,16 @@ pub async fn create_checkpoint(
     fs::create_dir_all(&dir).map_err(|e| create_stage("create checkpoint dir", &dir, e))?;
 
     let created_at = Utc::now();
-    let stem = format!("hstry-{}", created_at.format("%Y%m%d-%H%M%S"));
+    let base_stem = format!("hstry-{}", created_at.format("%Y%m%d-%H%M%S"));
+    let mut stem = base_stem.clone();
+    let mut counter = 1;
+    while archive_path(&dir, &stem).exists()
+        || manifest_path(&dir, &stem).exists()
+        || dir.join(format!("{stem}.db")).exists()
+    {
+        stem = format!("{base_stem}-{counter}");
+        counter += 1;
+    }
     let weekly = weekly.unwrap_or(created_at.weekday() == Weekday::Sun);
 
     let _lock = acquire_ingest_lock(&ingest_lock_path(database_path))?;
@@ -278,9 +287,9 @@ pub fn prune_checkpoints(dir: &Path, config: &CheckpointConfig) -> Result<Vec<Pa
             .and_then(|n| n.strip_suffix(".db.zst"))
             .unwrap_or("");
         let json = manifest_path(dir, stem);
-        let _ = fs::remove_file(&json);
+        let _ = safe_remove_file(&json);
         if archive.exists() {
-            fs::remove_file(&archive)?;
+            safe_remove_file(&archive)?;
         }
         deleted.push(archive);
     }
@@ -533,6 +542,34 @@ mod tests {
     }
 
     #[test]
+    fn prune_preserves_freshest_checkpoint_when_weeklies_exceed_cap() {
+        let records = vec![
+            rec("w1", 3, 28, true),
+            rec("w2", 3, 21, true),
+            rec("w3", 3, 14, true),
+            rec("w4", 3, 7, true),
+            rec("d_new", 1, 0, false),
+        ];
+        let deleted = plan_prune(records, 10, 4);
+        assert!(!deleted.contains(&PathBuf::from("d_new")));
+        assert!(deleted.is_empty());
+    }
+
+    #[test]
+    fn prune_drops_older_dailies_but_preserves_freshest_when_weeklies_exceed_cap() {
+        let records = vec![
+            rec("w1", 3, 28, true),
+            rec("w2", 3, 21, true),
+            rec("w3", 3, 14, true),
+            rec("w4", 3, 7, true),
+            rec("d_old", 1, 2, false),
+            rec("d_new", 1, 0, false),
+        ];
+        let deleted = plan_prune(records, 10, 4);
+        assert_eq!(deleted, vec![PathBuf::from("d_old")]);
+    }
+
+    #[test]
     fn os_error_code_parse_does_not_prefix_match() {
         assert_eq!(parse_os_error_codes("os error 5"), vec![5]);
         assert_eq!(parse_os_error_codes("os error 32"), vec![32]);
@@ -648,6 +685,57 @@ mod tests {
 
         let restore_path = dir.path().join("restored.db");
         restore_checkpoint(&ckpt_dir, &created.manifest.stem, &restore_path).unwrap();
+        let restored = Database::open(&restore_path).await.unwrap();
+        assert_eq!(restored.count_sources().await.unwrap(), 1);
+        restored.close().await;
+    }
+
+    #[tokio::test]
+    async fn restore_checkpoint_removes_stale_wal_and_shm_sidecars() {
+        use crate::models::Source;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("live.db");
+        let db = Database::open(&db_path).await.unwrap();
+        db.upsert_source(&Source {
+            id: "cursor-123".to_string(),
+            adapter: "cursor".to_string(),
+            path: Some("/test".to_string()),
+            last_sync_at: None,
+            config: serde_json::json!({}),
+        })
+        .await
+        .unwrap();
+
+        let cfg = CheckpointConfig {
+            enabled: true,
+            dir: Some(dir.path().join("checkpoints")),
+            max_total_bytes: 10 * 1024 * 1024,
+            ..Default::default()
+        };
+
+        let created = create_checkpoint(&db, &db_path, &cfg, Some(false))
+            .await
+            .unwrap();
+        db.close().await;
+
+        let restore_path = dir.path().join("restored.db");
+        let wal_path = dir.path().join("restored.db-wal");
+        let shm_path = dir.path().join("restored.db-shm");
+        fs::write(&restore_path, b"stale db").unwrap();
+        fs::write(&wal_path, b"stale wal").unwrap();
+        fs::write(&shm_path, b"stale shm").unwrap();
+
+        restore_checkpoint(
+            &cfg.dir.clone().unwrap(),
+            &created.manifest.stem,
+            &restore_path,
+        )
+        .unwrap();
+
+        assert!(!wal_path.exists(), "stale -wal sidecar should be removed");
+        assert!(!shm_path.exists(), "stale -shm sidecar should be removed");
+
         let restored = Database::open(&restore_path).await.unwrap();
         assert_eq!(restored.count_sources().await.unwrap(), 1);
         restored.close().await;

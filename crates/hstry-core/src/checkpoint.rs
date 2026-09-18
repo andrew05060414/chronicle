@@ -120,6 +120,24 @@ fn manifest_path(dir: &Path, stem: &str) -> PathBuf {
     dir.join(format!("{stem}.json"))
 }
 
+/// Sidecar written by `chronicle backup --encrypt` next to a `.db.zst` archive.
+///
+/// Bound into the existing byte-cap prune: counted toward `max_total_bytes`
+/// and removed with the matching archive. No separate retention-days policy.
+pub fn encrypted_archive_path(archive: &Path) -> PathBuf {
+    let mut name = archive.as_os_str().to_os_string();
+    name.push(".enc");
+    PathBuf::from(name)
+}
+
+fn sidecar_len(path: &Path) -> u64 {
+    fs::metadata(path).map(|m| m.len()).unwrap_or(0)
+}
+
+fn prune_on_disk_bytes(archive: &Path, manifest_compressed_bytes: u64) -> u64 {
+    manifest_compressed_bytes.saturating_add(sidecar_len(&encrypted_archive_path(archive)))
+}
+
 pub fn list_checkpoints(dir: &Path) -> Result<Vec<CheckpointInfo>> {
     if !dir.exists() {
         return Ok(Vec::new());
@@ -187,6 +205,7 @@ pub async fn create_checkpoint(
     while archive_path(&dir, &stem).exists()
         || manifest_path(&dir, &stem).exists()
         || dir.join(format!("{stem}.db")).exists()
+        || encrypted_archive_path(&archive_path(&dir, &stem)).exists()
     {
         stem = format!("{base_stem}-{counter}");
         counter += 1;
@@ -273,13 +292,13 @@ pub fn prune_checkpoints(dir: &Path, config: &CheckpointConfig) -> Result<Vec<Pa
         .iter()
         .map(|c| CheckpointRecord {
             path: c.archive_path.clone(),
-            compressed_bytes: c.manifest.compressed_bytes,
+            compressed_bytes: prune_on_disk_bytes(&c.archive_path, c.manifest.compressed_bytes),
             created_at: c.manifest.created_at,
             weekly: c.manifest.weekly,
         })
         .collect();
     let targets = plan_prune(records, config.max_total_bytes, config.keep_weekly);
-    let mut deleted = Vec::new();
+    let mut deleted = sweep_orphan_encrypted_payloads(dir)?;
     for archive in targets {
         let stem = archive
             .file_name()
@@ -287,11 +306,48 @@ pub fn prune_checkpoints(dir: &Path, config: &CheckpointConfig) -> Result<Vec<Pa
             .and_then(|n| n.strip_suffix(".db.zst"))
             .unwrap_or("");
         let json = manifest_path(dir, stem);
+        let enc = encrypted_archive_path(&archive);
         let _ = safe_remove_file(&json);
+        if enc.exists() {
+            safe_remove_file(&enc)?;
+            deleted.push(enc);
+        }
         if archive.exists() {
             safe_remove_file(&archive)?;
         }
         deleted.push(archive);
+    }
+    Ok(deleted)
+}
+
+/// Remove `.db.zst.enc` files whose matching archive is already gone.
+///
+/// These are unreachable once the `.zst` is pruned, and would otherwise
+/// accumulate outside `max_total_bytes`.
+fn sweep_orphan_encrypted_payloads(dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut orphans = Vec::new();
+    if !dir.exists() {
+        return Ok(orphans);
+    }
+    for entry in fs::read_dir(dir)? {
+        let path = entry?.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let Some(archive_name) = name.strip_suffix(".enc") else {
+            continue;
+        };
+        if !archive_name.ends_with(".db.zst") {
+            continue;
+        }
+        if !dir.join(archive_name).exists() {
+            orphans.push(path);
+        }
+    }
+    let mut deleted = Vec::new();
+    for path in orphans {
+        safe_remove_file(&path)?;
+        deleted.push(path);
     }
     Ok(deleted)
 }
@@ -567,6 +623,111 @@ mod tests {
         ];
         let deleted = plan_prune(records, 10, 4);
         assert_eq!(deleted, vec![PathBuf::from("d_old")]);
+    }
+
+    fn write_checkpoint_fixture(
+        dir: &Path,
+        stem: &str,
+        days_ago: i64,
+        weekly: bool,
+        zst_bytes: usize,
+        enc_bytes: Option<usize>,
+    ) {
+        let manifest = CheckpointManifest {
+            version: MANIFEST_VERSION,
+            created_at: Utc::now() - chrono::Duration::days(days_ago),
+            stem: stem.to_string(),
+            weekly,
+            conversations: 0,
+            messages: 0,
+            sources: 0,
+            uncompressed_bytes: zst_bytes as u64,
+            compressed_bytes: zst_bytes as u64,
+            integrity: "ok".into(),
+            live_database: "synthetic".into(),
+        };
+        fs::write(
+            dir.join(format!("{stem}.json")),
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        fs::write(dir.join(format!("{stem}.db.zst")), vec![b'z'; zst_bytes]).unwrap();
+        if let Some(n) = enc_bytes {
+            fs::write(dir.join(format!("{stem}.db.zst.enc")), vec![b'e'; n]).unwrap();
+        }
+    }
+
+    fn prune_cfg(dir: &Path, max_total_bytes: u64) -> CheckpointConfig {
+        CheckpointConfig {
+            enabled: true,
+            dir: Some(dir.to_path_buf()),
+            max_total_bytes,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn prune_counts_enc_sidecar_toward_byte_cap_and_deletes_it_with_archive() {
+        let dir = tempfile::tempdir().unwrap();
+        // Unencrypted, these two 4-byte archives (8 bytes) stay under cap 10.
+        // With 10-byte .enc sidecars they occupy 28 bytes and must prune.
+        write_checkpoint_fixture(dir.path(), "old", 2, false, 4, Some(10));
+        write_checkpoint_fixture(dir.path(), "new", 0, false, 4, Some(10));
+        let deleted = prune_checkpoints(dir.path(), &prune_cfg(dir.path(), 10)).unwrap();
+        assert!(
+            deleted
+                .iter()
+                .any(|p| p.file_name().and_then(|n| n.to_str()) == Some("old.db.zst")),
+            "oldest archive must be pruned once .enc bytes count, got {deleted:?}"
+        );
+        assert!(
+            deleted
+                .iter()
+                .any(|p| p.file_name().and_then(|n| n.to_str()) == Some("old.db.zst.enc")),
+            "matching .enc must be removed with the archive, got {deleted:?}"
+        );
+        assert!(!dir.path().join("old.db.zst").exists());
+        assert!(!dir.path().join("old.db.zst.enc").exists());
+        assert!(!dir.path().join("old.json").exists());
+        assert!(dir.path().join("new.db.zst").exists());
+        assert!(dir.path().join("new.db.zst.enc").exists());
+        assert!(dir.path().join("new.json").exists());
+    }
+
+    #[test]
+    fn prune_without_enc_does_not_delete_under_same_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        write_checkpoint_fixture(dir.path(), "old", 2, false, 4, None);
+        write_checkpoint_fixture(dir.path(), "new", 0, false, 4, None);
+        let deleted = prune_checkpoints(dir.path(), &prune_cfg(dir.path(), 10)).unwrap();
+        assert!(deleted.is_empty());
+        assert!(dir.path().join("old.db.zst").exists());
+        assert!(dir.path().join("new.db.zst").exists());
+    }
+
+    #[test]
+    fn prune_removes_orphan_enc_when_archive_already_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        write_checkpoint_fixture(dir.path(), "kept", 0, false, 4, None);
+        fs::write(dir.path().join("ghost.db.zst.enc"), vec![b'e'; 64]).unwrap();
+        let deleted = prune_checkpoints(dir.path(), &prune_cfg(dir.path(), 10 * 1024)).unwrap();
+        assert!(
+            deleted
+                .iter()
+                .any(|p| p.file_name().and_then(|n| n.to_str()) == Some("ghost.db.zst.enc")),
+            "orphan .enc must be swept even when under the byte cap, got {deleted:?}"
+        );
+        assert!(!dir.path().join("ghost.db.zst.enc").exists());
+        assert!(dir.path().join("kept.db.zst").exists());
+    }
+
+    #[test]
+    fn encrypted_archive_path_appends_enc_without_replacing_zst() {
+        let archive = PathBuf::from("hstry-20260101-000000.db.zst");
+        assert_eq!(
+            encrypted_archive_path(&archive),
+            PathBuf::from("hstry-20260101-000000.db.zst.enc")
+        );
     }
 
     #[test]

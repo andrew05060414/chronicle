@@ -12,10 +12,13 @@
 //! - checkpoint create -> mutate scratch -> restore to scratch ->
 //!   quick_check + sentinel/row-count preservation;
 //! - WAL/SHM-sensitive lifecycle with all handles closed before replacement
-//!   (Windows file-handle semantics);
+//!   (Windows file-handle semantics); on Windows only, restore over still-
+//!   open handles must fail safely and succeed after release;
 //! - fetched/full-sync database validation helpers against local temp files;
 //! - prior-schema builder that migrates/opens and preserves sentinels;
-//! - live/archive paths are refused before any database work runs.
+//! - live/archive paths are refused before any database work runs, centrally
+//!   enforced at the `Database::open` boundary while
+//!   `HSTRY_ENFORCE_TEST_DB_GUARD` is set (proven before mutation).
 
 use std::path::{Path, PathBuf};
 
@@ -145,6 +148,27 @@ fn checkpoint_config(dir: &Path) -> CheckpointConfig {
     }
 }
 
+/// Write a stale sidecar fixture, waiting (bounded) for the OS to release
+/// the memory-mapped section after close. On Windows the `-shm` file can
+/// stay mapped briefly after the last handle closes (os error 1224,
+/// user-mapped section open); the retry establishes the fixture only after
+/// the mapping is gone, so the stale state is legitimate and never
+/// truncates a live mapping.
+async fn write_stale_sidecar(slot: &Path, suffix: &str) -> anyhow::Result<()> {
+    let target = format!("{}{suffix}", slot.display());
+    let mut last_err = String::new();
+    for _ in 0..100 {
+        match std::fs::write(&target, b"stale-sidecar-fixture") {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                last_err = format!("{e}");
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        }
+    }
+    anyhow::bail!("could not establish stale sidecar fixture {target}: {last_err}")
+}
+
 #[test]
 fn live_archive_paths_are_refused_before_any_db_work() {
     for blocked in [
@@ -219,7 +243,7 @@ async fn checkpoint_mutate_restore_preserves_sentinels() -> anyhow::Result<()> {
     // Plant a stale WAL sidecar: restore must clear it so it can never replay
     // over the restored database (and so Windows never sees a locked target).
     let stale_wal = format!("{}-wal", scratch.display());
-    std::fs::write(&stale_wal, b"stale")?;
+    write_stale_sidecar(&scratch, "-wal").await?;
     restore_checkpoint(
         &tmp_dir.join("checkpoints"),
         &created.manifest.stem,
@@ -267,11 +291,13 @@ async fn wal_shm_lifecycle_closed_before_replace() -> anyhow::Result<()> {
     prior.close().await;
 
     // Stale sidecars: restore must clear them (Windows also treats a
-    // leftover sidecar as a lock on the restore target).
+    // leftover sidecar as a lock on the restore target). The fixture write
+    // waits for the post-close unmap so it never truncates a live mapping
+    // (os error 1224).
     let stale_wal = format!("{}-wal", slot.display());
     let stale_shm = format!("{}-shm", slot.display());
-    std::fs::write(&stale_wal, b"stale")?;
-    std::fs::write(&stale_shm, b"stale")?;
+    write_stale_sidecar(&slot, "-wal").await?;
+    write_stale_sidecar(&slot, "-shm").await?;
     restore_checkpoint(&tmp_dir.join("checkpoints"), &created.manifest.stem, &slot)?;
     anyhow::ensure!(
         !Path::new(&stale_wal).exists() && !Path::new(&stale_shm).exists(),
@@ -282,6 +308,81 @@ async fn wal_shm_lifecycle_closed_before_replace() -> anyhow::Result<()> {
     assert_sentinels_present(&reopened).await?;
     reopened.close().await;
     Ok(())
+}
+
+/// Windows-only: restoring over a database whose handles are still open must
+/// fail safely instead of writing a partial file; after the handles are
+/// released the same restore succeeds with sentinels intact.
+///
+/// Windows denies replacing a file with live handles (os error 32), so the
+/// refusal half is Windows-specific by OS semantics -- POSIX permits
+/// replacing open files. The success-after-release half runs on all
+/// platforms inside `wal_shm_lifecycle_closed_before_replace`.
+#[cfg(windows)]
+#[tokio::test]
+async fn restore_refuses_open_handles_and_succeeds_after_close() -> anyhow::Result<()> {
+    let (_tmp, db_path) = isolated_temp_db("integrity-gate-refusal");
+    let tmp_dir: PathBuf = _tmp.path().to_path_buf();
+    let cfg = checkpoint_config(&tmp_dir);
+
+    let db = Database::open(&db_path).await?;
+    seed_sentinels(&db).await?;
+    let created = create_checkpoint(&db, &db_path, &cfg, Some(false)).await?;
+    db.close().await;
+
+    let slot = tmp_dir.join("refusal-slot.db");
+    restore_checkpoint(&tmp_dir.join("checkpoints"), &created.manifest.stem, &slot)?;
+
+    // Hold the slot open: handles are genuinely live here by construction.
+    let held = Database::open(&slot).await?;
+    anyhow::ensure!(
+        held.count_conversations().await? == 2,
+        "slot must hold the restored sentinels before the refusal attempt"
+    );
+    let refused = restore_checkpoint(&tmp_dir.join("checkpoints"), &created.manifest.stem, &slot);
+    anyhow::ensure!(
+        refused.is_err(),
+        "restore over open handles must fail on Windows"
+    );
+    held.close().await;
+
+    // Handles released: the same restore now succeeds and nothing partial
+    // was left behind by the refused attempt.
+    restore_checkpoint(&tmp_dir.join("checkpoints"), &created.manifest.stem, &slot)?;
+    let reopened = Database::open(&slot).await?;
+    assert_sentinels_present(&reopened).await?;
+    reopened.close().await;
+    Ok(())
+}
+
+/// Central-enforcement proof: with `HSTRY_ENFORCE_TEST_DB_GUARD` set
+/// (pre-PR scripts and CI set it), opening a known live/archive path is
+/// rejected at the common `Database::open` boundary before any filesystem
+/// or database mutation -- no directory or file may appear.
+///
+/// Synchronous test driving a fresh runtime so the flag mutation (via
+/// `temp_env`, which restores it afterwards) never overlaps an ambient
+/// async context. Sibling tests open isolated temp paths, which pass the
+/// guard either way.
+#[test]
+fn open_rejects_blocked_live_path_before_mutation() {
+    temp_env::with_var(hstry_core::test_guard::GUARD_ENV_VAR, Some("1"), || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build single-threaded test runtime");
+        let result = rt.block_on(Database::open(Path::new("D:/Data/hstry/staging.db")));
+        assert!(
+            result.is_err(),
+            "guarded open of a known live path must fail"
+        );
+        // Rejected before `create_dir_all`: nothing may have been created, no
+        // matter the test runner's working directory.
+        assert!(
+            !Path::new("D:/Data/hstry/staging.db").exists() && !Path::new("D:/Data").exists(),
+            "refused open must not mutate the filesystem"
+        );
+    });
 }
 
 #[tokio::test]

@@ -65,6 +65,11 @@ impl Database {
 
     /// Open or create a database at the given path.
     pub async fn open(path: &Path) -> Result<Self> {
+        // Central test-guard enforcement: when HSTRY_ENFORCE_TEST_DB_GUARD
+        // is set (pre-PR/CI), a known live/archive path is refused before
+        // any directory creation or connection. Production (flag unset) is
+        // unaffected.
+        crate::test_guard::check_path_for_open(path).map_err(Error::Other)?;
         let parent = path.parent().unwrap_or(Path::new("."));
         if !parent.exists() {
             std::fs::create_dir_all(parent)?;
@@ -1049,6 +1054,7 @@ impl Database {
     /// only. Returns an error for corrupt files, non-SQLite files, and
     /// SQLite files that are not hstry archives.
     pub async fn validate_hstry_database_file(path: &Path) -> Result<()> {
+        crate::test_guard::check_path_for_open(path).map_err(Error::Other)?;
         let options = SqliteConnectOptions::new().filename(path).read_only(true);
         let pool = SqlitePoolOptions::new()
             .max_connections(1)

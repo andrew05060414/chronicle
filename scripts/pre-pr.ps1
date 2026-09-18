@@ -35,6 +35,10 @@ $env:XDG_STATE_HOME = Join-Path $IsolatedHome ".local/state"
 New-Item -ItemType Directory -Path $env:XDG_CONFIG_HOME, $env:XDG_DATA_HOME, $env:XDG_STATE_HOME | Out-Null
 Write-Host "pre-pr: isolated HOME=$IsolatedHome"
 
+# Central test-guard enforcement: while set, Database::open refuses known
+# live/archive paths before any filesystem mutation (see test_guard.rs).
+$env:HSTRY_ENFORCE_TEST_DB_GUARD = "1"
+
 try {
   Refuse-LivePath($env:HSTRY_DATABASE)
 

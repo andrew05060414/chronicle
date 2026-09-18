@@ -24,6 +24,10 @@ mkdir -p "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$XDG_STATE_HOME"
 echo "pre-pr: isolated HOME=$HOME"
 trap 'rm -rf "$ISOLATED_HOME"' EXIT
 
+# Central test-guard enforcement: while set, Database::open refuses known
+# live/archive paths before any filesystem mutation (see test_guard.rs).
+export HSTRY_ENFORCE_TEST_DB_GUARD=1
+
 refuse_live_path() {
   case "$(printf '%s' "$1" | tr '\\\\' '/' | tr '[:upper:]' '[:lower:]')" in
     d:/data/hstry|d:/data/hstry/*)

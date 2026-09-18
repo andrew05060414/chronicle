@@ -33,11 +33,16 @@ Pre-commit stays lightweight; this pre-PR gate is the hard gate.
 - `HOME`, `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, and `XDG_STATE_HOME` are
   redirected to a fresh temp directory, so no command can resolve the real
   user config/home/database.
-- Known live/archive roots (notably the `D:/Data/hstry` tree, e.g.
-  `D:/Data/hstry/staging.db`) are refused up front, and the Rust tests
-  re-enforce this themselves via `hstry_core::test_guard` — they panic
-  before any database work when a blocked path is detected, instead of
-  relying only on CI isolation.
+- Central enforcement, not just convention: pre-PR scripts and CI set
+  `HSTRY_ENFORCE_TEST_DB_GUARD=1`, and the common `Database::open`
+  boundary (plus read-only file validation) refuses known live/archive
+  roots (notably the `D:/Data/hstry` tree, e.g.
+  `D:/Data/hstry/staging.db`) BEFORE any directory creation or connection
+  whenever the flag is set. Production and ad-hoc debug runs leave the
+  flag unset and are completely unaffected. Per-test
+  `hstry_core::test_guard::assert_test_path_safe` / `isolated_temp_db`
+  remain as a second layer, and `open_rejects_blocked_live_path_before_mutation`
+  proves the refusal happens before filesystem mutation.
 - Only synthetic sentinel conversations/messages are seeded, in isolated
   temp databases. No network, SSH, NAS, or remotes anywhere in the suite.
 
@@ -74,13 +79,20 @@ semantics differ (open SQLite files lock on Windows). No step uses
    open live database. The test reuses one slot across two incarnations
    (open -> close with WAL checkpoint -> plant stale `-wal`/`-shm` ->
    restore over the closed slot), asserting the replace succeeds, stale
-   sidecars are cleared, and sentinels survive. Note: on `main`,
+   sidecars are cleared, and sentinels survive. The stale-sidecar fixture
+   is established with a bounded wait so it never truncates a still-mapped
+   section (Windows os error 1224). A Windows-only test additionally holds
+   the slot open and asserts restore fails safely (no partial file) and
+   then succeeds after release. Note: on `main`,
    `checkpoint restore --live` still replaces the file while the pool is
    open; that overwrite-while-open sequence is a separately owned defect
    (PR #30) and is deliberately not modeled here. `restore_checkpoint`
-   additionally tolerates Windows handle-release latency with a bounded
-   (~5s) remove/create retry whose last error propagates, so a genuine
-   leak still fails loudly.
+   removes the target and each `-wal`/`-shm` sidecar strictly via
+   `safe_remove_file` (bounded retry on transient Windows locks 32/5,
+   every other failure propagates) -- the same shape as PR #30, so it
+   rebases cleanly; the gate adds tests/workflow/guard infrastructure, not
+   a second restore implementation. No best-effort test helper is used in
+   the production path.
 6. Fetched/full-sync validation helpers
    (`Database::validate_hstry_database_file`, read-only, local temp files
    only): a valid archive passes; a corrupt file and a SQLite file without

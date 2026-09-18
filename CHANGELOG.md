@@ -23,12 +23,14 @@ Upstream last consumed here is `v0.5.25` (`a4be7c9`). Keep fork version at `1.0.
 ### Changed
 
 - Satellite push exports only conversations with `updated_at` since the last successful ingest (watermark in `search_state`). `--full` keeps the legacy whole-file replace for recovery.
-- Satellite search defaults to the hub remote (`sync.hub_remote`) instead of local staging (trx-1xsa). Pass `--scope local` to search only this machine.
+- Satellite search still queries the hub remote (`sync.hub_remote`, trx-1xsa) but defaults to `--scope all` so local staging is read too. Pass `--scope local` for this machine only, `--scope remote` for hub-only.
 - Search JSON now returns a report object; upgrade service/API/remote binaries together. `show` is bounded by default; use `--full` for legacy output.
 - Resume uses structured arguments, fresh conversion identities, origin sidecars, and no-overwrite placement. JSON returns a non-executing plan; converted launches require `--allow-unverified`.
 
 ### Fixed
 
+- Restore the global `--no-color` flag (`console::set_colors_enabled(false)`). Scripts that pass `hstry --no-color` no longer die on an unexpected clap argument.
+- Satellite default search reads the local database. An unreachable hub keeps those local hits (with a warning) instead of failing the whole search.
 - Antigravity SQLite conversations read timestamps from `step_payload` field 5 (`CortexStepMetadata` Timestamp, or a unix varint) when `metadata` is empty, instead of using wall-clock `Date.now()` per row.
 - Default remote search (CLI and TUI) uses `sync.hub_remote` and errors if that name is missing, instead of silently querying every remote. Explicit `--remote` is unchanged.
 - Windows MSVC debug builds reserve an 8MB stack so `hstry --help` no longer hits `STATUS_STACK_OVERFLOW`.

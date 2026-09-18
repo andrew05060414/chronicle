@@ -832,7 +832,8 @@ const adapter: Adapter = {
   },
 
   async parse(path: string, opts?: ParseOptions): Promise<Conversation[]> {
-    if (!openDb) return [];
+    // Offline snapshot parsing does not require SQLite. DB-backed paths already
+    // degrade to no conversations when the SQLite binding is unavailable.
     return loadAllCursorSessions(path, opts);
   },
 

@@ -58,6 +58,18 @@ fn normalize_source_path(path: Option<&String>) -> Option<String> {
     path.map(|p| p.trim_end_matches('/').to_string())
 }
 
+/// Row counts and integrity of a `VACUUM INTO` snapshot.
+///
+/// Used by checkpoint creation so the live archive can stay open while the
+/// snapshot is verified without enabling WAL on the copy.
+#[derive(Debug, Clone)]
+pub(crate) struct SnapshotInspect {
+    pub integrity: String,
+    pub conversations: i64,
+    pub messages: i64,
+    pub sources: i64,
+}
+
 impl Database {
     pub(crate) fn read_pool(&self) -> &SqlitePool {
         &self.pool
@@ -65,6 +77,11 @@ impl Database {
 
     /// Open or create a database at the given path.
     pub async fn open(path: &Path) -> Result<Self> {
+        // Central test-guard: when HSTRY_ENFORCE_TEST_DB_GUARD is set AND
+        // the path is under HSTRY_TEST_BLOCKED_DB_ROOTS, refuse before any
+        // directory creation or connection. Flag-only (no root list) is a
+        // no-op so a leaked flag cannot brick production.
+        crate::test_guard::check_path_for_open(path).map_err(Error::Other)?;
         let parent = path.parent().unwrap_or(Path::new("."));
         if !parent.exists() {
             std::fs::create_dir_all(parent)?;
@@ -1007,6 +1024,122 @@ impl Database {
             .fetch_one(&self.pool)
             .await?;
         Ok(row.get::<String, _>(0))
+    }
+
+    /// Run `PRAGMA quick_check` and return the first result row.
+    ///
+    /// `quick_check` is the fast PR-gate counterpart of `integrity_check`:
+    /// it catches corruption without the full scan cost of `integrity_check`.
+    pub async fn quick_check(&self) -> Result<String> {
+        let row = sqlx::query("PRAGMA quick_check")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(row.get::<String, _>(0))
+    }
+
+    /// Verify the required archive tables exist, else return an error.
+    ///
+    /// This is the smallest maintainable schema contract for the pre-PR
+    /// memory-integrity gate: the authoritative archive must always expose
+    /// these tables. New migrations extend the schema but must never remove
+    /// them; the migration-protection test enforces this after upgrades.
+    pub async fn require_schema(&self) -> Result<()> {
+        for table in ["schema_migrations", "sources", "conversations", "messages"] {
+            let row: Option<(String,)> =
+                sqlx::query_as("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?")
+                    .bind(table)
+                    .fetch_optional(&self.pool)
+                    .await?;
+            if row.is_none() {
+                return Err(Error::Other(format!("required table missing: {table}")));
+            }
+        }
+        Ok(())
+    }
+
+    /// Validate a database *file* without running migrations and without any
+    /// network/SSH/remote access.
+    ///
+    /// Opens the file read-only, runs `PRAGMA quick_check`, and verifies the
+    /// required archive tables exist. Used by the memory-integrity gate to
+    /// validate fetched/full-sync database files against local temp files
+    /// only. Returns an error for corrupt files, non-SQLite files, and
+    /// SQLite files that are not hstry archives.
+    pub async fn validate_hstry_database_file(path: &Path) -> Result<()> {
+        crate::test_guard::check_path_for_open(path).map_err(Error::Other)?;
+        let options = SqliteConnectOptions::new().filename(path).read_only(true);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .map_err(|e| Error::Other(format!("cannot open database file for validation: {e}")))?;
+        let check: (String,) = sqlx::query_as("PRAGMA quick_check")
+            .fetch_one(&pool)
+            .await
+            .map_err(|e| Error::Other(format!("quick_check failed: {e}")))?;
+        if check.0 != "ok" {
+            pool.close().await;
+            return Err(Error::Other(format!("quick_check failed: {}", check.0)));
+        }
+        for table in ["sources", "conversations", "messages"] {
+            let row: Option<(String,)> =
+                sqlx::query_as("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?")
+                    .bind(table)
+                    .fetch_optional(&pool)
+                    .await
+                    .map_err(|e| Error::Other(format!("schema check failed: {e}")))?;
+            if row.is_none() {
+                pool.close().await;
+                return Err(Error::Other(format!(
+                    "not a hstry database: table missing: {table}"
+                )));
+            }
+        }
+        pool.close().await;
+        Ok(())
+    }
+
+    /// Inspect a checkpoint snapshot read-only: no WAL, no migrations, no
+    /// writes.
+    ///
+    /// `Database::open` always enables WAL and runs `init()`. Using it on a
+    /// freshly vacuumed copy creates `-wal`/`-shm` next to the snapshot and
+    /// then races Windows handle release when the copy is compressed and
+    /// deleted. This path is the production inspect for that snapshot.
+    pub(crate) async fn inspect_readonly_snapshot(path: &Path) -> Result<SnapshotInspect> {
+        crate::test_guard::check_path_for_open(path).map_err(Error::Other)?;
+        let options = SqliteConnectOptions::new()
+            .filename(path)
+            .create_if_missing(false)
+            .read_only(true);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await?;
+        let result = Self::inspect_readonly_snapshot_with(&pool).await;
+        pool.close().await;
+        result
+    }
+
+    async fn inspect_readonly_snapshot_with(pool: &SqlitePool) -> Result<SnapshotInspect> {
+        let integrity: (String,) = sqlx::query_as("PRAGMA integrity_check")
+            .fetch_one(pool)
+            .await?;
+        let conversations: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM conversations")
+            .fetch_one(pool)
+            .await?;
+        let messages: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM messages")
+            .fetch_one(pool)
+            .await?;
+        let sources: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM sources")
+            .fetch_one(pool)
+            .await?;
+        Ok(SnapshotInspect {
+            integrity: integrity.0,
+            conversations: conversations.0,
+            messages: messages.0,
+            sources: sources.0,
+        })
     }
 
     /// Consistent online copy of this database via `VACUUM INTO`.

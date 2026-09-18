@@ -88,11 +88,16 @@ semantics differ (open SQLite files lock on Windows). No step uses
    open; that overwrite-while-open sequence is a separately owned defect
    (PR #30) and is deliberately not modeled here. `restore_checkpoint`
    removes the target and each `-wal`/`-shm` sidecar strictly via
-   `safe_remove_file` (bounded retry on transient Windows locks 32/5,
-   every other failure propagates) -- the same shape as PR #30, so it
-   rebases cleanly; the gate adds tests/workflow/guard infrastructure, not
-   a second restore implementation. No best-effort test helper is used in
-   the production path.
+   `safe_remove_file` (bounded ~5s retry on transient Windows locks
+   32/5/1224, every other failure propagates) and opens the freshly
+   written archive through a bounded transient-only retry, since that
+   open races handle release/indexing on hosted Windows; decode and
+   corruption errors never retry. Every restore filesystem step reports
+   its stage and path, so CI is diagnosable from one error line. The
+   shape matches PR #30, so it rebases cleanly; the gate adds
+   tests/workflow/guard infrastructure, not a second restore
+   implementation. No best-effort test helper is used in the production
+   path.
 6. Fetched/full-sync validation helpers
    (`Database::validate_hstry_database_file`, read-only, local temp files
    only): a valid archive passes; a corrupt file and a SQLite file without

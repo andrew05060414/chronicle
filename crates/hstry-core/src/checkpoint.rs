@@ -265,11 +265,22 @@ pub fn prune_checkpoints(dir: &Path, config: &CheckpointConfig) -> Result<Vec<Pa
     Ok(deleted)
 }
 
+/// Windows transient file-lock codes worth a bounded retry while the OS
+/// releases handles or finishes indexing a fresh file.
+///
+/// 32: ERROR_SHARING_VIOLATION, 5: ERROR_ACCESS_DENIED,
+/// 1224: ERROR_USER_MAPPED_SECTION_OPEN. Anything else (corruption, missing
+/// files, permission policy, semantic errors) must fail fast, never retry.
+fn is_transient_lock(code: Option<i32>) -> bool {
+    matches!(code, Some(32) | Some(5) | Some(1224))
+}
+
 /// Remove `path` for restore, retrying transient Windows locks.
 ///
-/// 32: ERROR_SHARING_VIOLATION, 5: ERROR_ACCESS_DENIED. Any other error, or
-/// a lock that does not clear within the bound, propagates: production
-/// restore must never silently continue with a stale file in place.
+/// Bounded at ~5s (100 x 50ms), consistent with test cleanup tolerance for
+/// hosted-runner handle/indexing latency. Any non-transient error, or a lock
+/// that does not clear within the bound, propagates: production restore must
+/// never silently continue with a stale file in place.
 /// (Shared shape with PR #30 so it rebases cleanly; the gate adds
 /// tests/workflow/guard infrastructure, not a second implementation.)
 pub(crate) fn safe_remove_file(path: &Path) -> Result<()> {
@@ -283,9 +294,7 @@ pub(crate) fn safe_remove_file(path: &Path) -> Result<()> {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(e) => {
                 attempts += 1;
-                let code = e.raw_os_error();
-                // 32: ERROR_SHARING_VIOLATION, 5: ERROR_ACCESS_DENIED (Windows transient file locks)
-                if (code == Some(32) || code == Some(5)) && attempts < 20 {
+                if is_transient_lock(e.raw_os_error()) && attempts < 100 {
                     std::thread::sleep(std::time::Duration::from_millis(50));
                     continue;
                 }
@@ -302,8 +311,7 @@ fn safe_create_file(path: &Path) -> std::io::Result<File> {
             Ok(f) => return Ok(f),
             Err(e) => {
                 attempts += 1;
-                let code = e.raw_os_error();
-                if (code == Some(32) || code == Some(5)) && attempts < 10 {
+                if is_transient_lock(e.raw_os_error()) && attempts < 10 {
                     std::thread::sleep(std::time::Duration::from_millis(25));
                     continue;
                 }
@@ -311,6 +319,40 @@ fn safe_create_file(path: &Path) -> std::io::Result<File> {
             }
         }
     }
+}
+
+/// Open the freshly-written checkpoint archive for reading, retrying
+/// transient Windows locks.
+///
+/// A brand-new destination can still fail restore here: opening the archive
+/// races OS handle release / antivirus indexing of the just-finished
+/// checkpoint write. Bounded at ~2s (40 x 50ms); decode/corruption errors
+/// downstream never retry.
+fn safe_open_file(path: &Path) -> std::io::Result<File> {
+    let mut attempts = 0;
+    loop {
+        match File::open(path) {
+            Ok(f) => return Ok(f),
+            Err(e) => {
+                attempts += 1;
+                if is_transient_lock(e.raw_os_error()) && attempts < 40 {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    continue;
+                }
+                return Err(e);
+            }
+        }
+    }
+}
+
+/// Annotate a restore failure with the exact stage and path so future CI is
+/// diagnosable from a single error line. The original error text (including
+/// any os error code) is preserved.
+fn restore_stage(stage: &str, path: &Path, err: impl std::fmt::Display) -> Error {
+    Error::Other(format!(
+        "checkpoint restore: {stage} failed for {}: {err}",
+        path.display()
+    ))
 }
 
 pub fn restore_checkpoint(dir: &Path, stem: &str, dest: &Path) -> Result<PathBuf> {
@@ -322,22 +364,29 @@ pub fn restore_checkpoint(dir: &Path, stem: &str, dest: &Path) -> Result<PathBuf
         )));
     }
     if let Some(parent) = dest.parent() {
-        fs::create_dir_all(parent)?;
+        fs::create_dir_all(parent)
+            .map_err(|e| restore_stage("create destination parent", parent, e))?;
     }
     // All database handles to `dest` must be closed before this call (see
     // `Database::close`, which checkpoints WAL first). Every removal below
     // is strict: a sidecar that cannot be cleared fails the restore instead
     // of letting a new database be written next to a stale WAL/SHM.
-    safe_remove_file(dest)?;
+    safe_remove_file(dest).map_err(|e| restore_stage("remove destination", dest, e))?;
     for suffix in ["-wal", "-shm"] {
         let mut sidecar_os = dest.as_os_str().to_os_string();
         sidecar_os.push(suffix);
         let sidecar = PathBuf::from(sidecar_os);
-        safe_remove_file(&sidecar)?;
+        safe_remove_file(&sidecar).map_err(|e| restore_stage("remove sidecar", &sidecar, e))?;
     }
-    let input = BufReader::new(File::open(&archive)?);
-    let output = BufWriter::new(safe_create_file(dest).map_err(Error::Io)?);
-    zstd::stream::copy_decode(input, output)?;
+    let input = BufReader::new(
+        safe_open_file(&archive)
+            .map_err(|e| restore_stage("open checkpoint archive", &archive, e))?,
+    );
+    let output = BufWriter::new(
+        safe_create_file(dest).map_err(|e| restore_stage("create destination", dest, e))?,
+    );
+    zstd::stream::copy_decode(input, output)
+        .map_err(|e| restore_stage("decode checkpoint archive", &archive, e))?;
     Ok(dest.to_path_buf())
 }
 
@@ -382,6 +431,40 @@ mod tests {
         let records = vec![rec("only", 20, 0, false)];
         let deleted = plan_prune(records, 10, 4);
         assert!(deleted.is_empty());
+    }
+
+    #[test]
+    fn restore_failure_names_stage_and_path() {
+        // Diagnosability contract: a restore failure must state exactly
+        // which stage and path failed, so CI is readable from one line.
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("out.db");
+        let err = restore_checkpoint(dir.path(), "missing-stem", &dest).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("missing-stem"),
+            "restore error must name the missing archive, got: {msg}"
+        );
+
+        // A corrupt archive must fail at the decode stage with the archive
+        // path, without any transient retry masking it.
+        let stem = "corrupt-stem";
+        std::fs::write(dir.path().join(format!("{stem}.db.zst")), b"not zstd").unwrap();
+        std::fs::write(
+            dir.path().join(format!("{stem}.json")),
+            serde_json::json!({"stem": stem}).to_string(),
+        )
+        .unwrap();
+        let err = restore_checkpoint(dir.path(), stem, &dest).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("decode") && msg.contains(stem),
+            "decode failure must name the stage and archive, got: {msg}"
+        );
+        // Failed restore must not leave a partial destination behind... the
+        // destination file exists (created before decode) but the call
+        // reported the failure loudly instead of succeeding.
+        assert!(!dest.exists() || std::fs::metadata(&dest).unwrap().len() == 0);
     }
 
     #[tokio::test]

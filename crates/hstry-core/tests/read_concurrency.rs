@@ -77,7 +77,7 @@ async fn readers_keep_bounded_consistent_pages_during_ingestion() -> anyhow::Res
             .await?;
         assert_eq!(page.records[0].text, "message 0");
         assert!(page.version >= last_version);
-        assert!(page.to_wire()?.chars().count() + 1 <= 1200);
+        assert!(page.to_wire()?.chars().count() < 1200);
         last_version = page.version;
     }
     writing.await??;

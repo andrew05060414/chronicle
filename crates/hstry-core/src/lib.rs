@@ -21,6 +21,7 @@ pub mod remote;
 pub mod schema;
 pub mod service;
 pub mod source_registry;
+pub mod test_guard;
 
 pub use config::Config;
 pub use db::Database;

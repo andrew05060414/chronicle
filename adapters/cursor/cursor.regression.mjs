@@ -4,9 +4,9 @@
 // were found (`full()`), and only sorted that subset — returning whichever
 // sessions the filesystem walk happened to find first instead of the newest.
 //
-// Uses offline snapshot fixtures so no SQLite database is needed.
-// Requires better-sqlite3 to be importable (the adapter returns [] without
-// it): npm install --no-save better-sqlite3
+// Uses offline snapshot fixtures, so this path must work even when no SQLite
+// binding is installed. DB-backed Cursor data may be unavailable in that case,
+// but JSON/JSON.GZ snapshot recovery is independent of SQLite.
 //
 // Run with: node adapters/cursor/cursor.regression.mjs
 // (runs from the repo root)

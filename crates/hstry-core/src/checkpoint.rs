@@ -1,7 +1,7 @@
 //! Rolling compressed checkpoints of a hub SQLite database.
 
 use std::fs::{self, File};
-use std::io::{BufReader, BufWriter};
+use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Datelike, Utc, Weekday};
@@ -212,12 +212,15 @@ pub async fn create_checkpoint(
             safe_open_file(&raw_path)
                 .map_err(|e| create_stage("open snapshot for compress", &raw_path, e))?,
         );
-        let output = BufWriter::new(
+        let mut output = BufWriter::new(
             safe_create_file(&zst_path)
                 .map_err(|e| create_stage("create archive", &zst_path, e))?,
         );
-        zstd::stream::copy_encode(input, output, 3)
+        zstd::stream::copy_encode(input, &mut output, 3)
             .map_err(|e| create_stage("compress snapshot", &raw_path, e))?;
+        output
+            .flush()
+            .map_err(|e| create_stage("flush archive", &zst_path, e))?;
     }
     let compressed_bytes = fs::metadata(&zst_path)
         .map_err(|e| create_stage("stat archive", &zst_path, e))?
@@ -381,18 +384,41 @@ fn create_stage(stage: &str, path: &Path, err: impl std::fmt::Display) -> Error 
     ))
 }
 
+/// Parse `os error N` codes from a Display string. Digits are consumed in
+/// full, so `os error 5` matches 5 and `os error 50` matches 50 — never
+/// a prefix of a larger Windows network code (50/53/55/59).
+fn parse_os_error_codes(s: &str) -> Vec<i32> {
+    const NEEDLE: &str = "os error ";
+    let mut codes = Vec::new();
+    let mut rest = s;
+    while let Some(i) = rest.find(NEEDLE) {
+        rest = &rest[i + NEEDLE.len()..];
+        let digits_end = rest
+            .char_indices()
+            .take_while(|(_, c)| c.is_ascii_digit())
+            .last()
+            .map(|(idx, c)| idx + c.len_utf8())
+            .unwrap_or(0);
+        if digits_end == 0 {
+            continue;
+        }
+        if let Ok(n) = rest[..digits_end].parse::<i32>() {
+            codes.push(n);
+        }
+        rest = &rest[digits_end..];
+    }
+    codes
+}
+
 fn error_is_transient_lock(err: &Error) -> bool {
     if let Error::Io(e) = err
         && is_transient_lock(e.raw_os_error())
     {
         return true;
     }
-    let s = err.to_string();
-    s.contains("os error 32")
-        || s.contains("os error 5")
-        || s.contains("os error 1224")
-        || s.contains("being used by another process")
-        || s.contains("user-mapped section")
+    parse_os_error_codes(&err.to_string())
+        .into_iter()
+        .any(|c| is_transient_lock(Some(c)))
 }
 
 async fn vacuum_into_with_retry(db: &Database, dest: &Path) -> Result<()> {
@@ -452,11 +478,14 @@ pub fn restore_checkpoint(dir: &Path, stem: &str, dest: &Path) -> Result<PathBuf
         safe_open_file(&archive)
             .map_err(|e| restore_stage("open checkpoint archive", &archive, e))?,
     );
-    let output = BufWriter::new(
+    let mut output = BufWriter::new(
         safe_create_file(dest).map_err(|e| restore_stage("create destination", dest, e))?,
     );
-    zstd::stream::copy_decode(input, output)
+    zstd::stream::copy_decode(input, &mut output)
         .map_err(|e| restore_stage("decode checkpoint archive", &archive, e))?;
+    output
+        .flush()
+        .map_err(|e| restore_stage("flush destination", dest, e))?;
     Ok(dest.to_path_buf())
 }
 
@@ -501,6 +530,37 @@ mod tests {
         let records = vec![rec("only", 20, 0, false)];
         let deleted = plan_prune(records, 10, 4);
         assert!(deleted.is_empty());
+    }
+
+    #[test]
+    fn os_error_code_parse_does_not_prefix_match() {
+        assert_eq!(parse_os_error_codes("os error 5"), vec![5]);
+        assert_eq!(parse_os_error_codes("os error 32"), vec![32]);
+        assert_eq!(parse_os_error_codes("os error 1224"), vec![1224]);
+        assert_eq!(parse_os_error_codes("os error 50"), vec![50]);
+        assert_eq!(
+            parse_os_error_codes("Io(Os { code: 32, kind: Uncategorized, message: \"x\" })"),
+            Vec::<i32>::new()
+        );
+        assert_eq!(
+            parse_os_error_codes("failed: os error 5 (and later os error 32)"),
+            vec![5, 32]
+        );
+        assert!(error_is_transient_lock(&Error::Other(
+            "checkpoint create: vacuum into snapshot failed for x: os error 5".into()
+        )));
+        assert!(!error_is_transient_lock(&Error::Other(
+            "checkpoint create: vacuum into snapshot failed for x: os error 50".into()
+        )));
+        assert!(!error_is_transient_lock(&Error::Other(
+            "checkpoint create: vacuum into snapshot failed for x: os error 53".into()
+        )));
+        assert!(error_is_transient_lock(&Error::Other(
+            "checkpoint create: inspect snapshot failed for x: os error 32".into()
+        )));
+        assert!(error_is_transient_lock(&Error::Other(
+            "checkpoint restore: remove sidecar failed for x: os error 1224".into()
+        )));
     }
 
     #[test]

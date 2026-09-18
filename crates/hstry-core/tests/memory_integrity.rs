@@ -28,7 +28,9 @@ use hstry_core::config::CheckpointConfig;
 use hstry_core::ingest::ingest_batch;
 use hstry_core::models::Source;
 use hstry_core::parsed::{ParsedConversation, ParsedMessage};
-use hstry_core::test_guard::{assert_test_path_safe, isolated_temp_db};
+use hstry_core::test_guard::{
+    BLOCKED_ROOTS_ENV_VAR, GUARD_ENV_VAR, assert_test_path_safe, isolated_temp_db,
+};
 
 const SENTINEL_A: &str = "hstry-integrity-sentinel-alpha-7f3a9c";
 const SENTINEL_B: &str = "hstry-integrity-sentinel-beta-41d2e8";
@@ -171,17 +173,20 @@ async fn write_stale_sidecar(slot: &Path, suffix: &str) -> anyhow::Result<()> {
 
 #[test]
 fn live_archive_paths_are_refused_before_any_db_work() {
-    for blocked in [
-        "D:/Data/hstry/staging.db",
-        "D:\\Data\\hstry\\staging.db",
-        "d:/data/hstry/hstry.db",
-        "D:/Data/hstry/nested/archive.db",
-    ] {
-        assert!(
-            std::panic::catch_unwind(|| assert_test_path_safe(Path::new(blocked))).is_err(),
-            "live path was not refused: {blocked}"
-        );
-    }
+    const ROOT: &str = "c:/hstry-test-blocked-root";
+    temp_env::with_var(BLOCKED_ROOTS_ENV_VAR, Some(ROOT), || {
+        for blocked in [
+            "c:/hstry-test-blocked-root/staging.db",
+            "c:\\hstry-test-blocked-root\\staging.db",
+            "c:/hstry-test-blocked-root/hstry.db",
+            "c:/hstry-test-blocked-root/nested/archive.db",
+        ] {
+            assert!(
+                std::panic::catch_unwind(|| assert_test_path_safe(Path::new(blocked))).is_err(),
+                "blocked path was not refused: {blocked}"
+            );
+        }
+    });
     let (_tmp, safe) = isolated_temp_db("integrity-gate-guard");
     assert_test_path_safe(&safe);
 }
@@ -355,34 +360,42 @@ async fn restore_refuses_open_handles_and_succeeds_after_close() -> anyhow::Resu
     Ok(())
 }
 
-/// Central-enforcement proof: with `HSTRY_ENFORCE_TEST_DB_GUARD` set
-/// (pre-PR scripts and CI set it), opening a known live/archive path is
-/// rejected at the common `Database::open` boundary before any filesystem
-/// or database mutation -- no directory or file may appear.
+/// Central-enforcement proof: with `HSTRY_ENFORCE_TEST_DB_GUARD` set and a
+/// synthetic blocked root, opening a path under that root is rejected at
+/// `Database::open` before any filesystem or database mutation — the
+/// blocked root itself must not appear.
 ///
 /// Synchronous test driving a fresh runtime so the flag mutation (via
 /// `temp_env`, which restores it afterwards) never overlaps an ambient
 /// async context. Sibling tests open isolated temp paths, which pass the
-/// guard either way.
+/// guard either way. The blocked root is injected, never a real live disk.
 #[test]
 fn open_rejects_blocked_live_path_before_mutation() {
-    temp_env::with_var(hstry_core::test_guard::GUARD_ENV_VAR, Some("1"), || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("build single-threaded test runtime");
-        let result = rt.block_on(Database::open(Path::new("D:/Data/hstry/staging.db")));
-        assert!(
-            result.is_err(),
-            "guarded open of a known live path must fail"
-        );
-        // Rejected before `create_dir_all`: nothing may have been created, no
-        // matter the test runner's working directory.
-        assert!(
-            !Path::new("D:/Data/hstry/staging.db").exists() && !Path::new("D:/Data").exists(),
-            "refused open must not mutate the filesystem"
-        );
-    });
+    let (tmp, _) = isolated_temp_db("integrity-gate-open-guard");
+    let blocked_root = tmp.path().join("blocked-root-must-not-be-created");
+    let db_path = blocked_root.join("staging.db");
+    let root_str = blocked_root.to_string_lossy().into_owned();
+    temp_env::with_vars(
+        [
+            (GUARD_ENV_VAR, Some("1")),
+            (BLOCKED_ROOTS_ENV_VAR, Some(root_str.as_str())),
+        ],
+        || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build single-threaded test runtime");
+            let result = rt.block_on(Database::open(&db_path));
+            assert!(
+                result.is_err(),
+                "guarded open of a configured blocked path must fail"
+            );
+            assert!(
+                !db_path.exists() && !blocked_root.exists(),
+                "refused open must not mutate the filesystem"
+            );
+        },
+    );
 }
 
 #[tokio::test]

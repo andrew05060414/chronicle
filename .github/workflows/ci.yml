@@ -10,10 +10,11 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  # Central test-guard enforcement: while set, Database::open refuses known
-  # live/archive paths before any filesystem mutation. Production (unset) is
-  # unaffected. See crates/hstry-core/src/test_guard.rs.
+  # Central test-guard: Database::open refuses roots listed here, and only
+  # while the flag is set. Production (both unset) is unaffected. Roots are
+  # operator config, not compiled into the library.
   HSTRY_ENFORCE_TEST_DB_GUARD: "1"
+  HSTRY_TEST_BLOCKED_DB_ROOTS: "D:/Data/hstry"
 
 jobs:
   test:

@@ -77,10 +77,10 @@ impl Database {
 
     /// Open or create a database at the given path.
     pub async fn open(path: &Path) -> Result<Self> {
-        // Central test-guard enforcement: when HSTRY_ENFORCE_TEST_DB_GUARD
-        // is set (pre-PR/CI), a known live/archive path is refused before
-        // any directory creation or connection. Production (flag unset) is
-        // unaffected.
+        // Central test-guard: when HSTRY_ENFORCE_TEST_DB_GUARD is set AND
+        // the path is under HSTRY_TEST_BLOCKED_DB_ROOTS, refuse before any
+        // directory creation or connection. Flag-only (no root list) is a
+        // no-op so a leaked flag cannot brick production.
         crate::test_guard::check_path_for_open(path).map_err(Error::Other)?;
         let parent = path.parent().unwrap_or(Path::new("."));
         if !parent.exists() {

@@ -35,9 +35,12 @@ $env:XDG_STATE_HOME = Join-Path $IsolatedHome ".local/state"
 New-Item -ItemType Directory -Path $env:XDG_CONFIG_HOME, $env:XDG_DATA_HOME, $env:XDG_STATE_HOME | Out-Null
 Write-Host "pre-pr: isolated HOME=$IsolatedHome"
 
-# Central test-guard enforcement: while set, Database::open refuses known
-# live/archive paths before any filesystem mutation (see test_guard.rs).
+# Central test-guard: flag + operator-configured roots (not compiled in).
+# A leaked flag with an empty root list refuses nothing.
 $env:HSTRY_ENFORCE_TEST_DB_GUARD = "1"
+if (-not $env:HSTRY_TEST_BLOCKED_DB_ROOTS) {
+  $env:HSTRY_TEST_BLOCKED_DB_ROOTS = "D:/Data/hstry"
+}
 
 try {
   Refuse-LivePath($env:HSTRY_DATABASE)

@@ -1,25 +1,14 @@
 //! Isolation guards for tests touching the authoritative archive.
 //!
 //! Chronicle is the authoritative conversation/memory SQLite archive. Tests
-//! must only ever open databases inside an isolated temporary directory and
-//! must never resolve to a known live/archive location (for example
-//! `D:/Data/hstry/staging.db`). CI isolation alone is not sufficient: every
-//! test fails fast here, before executing any database work, when a blocked
-//! path is detected.
+//! must only ever open databases inside an isolated temporary directory.
+//! This module never hardcodes a machine-specific live root: blocked roots
+//! come from [`BLOCKED_ROOTS_ENV_VAR`]. The open-boundary check in
+//! [`crate::Database::open`] only fires when [`GUARD_ENV_VAR`] is also set.
+//! A leaked guard flag with an empty root list refuses nothing, so
+//! production cannot be bricked by the flag alone.
 
 use std::path::{Path, PathBuf};
-
-/// Normalized (lowercase, forward-slash) live archive root. Any test path
-/// equal to or under this root is refused.
-const BLOCKED_ROOT: &str = "d:/data/hstry";
-
-/// Known live archive files, matched by exact normalized path.
-const BLOCKED_FILES: &[&str] = &[
-    "d:/data/hstry/staging.db",
-    "d:/data/hstry/hstry.db",
-    "d:/data/hstry/archive.db",
-    "d:/data/hstry/archive-restore.db",
-];
 
 fn normalize_str(path: &str) -> String {
     path.replace('\\', "/").to_lowercase()
@@ -29,15 +18,26 @@ fn normalize(path: &Path) -> String {
     normalize_str(&path.to_string_lossy())
 }
 
+/// Roots supplied by [`BLOCKED_ROOTS_ENV_VAR`], normalized, trailing slashes
+/// stripped. Empty / unset means nothing is blocked.
+fn blocked_roots() -> Vec<String> {
+    std::env::var(BLOCKED_ROOTS_ENV_VAR)
+        .ok()
+        .map(|v| {
+            v.split(';')
+                .map(|s| normalize_str(s.trim()).trim_end_matches('/').to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn is_blocked(raw: &str) -> bool {
     let normalized = normalize_str(raw);
-    if BLOCKED_FILES.contains(&normalized.as_str()) {
-        return true;
-    }
-    if normalized == BLOCKED_ROOT || normalized.starts_with("d:/data/hstry/") {
-        return true;
-    }
-    false
+    let trimmed = normalized.trim_end_matches('/');
+    blocked_roots().into_iter().any(|root| {
+        trimmed == root || normalized == root || normalized.starts_with(&format!("{root}/"))
+    })
 }
 
 /// Environment flag enabling central test-guard enforcement at the DB-open
@@ -45,6 +45,12 @@ fn is_blocked(raw: &str) -> bool {
 /// `HSTRY_ENFORCE_TEST_DB_GUARD=1`; production and ad-hoc debug runs leave
 /// it unset and are completely unaffected.
 pub const GUARD_ENV_VAR: &str = "HSTRY_ENFORCE_TEST_DB_GUARD";
+
+/// `;`-separated roots that [`check_path_for_open`] / [`assert_test_path_safe`]
+/// refuse. Not a compiled-in machine path: CI and pre-PR scripts supply the
+/// operator's live archive root; tests that prove the guard inject a
+/// synthetic path of their own.
+pub const BLOCKED_ROOTS_ENV_VAR: &str = "HSTRY_TEST_BLOCKED_DB_ROOTS";
 
 /// Whether central guard enforcement is enabled for this process.
 pub fn guard_enabled() -> bool {
@@ -56,13 +62,12 @@ pub fn guard_enabled() -> bool {
 /// Central enforcement hook for the database-open boundary
 /// ([`crate::Database::open`]).
 ///
-/// When the guard flag is enabled and `path` is a known live/archive
-/// location, this returns an error BEFORE any filesystem or database
-/// mutation (callers invoke it before `create_dir_all` or connecting).
-/// Any test — present or future — that opens a database through the common
-/// boundary is therefore refused up front; per-test
-/// [`assert_test_path_safe`] / [`isolated_temp_db`] remain as a second
-/// layer that also applies when the flag is unset.
+/// When the guard flag is enabled **and** `path` is under a root listed in
+/// [`BLOCKED_ROOTS_ENV_VAR`], this returns an error BEFORE any filesystem
+/// or database mutation (callers invoke it before `create_dir_all` or
+/// connecting). Flag-only (empty root list) is a no-op, so a leaked flag
+/// cannot refuse a production archive. Per-test [`assert_test_path_safe`] /
+/// [`isolated_temp_db`] remain as a second layer against the same env list.
 pub fn check_path_for_open(path: &Path) -> Result<(), String> {
     if guard_enabled() && is_blocked(&normalize(path)) {
         return Err(format!(
@@ -144,41 +149,87 @@ pub async fn close_and_remove_db(db: crate::Database, path: &Path) -> std::io::R
 mod tests {
     use super::*;
 
+    const SYNTHETIC_ROOT: &str = "c:/hstry-test-blocked-root";
+
     #[test]
-    fn blocks_known_live_paths() {
-        assert!(is_blocked("d:/data/hstry/staging.db"));
-        assert!(is_blocked("d:\\data\\hstry\\staging.db"));
-        assert!(is_blocked("D:/Data/HSTRY/STAGING.DB"));
-        assert!(is_blocked("d:/data/hstry/nested/dir/hstry.db"));
-        assert!(is_blocked("d:/data/hstry"));
+    fn blocks_configured_roots() {
+        temp_env::with_var(BLOCKED_ROOTS_ENV_VAR, Some(SYNTHETIC_ROOT), || {
+            assert!(is_blocked("c:/hstry-test-blocked-root/staging.db"));
+            assert!(is_blocked("c:\\hstry-test-blocked-root\\staging.db"));
+            assert!(is_blocked("C:/HSTRY-TEST-BLOCKED-ROOT/STAGING.DB"));
+            assert!(is_blocked("c:/hstry-test-blocked-root/nested/dir/hstry.db"));
+            assert!(is_blocked("c:/hstry-test-blocked-root"));
+        });
     }
 
     #[test]
     fn allows_isolated_temp_paths() {
-        assert!(!is_blocked("/tmp/hstry-test-123.db"));
-        assert!(!is_blocked("c:/users/test/appdata/local/temp/hstry.db"));
+        temp_env::with_var(BLOCKED_ROOTS_ENV_VAR, Some(SYNTHETIC_ROOT), || {
+            assert!(!is_blocked("/tmp/hstry-test-123.db"));
+            assert!(!is_blocked("c:/users/test/appdata/local/temp/hstry.db"));
+        });
+    }
+
+    #[test]
+    fn empty_root_list_blocks_nothing() {
+        temp_env::with_var(BLOCKED_ROOTS_ENV_VAR, None::<&str>, || {
+            assert!(!is_blocked("c:/hstry-test-blocked-root/staging.db"));
+            assert!(!is_blocked("d:/data/hstry/staging.db"));
+        });
     }
 
     #[test]
     #[should_panic(expected = "refusing to run a test")]
-    fn guard_panics_on_live_path() {
-        assert_test_path_safe(Path::new("D:/Data/hstry/staging.db"));
+    fn guard_panics_on_blocked_path() {
+        temp_env::with_var(BLOCKED_ROOTS_ENV_VAR, Some(SYNTHETIC_ROOT), || {
+            assert_test_path_safe(Path::new("c:/hstry-test-blocked-root/staging.db"));
+        });
     }
 
     #[test]
     fn open_boundary_rejects_blocked_paths_only_while_flag_is_set() {
-        let blocked = Path::new("D:/Data/hstry/staging.db");
+        let blocked = Path::new("c:/hstry-test-blocked-root/staging.db");
         let safe = Path::new("/tmp/hstry-test-guard.db");
-        temp_env::with_var(GUARD_ENV_VAR, Some("1"), || {
-            assert!(guard_enabled());
-            assert!(check_path_for_open(blocked).is_err());
-            assert!(check_path_for_open(safe).is_ok());
-        });
-        temp_env::with_var(GUARD_ENV_VAR, None::<&str>, || {
-            assert!(!guard_enabled());
-            // Flag unset: the boundary passes everything through, so normal
-            // production/debug usage is unaffected.
-            assert!(check_path_for_open(blocked).is_ok());
-        });
+        temp_env::with_vars(
+            [
+                (GUARD_ENV_VAR, Some("1")),
+                (BLOCKED_ROOTS_ENV_VAR, Some(SYNTHETIC_ROOT)),
+            ],
+            || {
+                assert!(guard_enabled());
+                assert!(check_path_for_open(blocked).is_err());
+                assert!(check_path_for_open(safe).is_ok());
+            },
+        );
+        temp_env::with_vars(
+            [
+                (GUARD_ENV_VAR, None::<&str>),
+                (BLOCKED_ROOTS_ENV_VAR, Some(SYNTHETIC_ROOT)),
+            ],
+            || {
+                assert!(!guard_enabled());
+                // Flag unset: the boundary passes everything through, so
+                // normal production/debug usage is unaffected even if a
+                // blocked-root list leaked into the environment.
+                assert!(check_path_for_open(blocked).is_ok());
+            },
+        );
+    }
+
+    #[test]
+    fn guard_flag_alone_does_not_refuse_without_roots() {
+        // Production-safety: a leaked HSTRY_ENFORCE_TEST_DB_GUARD=1 with
+        // no root list must not refuse any path, including a live archive.
+        temp_env::with_vars(
+            [
+                (GUARD_ENV_VAR, Some("1")),
+                (BLOCKED_ROOTS_ENV_VAR, None::<&str>),
+            ],
+            || {
+                assert!(guard_enabled());
+                assert!(check_path_for_open(Path::new("d:/data/hstry/staging.db")).is_ok());
+                assert!(check_path_for_open(Path::new("c:/hstry-test-blocked-root/db")).is_ok());
+            },
+        );
     }
 }

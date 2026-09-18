@@ -283,26 +283,67 @@ fn run_nas(config_path: &Path, opts: &BackupOpts, json: bool) -> Result<StepRepo
     cmd.args(["remote", "sync", "-r", &remote, "-d", "push", "--config"]);
     cmd.arg(config_path);
     if json {
-        cmd.stdout(Stdio::null());
-        cmd.stderr(Stdio::piped());
+        let (status, stderr) =
+            run_piped_stderr_child(cmd).context("failed to spawn remote sync")?;
+        Ok(nas_step_report(detail, status, &stderr))
     } else {
         cmd.stdout(Stdio::inherit());
         cmd.stderr(Stdio::inherit());
+        let status = cmd.status().context("failed to spawn remote sync")?;
+        Ok(nas_step_report(detail, status, &[]))
     }
-    let status = cmd.status().context("failed to spawn remote sync")?;
+}
+
+/// Run `cmd` with stdout discarded and stderr piped, draining both until exit.
+///
+/// `Command::status()` waits without reading a piped stderr handle. A child
+/// that writes more than the OS pipe buffer (~64 KiB) then blocks on write
+/// while the parent blocks in `wait()` — `chronicle backup --json` hangs.
+/// `Child::wait_with_output()` drains the pipe.
+fn run_piped_stderr_child(mut cmd: ProcessCommand) -> Result<(std::process::ExitStatus, Vec<u8>)> {
+    cmd.stdout(Stdio::null());
+    cmd.stderr(Stdio::piped());
+    let child = cmd.spawn().context("failed to spawn process")?;
+    let output = child
+        .wait_with_output()
+        .context("failed to wait for process")?;
+    Ok((output.status, output.stderr))
+}
+
+fn nas_step_report(detail: String, status: std::process::ExitStatus, stderr: &[u8]) -> StepReport {
     if status.success() {
-        Ok(StepReport {
+        return StepReport {
             name: "nas".into(),
             status: "ok".into(),
             detail,
-        })
-    } else {
-        Ok(StepReport {
-            name: "nas".into(),
-            status: "failed".into(),
-            detail: format!("{detail} (exit {status})"),
-        })
+        };
     }
+    let stderr = stderr_for_report(stderr);
+    let detail = if stderr.trim().is_empty() {
+        format!("{detail} (exit {status})")
+    } else {
+        format!("{detail} (exit {status}): {stderr}")
+    };
+    StepReport {
+        name: "nas".into(),
+        status: "failed".into(),
+        detail,
+    }
+}
+
+/// Bound captured NAS stderr so a verbose `-v` dump cannot bloat JSON output.
+/// Keep the tail: SSH and rsync failures land at the end of the log.
+fn stderr_for_report(bytes: &[u8]) -> String {
+    const MAX: usize = 8 * 1024;
+    let text = String::from_utf8_lossy(bytes);
+    if text.len() <= MAX {
+        return text.into_owned();
+    }
+    let mut start = text.len() - MAX;
+    while start < text.len() && !text.is_char_boundary(start) {
+        start += 1;
+    }
+    format!("…{}", &text[start..])
 }
 
 fn run_oracle(payload: Option<&Path>, opts: &BackupOpts) -> Result<StepReport> {
@@ -470,5 +511,144 @@ fn finish(mut report: BackupReport, json: bool, ok: bool) -> Result<()> {
         Ok(())
     } else {
         bail!("backup finished with failures");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    /// Larger than the typical 64 KiB OS pipe buffer so a drained wait must
+    /// actually read stderr; `status()` would deadlock here.
+    const OVERSIZE: usize = 128 * 1024;
+    const MARKER: &str = "NAS_STDERR_MARKER";
+
+    fn oversized_stderr_command(nbytes: usize, marker: &str, exit: i32) -> ProcessCommand {
+        #[cfg(windows)]
+        {
+            let script = format!(
+                "$ProgressPreference='SilentlyContinue'; $n={nbytes}; $e=[Console]::OpenStandardError(); $chunk=New-Object byte[] 4096; for($i=0;$i -lt 4096;$i++){{ $chunk[$i]=[byte][char]'X' }}; $left=$n; while($left -gt 0){{ $c=[Math]::Min(4096,$left); $e.Write($chunk,0,$c); $left-=$c }}; [Console]::Error.Write('{marker}'); exit {exit}"
+            );
+            let mut cmd = ProcessCommand::new("powershell.exe");
+            cmd.args(["-NoProfile", "-NonInteractive", "-Command", &script]);
+            cmd
+        }
+        #[cfg(not(windows))]
+        {
+            let script = format!(
+                "head -c {nbytes} /dev/zero | tr '\\0' 'X' >&2; printf '%s' '{marker}' >&2; exit {exit}"
+            );
+            let mut cmd = ProcessCommand::new("sh");
+            cmd.args(["-c", &script]);
+            cmd
+        }
+    }
+
+    fn quiet_exit_command(exit: i32) -> ProcessCommand {
+        #[cfg(windows)]
+        {
+            let mut cmd = ProcessCommand::new("cmd");
+            cmd.args(["/C", &format!("exit {exit}")]);
+            cmd
+        }
+        #[cfg(not(windows))]
+        {
+            let mut cmd = ProcessCommand::new("sh");
+            cmd.args(["-c", &format!("exit {exit}")]);
+            cmd
+        }
+    }
+
+    fn run_piped_stderr_child_bounded(
+        cmd: ProcessCommand,
+        timeout: Duration,
+    ) -> Result<(std::process::ExitStatus, Vec<u8>)> {
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(run_piped_stderr_child(cmd));
+        });
+        match rx.recv_timeout(timeout) {
+            Ok(result) => result,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                bail!(
+                    "child did not exit within {timeout:?}; stderr pipe was not drained (backup --json deadlock)"
+                )
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                bail!("stderr-drain worker thread disconnected")
+            }
+        }
+    }
+
+    #[test]
+    fn json_child_drains_oversized_stderr_without_deadlock() {
+        let cmd = oversized_stderr_command(OVERSIZE, MARKER, 9);
+        let (status, stderr) = run_piped_stderr_child_bounded(cmd, Duration::from_secs(30))
+            .expect("piped stderr child should exit once the parent drains the pipe");
+        assert!(!status.success(), "synthetic NAS child should fail");
+        assert!(
+            stderr.len() >= OVERSIZE,
+            "expected >= {OVERSIZE} stderr bytes, got {}",
+            stderr.len()
+        );
+        let text = String::from_utf8_lossy(&stderr);
+        assert!(
+            text.contains(MARKER),
+            "captured stderr must include the failure marker, got {} bytes",
+            stderr.len()
+        );
+        let report = nas_step_report("remote sync -d push".into(), status, &stderr);
+        assert_eq!(report.status, "failed");
+        assert!(
+            report.detail.contains(MARKER),
+            "failure StepReport must surface stderr, got: {}",
+            report.detail
+        );
+        assert!(report.detail.contains("exit"));
+    }
+
+    #[test]
+    fn json_child_drains_oversized_stderr_on_success() {
+        let cmd = oversized_stderr_command(OVERSIZE, MARKER, 0);
+        let (status, stderr) = run_piped_stderr_child_bounded(cmd, Duration::from_secs(30))
+            .expect("success path must also drain oversized stderr");
+        assert!(status.success());
+        assert!(stderr.len() >= OVERSIZE);
+        let report = nas_step_report("remote sync -d push".into(), status, &stderr);
+        assert_eq!(report.status, "ok");
+        assert!(
+            !report.detail.contains(MARKER),
+            "success StepReport should not dump stderr: {}",
+            report.detail
+        );
+    }
+
+    #[test]
+    fn failed_nas_step_without_stderr_still_names_exit() {
+        let cmd = quiet_exit_command(3);
+        let (status, stderr) = run_piped_stderr_child(cmd).unwrap();
+        assert!(!status.success());
+        assert!(stderr.is_empty() || stderr.iter().all(|b| b.is_ascii_whitespace()));
+        let report = nas_step_report("nas push".into(), status, &stderr);
+        assert_eq!(report.status, "failed");
+        assert!(report.detail.contains("nas push"));
+        assert!(report.detail.contains("exit"));
+        assert!(!report.detail.contains(MARKER));
+    }
+
+    #[test]
+    fn stderr_report_keeps_the_tail() {
+        let mut bytes = vec![b'a'; 9 * 1024];
+        bytes.extend_from_slice(b"TAIL-MARKER");
+        let text = stderr_for_report(&bytes);
+        assert!(text.starts_with('…'));
+        assert!(
+            text.ends_with("TAIL-MARKER"),
+            "truncated stderr must keep the tail, got ending {:?}",
+            text.chars().rev().take(20).collect::<String>()
+        );
+        assert!(text.len() <= 8 * 1024 + '…'.len_utf8());
     }
 }

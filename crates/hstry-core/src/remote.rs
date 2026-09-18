@@ -1,3 +1,2 @@
-//! Remote sync functionality over SSH.
-//!
-//! Provides fetching and bidirectional merging of hstry databases across machines.
+// Abandoned branch: GitHub MCP truncated a full remote.rs upload.
+// Do not review or merge. Real fix is on a separate PR from main.

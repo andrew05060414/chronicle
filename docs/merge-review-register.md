@@ -2,7 +2,7 @@
 
 一张表把 issue 和 PR 对起来，省得每次重新翻。**GitHub Issues 是这个仓库唯一的看板**——`.trx/`、`.pi/todos/`、`.octo/` 都是要冻结的历史（#21）。
 
-状态截至 2026-09-18 06:05 UTC。CI 列读自各 PR head commit 的 check runs。严重度以 GitHub 标签为准。
+状态截至 2026-09-18 06:45 UTC，main 在 `fddb223`。严重度以 GitHub 标签为准。下面两张表里的 issue↔PR 对应关系不随合并变化；PR 的实时状态见「PR 面板」。
 
 背景见 [`fork-timeline.md`](./fork-timeline.md)，决策依据见 [`project-thread.md`](./project-thread.md)。
 
@@ -84,6 +84,8 @@
 
 修法有三步，第一步是核心：pull 时跳过 id 以自己的 `device_namespace` 开头的 source；satellite 模式下把默认方向改成 `push` 或强制显式 `--direction`；help 文本要写明 pull 会写入本地归档。清理已有的双前缀行是第四件事，取决于保留策略——hub 上那份可能留着本机 adapter 已经轮转掉的历史。
 
+[#35](https://github.com/andrew05060414/chronicle/pull/35) 正在做这件事，目前 open 待评审。
+
 ### #25 有两个原因，别只修一个
 
 服务停了是一个，另一个是配置里 `[checkpoint] enabled = false`。只把服务拉起来不会让 checkpoint 恢复。
@@ -92,23 +94,24 @@
 
 ## PR 面板
 
-全部 6 个都是 draft，base 都是 `0186b81`，一个都没合。
+2026-09-18 上午一次性合掉了五个：#30（06:15）、#29（06:16）、#31（06:16）、#34（06:33）、#28（06:40）。main 从 `0186b81` 走到 `fddb223`。
 
-| PR | 分支 | 覆盖 | CI（head） |
-|---|---|---|---|
-| [#34](https://github.com/andrew05060414/chronicle/pull/34) | `ci/pre-pr-memory-integrity-gate` | #33 | 四项全绿（2026-09-18 06:05） |
-| [#29](https://github.com/andrew05060414/chronicle/pull/29) | `fix/adapter-defects-batch` | #10 #11 #12 #15 | 全绿 |
-| [#31](https://github.com/andrew05060414/chronicle/pull/31) | `fix/windows-service-process-detection` | #13 | 全绿 |
-| [#30](https://github.com/andrew05060414/chronicle/pull/30) | `fix/backup-safety-5-6-7` | #5 #6 #7 | 全绿 |
-| [#28](https://github.com/andrew05060414/chronicle/pull/28) | `fix/search-scope-and-mcp-surface` | #18 #22 | 全绿 |
-| [#32](https://github.com/andrew05060414/chronicle/pull/32) | `docs/chronicle-boundary-20-21` | #20 #21 | Windows 红（2026-09-17 那次运行） |
+| PR | 覆盖 | 状态 |
+|---|---|---|
+| [#30](https://github.com/andrew05060414/chronicle/pull/30) | #5 #6 #7 | 已合并 |
+| [#29](https://github.com/andrew05060414/chronicle/pull/29) | #10 #11 #12 #15 | 已合并 |
+| [#31](https://github.com/andrew05060414/chronicle/pull/31) | #13 | 已合并 |
+| [#34](https://github.com/andrew05060414/chronicle/pull/34) | #33 | 已合并，门禁已生效 |
+| [#28](https://github.com/andrew05060414/chronicle/pull/28) | #18 #22 | 已合并 |
+| [#35](https://github.com/andrew05060414/chronicle/pull/35) | #17 | open，待评审 |
+| [#32](https://github.com/andrew05060414/chronicle/pull/32) | #20 #21 | draft |
 
-**#34 是其余 PR 的前置。** 它把 CI 收紧到 `clippy --all-targets -- -D warnings` 和全 target 测试，所以它落地之后其余五个都要 rebase 重跑。#32 现在红的那一项正是 #34 修掉的那个测试，rebase 后应当自动转绿。
+**合并没有自动关掉对应的 issue。** 只有 #10、#13、#18、#22 关了；#5、#6、#7、#11、#12、#15 仍然 open，尽管修它们的代码已经在 main 上。读这张表之前先确认 issue 的真实状态，不要把 open 当成「还没修」。
 
-合并顺序按冲突面排（不是按重要性）：#29 是纯 TypeScript，和其他 PR 零文件重叠，可以先出去；#31 只动 `service.rs`；#30 动 `checkpoint.rs` / `remote.rs`，和 #34 在 core 的校验函数上有重叠，rebase 时要人看一眼；#28 和 #30 都改 `cli/main.rs`，放在 #30 之后；#32 是纯 README。
+#34 作为前置这件事已经过去了：它先落地，CI 现在跑 `clippy --all-targets -- -D warnings` 和全 target 测试，后面合进去的 PR 都是在这道门禁下过的。#33 本身仍然 open——门禁的最后一步（给 `main` 配 ruleset / 分支保护，让检查成为硬闸）还没做。
 
 ## 还没有 PR 的
 
-#3、#4、#8、#9、#14、#17、#19、#23、#24、#25、#26、#27。
+#3、#4、#8、#9、#14、#19、#23、#24、#25、#26、#27。#17 现在有 [#35](https://github.com/andrew05060414/chronicle/pull/35)。
 
-按「会不会弄坏数据」排，#17 和 #3 最靠前：#17 是这堆里唯一一个不修就会持续污染归档的，#3 是唯一一个标 `security` 的。#4 和 #17 同属同步命名空间这一族，建议一次做掉。#24 应该在下一次合上游**之前**做——`0186b81` 炸出 13 条回归正是因为没有它。
+按「会不会弄坏数据」排，#3 最靠前——唯一一个标 `security` 的。#4 和 #17 同属同步命名空间这一族，#35 落地之后应该紧接着做 #4。#24 应该在下一次合上游**之前**做：`0186b81` 炸出 13 条回归正是因为没有它，而 #34 的门禁只覆盖记忆完整性，不覆盖 fork 不变量。

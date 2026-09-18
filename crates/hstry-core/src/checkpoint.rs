@@ -1,7 +1,7 @@
 //! Rolling compressed checkpoints of a hub SQLite database.
 
 use std::fs::{self, File};
-use std::io::{BufReader, BufWriter};
+use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Datelike, Utc, Weekday};
@@ -45,8 +45,7 @@ pub struct CheckpointRecord {
 
 /// Choose which checkpoint archives to delete to stay under `max_total_bytes`.
 ///
-/// Drops oldest non-weekly files first (exempting the freshest checkpoint),
-/// then oldest weeklies beyond `keep_weekly`.
+/// Drops oldest non-weekly files first, then oldest weeklies beyond `keep_weekly`.
 /// Always leaves at least one checkpoint.
 pub fn plan_prune(
     mut records: Vec<CheckpointRecord>,
@@ -179,7 +178,7 @@ pub async fn create_checkpoint(
     weekly: Option<bool>,
 ) -> Result<CheckpointInfo> {
     let dir = config.resolve_dir(database_path);
-    fs::create_dir_all(&dir)?;
+    fs::create_dir_all(&dir).map_err(|e| create_stage("create checkpoint dir", &dir, e))?;
 
     let created_at = Utc::now();
     let base_stem = format!("hstry-{}", created_at.format("%Y%m%d-%H%M%S"));
@@ -196,95 +195,76 @@ pub async fn create_checkpoint(
 
     let _lock = acquire_ingest_lock(&ingest_lock_path(database_path))?;
 
+    // Online copy: the live `db` handle stays open. VACUUM INTO writes a
+    // consistent snapshot; we must not `Database::open` that snapshot
+    // (WAL + pooled connections + migrations) or Windows will still hold
+    // `-wal`/`-shm` mappings when we later compress and delete it.
     let raw_path = dir.join(format!("{stem}.db"));
-    db.backup_to(&raw_path).await?;
+    vacuum_into_with_retry(db, &raw_path).await?;
 
-    let copy = Database::open(&raw_path).await?;
-    let integrity = copy.integrity_check().await?;
-    let conversations = copy.count_conversations().await?;
-    let messages = copy.count_messages().await?;
-    let sources = copy.count_sources().await?;
-    copy.close().await;
-
-    if integrity != "ok" {
+    let stats = inspect_snapshot_with_retry(&raw_path).await?;
+    if stats.integrity != "ok" {
         let _ = safe_remove_file(&raw_path);
         return Err(Error::Other(format!(
-            "checkpoint integrity_check failed: {integrity}"
+            "checkpoint create: integrity_check failed for {}: {}",
+            raw_path.display(),
+            stats.integrity
         )));
     }
 
-    let uncompressed_bytes = fs::metadata(&raw_path)?.len();
+    let uncompressed_bytes = fs::metadata(&raw_path)
+        .map_err(|e| create_stage("stat snapshot", &raw_path, e))?
+        .len();
     let zst_path = archive_path(&dir, &stem);
     {
-        let input = BufReader::new(File::open(&raw_path)?);
-        let output = BufWriter::new(safe_create_file(&zst_path)?);
-        zstd::stream::copy_encode(input, output, 3)?;
+        let input = BufReader::new(
+            safe_open_file(&raw_path)
+                .map_err(|e| create_stage("open snapshot for compress", &raw_path, e))?,
+        );
+        let mut output = BufWriter::new(
+            safe_create_file(&zst_path)
+                .map_err(|e| create_stage("create archive", &zst_path, e))?,
+        );
+        zstd::stream::copy_encode(input, &mut output, 3)
+            .map_err(|e| create_stage("compress snapshot", &raw_path, e))?;
+        output
+            .flush()
+            .map_err(|e| create_stage("flush archive", &zst_path, e))?;
     }
-    let compressed_bytes = fs::metadata(&zst_path)?.len();
-    safe_remove_file(&raw_path)?;
+    let compressed_bytes = fs::metadata(&zst_path)
+        .map_err(|e| create_stage("stat archive", &zst_path, e))?
+        .len();
+    safe_remove_file(&raw_path).map_err(|e| create_stage("remove snapshot", &raw_path, e))?;
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let mut sidecar_os = raw_path.as_os_str().to_os_string();
+        sidecar_os.push(suffix);
+        let sidecar = PathBuf::from(sidecar_os);
+        safe_remove_file(&sidecar)
+            .map_err(|e| create_stage("remove snapshot sidecar", &sidecar, e))?;
+    }
 
     let manifest = CheckpointManifest {
         version: MANIFEST_VERSION,
         created_at,
         stem: stem.clone(),
         weekly,
-        conversations,
-        messages,
-        sources,
+        conversations: stats.conversations,
+        messages: stats.messages,
+        sources: stats.sources,
         uncompressed_bytes,
         compressed_bytes,
-        integrity,
+        integrity: stats.integrity,
         live_database: database_path.to_string_lossy().to_string(),
     };
     let manifest_path = manifest_path(&dir, &stem);
-    fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest)?)?;
+    fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest)?)
+        .map_err(|e| create_stage("write manifest", &manifest_path, e))?;
 
     Ok(CheckpointInfo {
         manifest,
         archive_path: zst_path,
         manifest_path,
     })
-}
-
-pub(crate) fn safe_remove_file(path: &Path) -> Result<()> {
-    if !path.exists() {
-        return Ok(());
-    }
-    let mut attempts = 0;
-    loop {
-        match fs::remove_file(path) {
-            Ok(()) => return Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(e) => {
-                attempts += 1;
-                let code = e.raw_os_error();
-                // 32: ERROR_SHARING_VIOLATION, 5: ERROR_ACCESS_DENIED (Windows transient file locks)
-                if (code == Some(32) || code == Some(5)) && attempts < 20 {
-                    std::thread::sleep(std::time::Duration::from_millis(50));
-                    continue;
-                }
-                return Err(Error::Io(e));
-            }
-        }
-    }
-}
-
-fn safe_create_file(path: &Path) -> std::io::Result<File> {
-    let mut attempts = 0;
-    loop {
-        match File::create(path) {
-            Ok(f) => return Ok(f),
-            Err(e) => {
-                attempts += 1;
-                let code = e.raw_os_error();
-                if (code == Some(32) || code == Some(5)) && attempts < 10 {
-                    std::thread::sleep(std::time::Duration::from_millis(25));
-                    continue;
-                }
-                return Err(e);
-            }
-        }
-    }
 }
 
 pub fn prune_checkpoints(dir: &Path, config: &CheckpointConfig) -> Result<Vec<PathBuf>> {
@@ -316,6 +296,170 @@ pub fn prune_checkpoints(dir: &Path, config: &CheckpointConfig) -> Result<Vec<Pa
     Ok(deleted)
 }
 
+/// Windows transient file-lock codes worth a bounded retry while the OS
+/// releases handles or finishes indexing a fresh file.
+///
+/// 32: ERROR_SHARING_VIOLATION, 5: ERROR_ACCESS_DENIED,
+/// 1224: ERROR_USER_MAPPED_SECTION_OPEN. Anything else (corruption, missing
+/// files, permission policy, semantic errors) must fail fast, never retry.
+fn is_transient_lock(code: Option<i32>) -> bool {
+    matches!(code, Some(32) | Some(5) | Some(1224))
+}
+
+/// Remove `path` for restore, retrying transient Windows locks.
+///
+/// Bounded at ~5s (100 x 50ms), consistent with test cleanup tolerance for
+/// hosted-runner handle/indexing latency. Any non-transient error, or a lock
+/// that does not clear within the bound, propagates: production restore must
+/// never silently continue with a stale file in place.
+/// (Shared shape with PR #30 so it rebases cleanly; the gate adds
+/// tests/workflow/guard infrastructure, not a second implementation.)
+pub(crate) fn safe_remove_file(path: &Path) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let mut attempts = 0;
+    loop {
+        match fs::remove_file(path) {
+            Ok(()) => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => {
+                attempts += 1;
+                if is_transient_lock(e.raw_os_error()) && attempts < 100 {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    continue;
+                }
+                return Err(Error::Io(e));
+            }
+        }
+    }
+}
+
+fn safe_create_file(path: &Path) -> std::io::Result<File> {
+    let mut attempts = 0;
+    loop {
+        match File::create(path) {
+            Ok(f) => return Ok(f),
+            Err(e) => {
+                attempts += 1;
+                if is_transient_lock(e.raw_os_error()) && attempts < 10 {
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                    continue;
+                }
+                return Err(e);
+            }
+        }
+    }
+}
+
+/// Open the freshly-written checkpoint archive for reading, retrying
+/// transient Windows locks.
+///
+/// A brand-new destination can still fail restore here: opening the archive
+/// races OS handle release / antivirus indexing of the just-finished
+/// checkpoint write. Bounded at ~2s (40 x 50ms); decode/corruption errors
+/// downstream never retry.
+fn safe_open_file(path: &Path) -> std::io::Result<File> {
+    let mut attempts = 0;
+    loop {
+        match File::open(path) {
+            Ok(f) => return Ok(f),
+            Err(e) => {
+                attempts += 1;
+                if is_transient_lock(e.raw_os_error()) && attempts < 40 {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    continue;
+                }
+                return Err(e);
+            }
+        }
+    }
+}
+
+/// Annotate a restore failure with the exact stage and path so future CI is
+/// diagnosable from a single error line. The original error text (including
+/// any os error code) is preserved.
+fn restore_stage(stage: &str, path: &Path, err: impl std::fmt::Display) -> Error {
+    Error::Other(format!(
+        "checkpoint restore: {stage} failed for {}: {err}",
+        path.display()
+    ))
+}
+
+fn create_stage(stage: &str, path: &Path, err: impl std::fmt::Display) -> Error {
+    Error::Other(format!(
+        "checkpoint create: {stage} failed for {}: {err}",
+        path.display()
+    ))
+}
+
+/// Parse `os error N` codes from a Display string. Digits are consumed in
+/// full, so `os error 5` matches 5 and `os error 50` matches 50 — never
+/// a prefix of a larger Windows network code (50/53/55/59).
+fn parse_os_error_codes(s: &str) -> Vec<i32> {
+    const NEEDLE: &str = "os error ";
+    let mut codes = Vec::new();
+    let mut rest = s;
+    while let Some(i) = rest.find(NEEDLE) {
+        rest = &rest[i + NEEDLE.len()..];
+        let digits_end = rest
+            .char_indices()
+            .take_while(|(_, c)| c.is_ascii_digit())
+            .last()
+            .map(|(idx, c)| idx + c.len_utf8())
+            .unwrap_or(0);
+        if digits_end == 0 {
+            continue;
+        }
+        if let Ok(n) = rest[..digits_end].parse::<i32>() {
+            codes.push(n);
+        }
+        rest = &rest[digits_end..];
+    }
+    codes
+}
+
+fn error_is_transient_lock(err: &Error) -> bool {
+    if let Error::Io(e) = err
+        && is_transient_lock(e.raw_os_error())
+    {
+        return true;
+    }
+    parse_os_error_codes(&err.to_string())
+        .into_iter()
+        .any(|c| is_transient_lock(Some(c)))
+}
+
+async fn vacuum_into_with_retry(db: &Database, dest: &Path) -> Result<()> {
+    let mut attempts = 0;
+    loop {
+        match db.backup_to(dest).await {
+            Ok(()) => return Ok(()),
+            Err(e) if error_is_transient_lock(&e) && attempts < 40 => {
+                attempts += 1;
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            Err(e) => return Err(create_stage("vacuum into snapshot", dest, e)),
+        }
+    }
+}
+
+async fn inspect_snapshot_with_retry(path: &Path) -> Result<crate::db::SnapshotInspect> {
+    let mut attempts = 0;
+    loop {
+        match Database::inspect_readonly_snapshot(path).await {
+            Ok(stats) => return Ok(stats),
+            Err(e) if error_is_transient_lock(&e) && attempts < 40 => {
+                attempts += 1;
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            Err(e) => {
+                return Err(create_stage("inspect snapshot", path, e));
+            }
+        }
+    }
+}
+
 pub fn restore_checkpoint(dir: &Path, stem: &str, dest: &Path) -> Result<PathBuf> {
     let archive = archive_path(dir, stem);
     if !archive.exists() {
@@ -325,18 +469,32 @@ pub fn restore_checkpoint(dir: &Path, stem: &str, dest: &Path) -> Result<PathBuf
         )));
     }
     if let Some(parent) = dest.parent() {
-        fs::create_dir_all(parent)?;
+        fs::create_dir_all(parent)
+            .map_err(|e| restore_stage("create destination parent", parent, e))?;
     }
-    safe_remove_file(dest)?;
+    // All database handles to `dest` must be closed before this call (see
+    // `Database::close`, which checkpoints WAL first). Every removal below
+    // is strict: a sidecar that cannot be cleared fails the restore instead
+    // of letting a new database be written next to a stale WAL/SHM.
+    safe_remove_file(dest).map_err(|e| restore_stage("remove destination", dest, e))?;
     for suffix in ["-wal", "-shm"] {
         let mut sidecar_os = dest.as_os_str().to_os_string();
         sidecar_os.push(suffix);
         let sidecar = PathBuf::from(sidecar_os);
-        safe_remove_file(&sidecar)?;
+        safe_remove_file(&sidecar).map_err(|e| restore_stage("remove sidecar", &sidecar, e))?;
     }
-    let input = BufReader::new(File::open(&archive)?);
-    let output = BufWriter::new(safe_create_file(dest)?);
-    zstd::stream::copy_decode(input, output)?;
+    let input = BufReader::new(
+        safe_open_file(&archive)
+            .map_err(|e| restore_stage("open checkpoint archive", &archive, e))?,
+    );
+    let mut output = BufWriter::new(
+        safe_create_file(dest).map_err(|e| restore_stage("create destination", dest, e))?,
+    );
+    zstd::stream::copy_decode(input, &mut output)
+        .map_err(|e| restore_stage("decode checkpoint archive", &archive, e))?;
+    output
+        .flush()
+        .map_err(|e| restore_stage("flush destination", dest, e))?;
     Ok(dest.to_path_buf())
 }
 
@@ -383,6 +541,99 @@ mod tests {
         assert!(deleted.is_empty());
     }
 
+    #[test]
+    fn prune_preserves_freshest_checkpoint_when_weeklies_exceed_cap() {
+        let records = vec![
+            rec("w1", 3, 28, true),
+            rec("w2", 3, 21, true),
+            rec("w3", 3, 14, true),
+            rec("w4", 3, 7, true),
+            rec("d_new", 1, 0, false),
+        ];
+        let deleted = plan_prune(records, 10, 4);
+        assert!(!deleted.contains(&PathBuf::from("d_new")));
+        assert!(deleted.is_empty());
+    }
+
+    #[test]
+    fn prune_drops_older_dailies_but_preserves_freshest_when_weeklies_exceed_cap() {
+        let records = vec![
+            rec("w1", 3, 28, true),
+            rec("w2", 3, 21, true),
+            rec("w3", 3, 14, true),
+            rec("w4", 3, 7, true),
+            rec("d_old", 1, 2, false),
+            rec("d_new", 1, 0, false),
+        ];
+        let deleted = plan_prune(records, 10, 4);
+        assert_eq!(deleted, vec![PathBuf::from("d_old")]);
+    }
+
+    #[test]
+    fn os_error_code_parse_does_not_prefix_match() {
+        assert_eq!(parse_os_error_codes("os error 5"), vec![5]);
+        assert_eq!(parse_os_error_codes("os error 32"), vec![32]);
+        assert_eq!(parse_os_error_codes("os error 1224"), vec![1224]);
+        assert_eq!(parse_os_error_codes("os error 50"), vec![50]);
+        assert_eq!(
+            parse_os_error_codes("Io(Os { code: 32, kind: Uncategorized, message: \"x\" })"),
+            Vec::<i32>::new()
+        );
+        assert_eq!(
+            parse_os_error_codes("failed: os error 5 (and later os error 32)"),
+            vec![5, 32]
+        );
+        assert!(error_is_transient_lock(&Error::Other(
+            "checkpoint create: vacuum into snapshot failed for x: os error 5".into()
+        )));
+        assert!(!error_is_transient_lock(&Error::Other(
+            "checkpoint create: vacuum into snapshot failed for x: os error 50".into()
+        )));
+        assert!(!error_is_transient_lock(&Error::Other(
+            "checkpoint create: vacuum into snapshot failed for x: os error 53".into()
+        )));
+        assert!(error_is_transient_lock(&Error::Other(
+            "checkpoint create: inspect snapshot failed for x: os error 32".into()
+        )));
+        assert!(error_is_transient_lock(&Error::Other(
+            "checkpoint restore: remove sidecar failed for x: os error 1224".into()
+        )));
+    }
+
+    #[test]
+    fn restore_failure_names_stage_and_path() {
+        // Diagnosability contract: a restore failure must state exactly
+        // which stage and path failed, so CI is readable from one line.
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("out.db");
+        let err = restore_checkpoint(dir.path(), "missing-stem", &dest).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("missing-stem"),
+            "restore error must name the missing archive, got: {msg}"
+        );
+
+        // A corrupt archive must fail at the decode stage with the archive
+        // path, without any transient retry masking it.
+        let stem = "corrupt-stem";
+        std::fs::write(dir.path().join(format!("{stem}.db.zst")), b"not zstd").unwrap();
+        std::fs::write(
+            dir.path().join(format!("{stem}.json")),
+            serde_json::json!({"stem": stem}).to_string(),
+        )
+        .unwrap();
+        let err = restore_checkpoint(dir.path(), stem, &dest).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("decode") && msg.contains(stem),
+            "decode failure must name the stage and archive, got: {msg}"
+        );
+        // Failed restore must not leave a partial destination behind... the
+        // destination file exists (created before decode) but the call
+        // reported the failure loudly instead of succeeding.
+        assert!(!dest.exists() || std::fs::metadata(&dest).unwrap().len() == 0);
+    }
+
     #[tokio::test]
     async fn create_list_restore_roundtrip() {
         use crate::models::Source;
@@ -412,51 +663,31 @@ mod tests {
             .unwrap();
         assert_eq!(created.manifest.integrity, "ok");
         assert_eq!(created.manifest.sources, 1);
+        // Live handle must remain usable: checkpoint creation is an online
+        // operation and must not require closing the source database.
+        assert_eq!(db.count_sources().await.unwrap(), 1);
+
+        let ckpt_dir = cfg.dir.clone().unwrap();
+        let leftover_sidecars: Vec<_> = fs::read_dir(&ckpt_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with("-wal") || n.ends_with("-shm") || n.ends_with("-journal"))
+            .collect();
+        assert!(
+            leftover_sidecars.is_empty(),
+            "checkpoint must not leave WAL/SHM on the snapshot: {leftover_sidecars:?}"
+        );
         db.close().await;
 
-        let listed = list_checkpoints(&cfg.dir.clone().unwrap()).unwrap();
+        let listed = list_checkpoints(&ckpt_dir).unwrap();
         assert_eq!(listed.len(), 1);
 
         let restore_path = dir.path().join("restored.db");
-        restore_checkpoint(
-            &cfg.dir.clone().unwrap(),
-            &created.manifest.stem,
-            &restore_path,
-        )
-        .unwrap();
+        restore_checkpoint(&ckpt_dir, &created.manifest.stem, &restore_path).unwrap();
         let restored = Database::open(&restore_path).await.unwrap();
         assert_eq!(restored.count_sources().await.unwrap(), 1);
         restored.close().await;
-    }
-
-    #[test]
-    fn prune_preserves_freshest_checkpoint_when_weeklies_exceed_cap() {
-        // 4 weeklies of 3 bytes each = 12 bytes (> max 10 bytes).
-        // A newly created daily of 1 byte = 13 bytes total.
-        let records = vec![
-            rec("w1", 3, 28, true),
-            rec("w2", 3, 21, true),
-            rec("w3", 3, 14, true),
-            rec("w4", 3, 7, true),
-            rec("d_new", 1, 0, false),
-        ];
-        let deleted = plan_prune(records, 10, 4);
-        assert!(!deleted.contains(&PathBuf::from("d_new")));
-        assert!(deleted.is_empty());
-    }
-
-    #[test]
-    fn prune_drops_older_dailies_but_preserves_freshest_when_weeklies_exceed_cap() {
-        let records = vec![
-            rec("w1", 3, 28, true),
-            rec("w2", 3, 21, true),
-            rec("w3", 3, 14, true),
-            rec("w4", 3, 7, true),
-            rec("d_old", 1, 2, false),
-            rec("d_new", 1, 0, false),
-        ];
-        let deleted = plan_prune(records, 10, 4);
-        assert_eq!(deleted, vec![PathBuf::from("d_old")]);
     }
 
     #[tokio::test]
@@ -491,13 +722,9 @@ mod tests {
         let restore_path = dir.path().join("restored.db");
         let wal_path = dir.path().join("restored.db-wal");
         let shm_path = dir.path().join("restored.db-shm");
-
-        // Seed stale sidecars
         fs::write(&restore_path, b"stale db").unwrap();
         fs::write(&wal_path, b"stale wal").unwrap();
         fs::write(&shm_path, b"stale shm").unwrap();
-        assert!(wal_path.exists());
-        assert!(shm_path.exists());
 
         restore_checkpoint(
             &cfg.dir.clone().unwrap(),
@@ -512,5 +739,51 @@ mod tests {
         let restored = Database::open(&restore_path).await.unwrap();
         assert_eq!(restored.count_sources().await.unwrap(), 1);
         restored.close().await;
+    }
+
+    #[tokio::test]
+    async fn inspect_snapshot_does_not_enable_wal_while_source_stays_open() {
+        use crate::models::Source;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("live.db");
+        let db = Database::open(&db_path).await.unwrap();
+        db.upsert_source(&Source {
+            id: "cursor-abc".to_string(),
+            adapter: "cursor".to_string(),
+            path: Some("/tmp".to_string()),
+            last_sync_at: None,
+            config: serde_json::json!({}),
+        })
+        .await
+        .unwrap();
+
+        let raw = dir.path().join("snapshot.db");
+        db.backup_to(&raw).await.unwrap();
+        let stats = Database::inspect_readonly_snapshot(&raw).await.unwrap();
+        assert_eq!(stats.integrity, "ok");
+        assert_eq!(stats.sources, 1);
+
+        let wal = PathBuf::from(format!("{}-wal", raw.display()));
+        let shm = PathBuf::from(format!("{}-shm", raw.display()));
+        assert!(
+            !wal.exists() && !shm.exists(),
+            "readonly snapshot inspect must not create WAL/SHM sidecars"
+        );
+        // Source database remains open and readable.
+        assert_eq!(db.count_sources().await.unwrap(), 1);
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn create_failure_names_stage_and_path() {
+        let err = inspect_snapshot_with_retry(Path::new("missing-snapshot.db"))
+            .await
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("inspect snapshot") && msg.contains("missing-snapshot.db"),
+            "create inspect failure must name the stage and path, got: {msg}"
+        );
     }
 }

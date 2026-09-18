@@ -53,7 +53,7 @@ async fn bounded_context_keeps_anchor_before_large_neighbors() -> anyhow::Result
         ),
         (&"content".to_owned(), 1, &"needle evidence".to_owned())
     );
-    assert!(page.to_wire()?.chars().count() + 1 <= 1500);
+    assert!(page.to_wire()?.chars().count() < 1500);
     assert!(page.truncated);
     Ok(())
 }
@@ -76,7 +76,7 @@ async fn field_continuations_reconstruct_unicode_without_gaps() -> anyhow::Resul
                 },
             )
             .await?;
-        assert!(page.to_wire()?.chars().count() + 1 <= 1100);
+        assert!(page.to_wire()?.chars().count() < 1100);
         text.push_str(&page.records[0].text);
         match page.records[0].next_offset_chars {
             Some(next) => {

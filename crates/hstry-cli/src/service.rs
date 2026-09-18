@@ -1428,11 +1428,13 @@ impl ServiceState {
 
         for remote_config in remotes {
             let _ = match direction {
-                hstry_core::remote::SyncDirection::Pull => {
-                    hstry_core::remote::sync_from_remote(&self.db, remote_config)
-                        .await
-                        .map(|_| ())
-                }
+                hstry_core::remote::SyncDirection::Pull => hstry_core::remote::sync_from_remote(
+                    &self.db,
+                    remote_config,
+                    &self.config.sync.device_namespace(),
+                )
+                .await
+                .map(|_| ()),
                 hstry_core::remote::SyncDirection::Push => hstry_core::remote::sync_to_remote(
                     &self.db,
                     &self.config.database,

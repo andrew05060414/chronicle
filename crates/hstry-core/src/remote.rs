@@ -368,12 +368,46 @@ fn source_metadata_changed(before: &Source, after: &Source) -> bool {
         || before.adapter != after.adapter
 }
 
+/// Whether `source_id` is already namespaced to `namespace`.
+///
+/// Hub rows are stored as `"<device>:<source>"`, so a satellite's own rows
+/// come back as `arknights:cursor-abc` when it pulls the hub.
+fn belongs_to_namespace(source_id: &str, namespace: &str) -> bool {
+    match source_id.strip_prefix(namespace) {
+        Some("") => true,
+        Some(rest) => rest.starts_with(':'),
+        None => false,
+    }
+}
+
 /// Merge conversations from a source database into a target database.
 /// Uses updated_at for conflict resolution (newer wins).
 pub async fn merge_databases(
     target: &Database,
     source_path: &Path,
     remote_name: &str,
+) -> Result<SyncResult> {
+    merge_databases_excluding(target, source_path, remote_name, None).await
+}
+
+/// Merge like [`merge_databases`], skipping rows that already belong to
+/// `own_namespace`.
+///
+/// A satellite pushes its archive to the hub under its own device namespace,
+/// so the hub holds `arknights:cursor-abc`. Merging the hub back in prefixes
+/// every id a second time (`nas-lan:arknights:cursor-abc`) and mints fresh
+/// conversation and message ids, so no later deduplication can match: the
+/// satellite ends up storing a full second copy of itself, and every search
+/// spends half its result window on that echo.
+///
+/// Pull passes its own device namespace here, which leaves those rows on the
+/// hub they came from; rows from other devices still merge normally. Push
+/// passes `None` -- namespacing local data into the hub is what it is for.
+pub async fn merge_databases_excluding(
+    target: &Database,
+    source_path: &Path,
+    remote_name: &str,
+    own_namespace: Option<&str>,
 ) -> Result<SyncResult> {
     // Open the source database
     let source = Database::open(source_path).await?;
@@ -386,7 +420,14 @@ pub async fn merge_databases(
 
     // Merge sources (prefixed with remote name to avoid conflicts)
     let remote_sources = source.list_sources().await?;
+    let mut sources_skipped = 0usize;
     for mut remote_source in remote_sources {
+        if let Some(own) = own_namespace
+            && belongs_to_namespace(&remote_source.id, own)
+        {
+            sources_skipped += 1;
+            continue;
+        }
         // Prefix source ID with remote name to namespace it
         let namespaced_id = format!("{}:{}", remote_name, remote_source.id);
         remote_source.id = namespaced_id;
@@ -420,7 +461,14 @@ pub async fn merge_databases(
     let mut batch_msgs: Vec<Message> = Vec::new();
     let mut affected_ids: Vec<Uuid> = Vec::new();
 
+    let mut conversations_skipped = 0usize;
     for conv in source_conversations {
+        if let Some(own) = own_namespace
+            && belongs_to_namespace(&conv.source_id, own)
+        {
+            conversations_skipped += 1;
+            continue;
+        }
         // Namespace the source_id
         let namespaced_source_id = format!("{}:{}", remote_name, conv.source_id);
 
@@ -537,6 +585,16 @@ pub async fn merge_databases(
     }
 
     source.close().await;
+
+    if sources_skipped > 0 || conversations_skipped > 0 {
+        tracing::info!(
+            remote = remote_name,
+            namespace = own_namespace.unwrap_or_default(),
+            sources_skipped,
+            conversations_skipped,
+            "skipped rows already namespaced to this device"
+        );
+    }
 
     Ok(SyncResult {
         remote_name: remote_name.to_string(),
@@ -667,13 +725,20 @@ fn remote_inbox_dir(remote_db_path: &str) -> String {
 pub async fn sync_from_remote(
     local_db: &Database,
     config: &RemoteConfig,
+    device_namespace: &str,
 ) -> Result<(FetchResult, SyncResult)> {
     // Fetch the remote database
     let fetch_result = fetch_remote(config)?;
 
-    // Merge into local
-    let sync_result =
-        merge_databases(local_db, &fetch_result.local_cache_path, &config.name).await?;
+    // Merge into local, leaving this device's own rows on the hub.
+    let namespace = crate::config::sanitize_device_namespace(device_namespace);
+    let sync_result = merge_databases_excluding(
+        local_db,
+        &fetch_result.local_cache_path,
+        &config.name,
+        Some(&namespace),
+    )
+    .await?;
 
     Ok((fetch_result, sync_result))
 }

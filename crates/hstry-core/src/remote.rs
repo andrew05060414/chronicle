@@ -9,6 +9,7 @@ use std::process::Command;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use sqlx::Connection;
 use tokio::task::JoinSet;
 use uuid::Uuid;
 
@@ -859,6 +860,45 @@ pub async fn sync_to_remote(
     Ok(sync_result)
 }
 
+async fn validate_hstry_database(path: &Path) -> Result<()> {
+    let options = sqlx::sqlite::SqliteConnectOptions::new()
+        .filename(path)
+        .read_only(true)
+        .create_if_missing(false);
+    let mut connection = sqlx::SqliteConnection::connect_with(&options)
+        .await
+        .map_err(|error| {
+            Error::Remote(format!("Fetched remote database is not SQLite: {error}"))
+        })?;
+
+    let quick_check: String = sqlx::query_scalar("PRAGMA quick_check")
+        .fetch_one(&mut connection)
+        .await
+        .map_err(|error| Error::Remote(format!("Remote database check failed: {error}")))?;
+    if quick_check != "ok" {
+        return Err(Error::Remote(format!(
+            "Fetched remote database failed SQLite quick_check: {quick_check}"
+        )));
+    }
+
+    let has_conversations: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'conversations'",
+    )
+    .fetch_one(&mut connection)
+    .await
+    .map_err(|error| Error::Remote(format!("Remote database schema check failed: {error}")))?;
+    connection.close().await.map_err(|error| {
+        Error::Remote(format!("Could not close remote database check: {error}"))
+    })?;
+
+    if has_conversations != 1 {
+        return Err(Error::Remote(
+            "Fetched SQLite file is not a hstry database".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// Legacy push: fetch hub, merge locally, SCP the whole file back.
 pub async fn sync_to_remote_full(
     local_db_path: &Path,
@@ -886,6 +926,7 @@ pub async fn sync_to_remote_full(
                 "Fetched remote database at {expanded_path} is unexpectedly small ({fetched_len} bytes); aborting push to avoid overwriting the hub"
             )));
         }
+        validate_hstry_database(&temp_db_path).await?;
     } else if config.database_path.is_some() {
         tracing::warn!(
             remote = %expanded_path,
@@ -1752,5 +1793,46 @@ mod tests {
         );
         assert_eq!(unchanged.config["cursor"], "current");
         assert_eq!(unchanged.path.as_deref(), Some("/win/cursor"));
+    }
+
+    #[tokio::test]
+    async fn fetched_remote_must_be_a_valid_hstry_database() {
+        let temp = tempfile::tempdir().expect("temp directory");
+        let valid_path = temp.path().join("valid.db");
+        Database::open(&valid_path)
+            .await
+            .expect("create database")
+            .close()
+            .await;
+        validate_hstry_database(&valid_path)
+            .await
+            .expect("valid hstry database");
+
+        // Reject non-sqlite file
+        let invalid_path = temp.path().join("invalid.db");
+        std::fs::write(&invalid_path, b"not a sqlite database").expect("write invalid database");
+        let error = validate_hstry_database(&invalid_path)
+            .await
+            .expect_err("reject invalid database");
+        assert!(matches!(error, Error::Remote(_)));
+
+        // Reject sqlite file without conversations table
+        let non_hstry_path = temp.path().join("non_hstry.db");
+        let options = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(&non_hstry_path)
+            .create_if_missing(true);
+        let mut connection = sqlx::SqliteConnection::connect_with(&options)
+            .await
+            .expect("connect sqlite");
+        sqlx::query("CREATE TABLE some_table (id INTEGER PRIMARY KEY);")
+            .execute(&mut connection)
+            .await
+            .expect("create table");
+        connection.close().await.expect("close connection");
+
+        let error = validate_hstry_database(&non_hstry_path)
+            .await
+            .expect_err("reject non-hstry database without conversations table");
+        assert!(matches!(error, Error::Remote(_)));
     }
 }

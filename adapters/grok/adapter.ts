@@ -20,6 +20,7 @@ import { homedir } from 'os';
 import type {
   Adapter,
   AdapterInfo,
+  Attachment,
   CanonPart,
   Conversation,
   Message,
@@ -53,16 +54,25 @@ interface GrokSummary {
   grok_home?: string;
   num_chat_messages?: number;
   reasoning_effort?: string;
+  /** 0 = legacy role-keyed JSONL records; >= 1 = type-dispatched records. */
+  chat_format_version?: number;
+  parent_session_id?: string;
+  session_kind?: string;
 }
 
 interface GrokToolCall {
   id?: string;
+  tool_call_id?: string;
   name?: string;
   arguments?: string | Record<string, unknown>;
+  /** Legacy shape: `{ function: { name, arguments } }`. */
+  function?: { name?: string; arguments?: string | Record<string, unknown> };
 }
 
 interface GrokRecord {
   type?: string;
+  /** Legacy (chat_format_version 0) records are keyed by `role`. */
+  role?: string;
   content?: unknown;
   synthetic_reason?: string;
   prompt_index?: number;
@@ -72,6 +82,12 @@ interface GrokRecord {
   tool_call_id?: string;
   model_id?: string;
   status?: string;
+  /** v1 `backend_tool_call` payload. */
+  kind?: Record<string, unknown>;
+  /** v1 `tool_result` image attachments. */
+  images?: unknown;
+  /** Legacy tool record name. */
+  name?: string;
 }
 
 interface SessionRef {
@@ -104,10 +120,12 @@ const adapter: Adapter = {
     for (const ref of refs) {
       const conv = await parseSession(ref, opts);
       if (conv) conversations.push(conv);
-      if (opts?.limit && conversations.length >= opts.limit) break;
     }
+    // NOTE: sort the FULL candidate set before slicing. findSessionRefs
+    // returns path order, so breaking out of the loop at `limit` would return
+    // the alphabetically-first sessions instead of the newest (#15).
     conversations.sort((a, b) => b.createdAt - a.createdAt);
-    return conversations;
+    return opts?.limit && opts.limit > 0 ? conversations.slice(0, opts.limit) : conversations;
   },
 
   supportsIncremental: true,
@@ -227,6 +245,110 @@ async function parseSession(
   let skippedSystem = 0;
   let skippedReminders = 0;
   let model = summary?.current_model_id;
+
+  const chatFormatVersion = summary?.chat_format_version;
+
+  // Legacy transcripts (chat_format_version 0) store JSONL records keyed by
+  // `role` instead of `type`. Without the legacy branch every line falls
+  // through the v1 dispatch and the session vanishes from the archive (#10).
+  // When the summary carries no version marker at all (older exports,
+  // hand-built fixtures), sniff the records so neither schema vanishes.
+  if (chatFormatVersion === undefined ? !looksLikeV1Records(raw) : chatFormatVersion < 1) {
+    parseLegacyRecords(raw, messages, opts);
+  } else {
+    const v1 = parseV1Records(raw, messages, opts, { createdAt, updatedAt });
+    if (v1.model) model = v1.model;
+    skippedSystem = v1.skippedSystem;
+    skippedReminders = v1.skippedReminders;
+  }
+
+  const hasChat = messages.some(m => m.role === 'user' || m.role === 'assistant');
+  if (!hasChat) return null;
+
+  const title =
+    nonempty(summary?.generated_title) ??
+    nonempty(summary?.session_summary) ??
+    (() => {
+      const frum = findFirstRealUserMessage(
+        messages.map(m => ({ role: m.role, content: m.content })),
+      );
+      return frum ? formatFrumTitle(frum) : undefined;
+    })();
+
+  const workspace =
+    nonempty(summary?.info?.cwd) ?? decodeWorkspaceDir(basename(dirname(ref.dir)));
+  const externalId = nonempty(summary?.info?.id) ?? basename(ref.dir);
+  const parentExternalId = nonempty(summary?.parent_session_id);
+
+  return {
+    externalId,
+    title,
+    createdAt: Math.floor(createdAt),
+    updatedAt: Math.floor(updatedAt),
+    model,
+    provider: 'xai',
+    workspace,
+    messages,
+    parentExternalId,
+    forkType: parentExternalId ? 'fork' : undefined,
+    metadata: {
+      file: ref.historyPath,
+      agentName: summary?.agent_name,
+      reasoningEffort: summary?.reasoning_effort,
+      skippedSystem,
+      skippedReminders,
+      chatFormatVersion,
+      sessionKind: summary?.session_kind,
+    },
+  };
+}
+
+const V1_RECORD_TYPES = new Set([
+  'system',
+  'user',
+  'assistant',
+  'reasoning',
+  'tool_result',
+  'backend_tool_call',
+]);
+
+/**
+ * Bounded sniff (first 50 parseable lines) for v1 `type`-dispatched records.
+ * Only used when the summary carries no `chat_format_version` marker.
+ */
+function looksLikeV1Records(raw: string): boolean {
+  let checked = 0;
+  for (const line of raw.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    try {
+      const rec = JSON.parse(trimmed) as { type?: unknown };
+      if (typeof rec.type === 'string' && V1_RECORD_TYPES.has(rec.type)) return true;
+    } catch {
+      /* not JSON — ignore */
+    }
+    if (++checked >= 50) break;
+  }
+  return false;
+}
+
+/**
+ * v1 (chat_format_version >= 1) records, dispatched on `rec.type`.
+ *
+ * Restored in the same fix as the legacy branch (#10): `backend_tool_call`
+ * records and `imageAttachments` were dropped by the merge rewrite.
+ */
+function parseV1Records(
+  raw: string,
+  messages: Message[],
+  opts: ParseOptions | undefined,
+  times: { createdAt: number; updatedAt: number },
+): { model?: string; skippedSystem: number; skippedReminders: number } {
+  const { createdAt, updatedAt } = times;
+  const includeTools = opts?.includeTools !== false;
+  let skippedSystem = 0;
+  let skippedReminders = 0;
+  let model: string | undefined;
   let pendingThinking: string[] = [];
 
   const flushThinking = (): CanonPart[] => {
@@ -273,6 +395,26 @@ async function parseSession(
         content: output,
         parts: [toolResultPart(callId, output, { isError })],
         createdAt: updatedAt,
+        attachments: imageAttachments(rec.images, opts),
+      });
+      continue;
+    }
+
+    if (type === 'backend_tool_call') {
+      if (!includeTools) continue;
+      flushThinking();
+      const kind = (rec.kind ?? {}) as Record<string, unknown>;
+      const name =
+        typeof kind.tool_type === 'string' && kind.tool_type ? kind.tool_type : 'backend_tool';
+      const id =
+        typeof kind.id === 'string' && kind.id ? kind.id : `backend-${messages.length}`;
+      messages.push({
+        role: 'assistant',
+        content: '',
+        parts: [toolCallPart(id, name, kind)],
+        createdAt: updatedAt,
+        model,
+        toolCalls: [{ toolName: name, input: kind, status: 'success' }],
       });
       continue;
     }
@@ -326,46 +468,79 @@ async function parseSession(
         parts: textOnlyParts(text),
         createdAt: createdAt,
         metadata: rec.prompt_index !== undefined ? { promptIndex: rec.prompt_index } : undefined,
+        attachments: imageAttachments(rec.content, opts),
       });
     }
   }
 
   flushThinking();
+  return { model, skippedSystem, skippedReminders };
+}
 
-  const hasChat = messages.some(m => m.role === 'user' || m.role === 'assistant');
-  if (!hasChat) return null;
+/**
+ * Legacy (chat_format_version 0) records, keyed by `role` instead of `type`.
+ * Restored by #10: without this branch legacy sessions parse to zero
+ * messages and vanish from the archive.
+ */
+function parseLegacyRecords(
+  raw: string,
+  messages: Message[],
+  opts?: ParseOptions,
+): void {
+  for (const line of raw.split(/\r?\n/)) {
+    if (!line.trim()) continue;
+    let item: GrokRecord;
+    try {
+      item = JSON.parse(line) as GrokRecord;
+    } catch {
+      continue;
+    }
+    const role = item.role;
+    if (role !== 'system' && role !== 'user' && role !== 'assistant' && role !== 'tool') {
+      continue;
+    }
+    const content = extractText(item.content);
+    const calls: ToolCall[] = [];
+    const parts: CanonPart[] = [...(textOnlyParts(content) ?? [])];
+    if (Array.isArray(item.tool_calls)) {
+      for (const call of item.tool_calls) {
+        const id = call.id ?? call.tool_call_id ?? `call-${calls.length + 1}`;
+        const fn = call.function ?? call;
+        const name = fn.name ?? 'tool';
+        const input = parseToolArgs(fn.arguments);
+        calls.push({ toolName: name, input, status: 'pending' });
+        parts.push(toolCallPart(id, name, input));
+      }
+    }
+    if (role === 'tool' && opts?.includeTools === false) continue;
+    if (!content && !calls.length) continue;
+    messages.push({
+      role,
+      content,
+      parts:
+        role === 'tool'
+          ? [toolResultPart(item.tool_call_id ?? 'unknown', content, { name: item.name })]
+          : parts,
+      toolCalls: calls.length > 0 ? calls : undefined,
+    });
+  }
+}
 
-  const title =
-    nonempty(summary?.generated_title) ??
-    nonempty(summary?.session_summary) ??
-    (() => {
-      const frum = findFirstRealUserMessage(
-        messages.map(m => ({ role: m.role, content: m.content })),
-      );
-      return frum ? formatFrumTitle(frum) : undefined;
-    })();
-
-  const workspace =
-    nonempty(summary?.info?.cwd) ?? decodeWorkspaceDir(basename(dirname(ref.dir)));
-  const externalId = nonempty(summary?.info?.id) ?? basename(ref.dir);
-
-  return {
-    externalId,
-    title,
-    createdAt: Math.floor(createdAt),
-    updatedAt: Math.floor(updatedAt),
-    model,
-    provider: 'xai',
-    workspace,
-    messages,
-    metadata: {
-      file: ref.historyPath,
-      agentName: summary?.agent_name,
-      reasoningEffort: summary?.reasoning_effort,
-      skippedSystem,
-      skippedReminders,
-    },
-  };
+function imageAttachments(value: unknown, opts?: ParseOptions): Attachment[] | undefined {
+  if (opts?.includeAttachments === false || !Array.isArray(value)) return undefined;
+  const images = value
+    .filter(
+      part =>
+        part != null &&
+        typeof part === 'object' &&
+        (part as { type?: unknown }).type === 'image' &&
+        typeof (part as { url?: unknown }).url === 'string',
+    )
+    .map(part => {
+      const url = (part as { url: string }).url;
+      return { type: 'image', name: 'image', path: url, metadata: { url } } as Attachment;
+    });
+  return images.length > 0 ? images : undefined;
 }
 
 async function readSummary(path: string): Promise<GrokSummary | null> {

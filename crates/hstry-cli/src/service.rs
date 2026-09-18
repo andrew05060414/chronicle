@@ -755,7 +755,7 @@ fn terminate_process(pid: u32) -> Result<()> {
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
     let status = Command::new("taskkill")
-        .args(["/PID", &pid.to_string(), "/F"])
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
         .creation_flags(CREATE_NO_WINDOW)
         .status()
         .context("Failed to run taskkill")?;
@@ -777,6 +777,59 @@ fn is_process_running(pid: u32) -> bool {
         .unwrap_or(false)
 }
 
+/// Split one `tasklist /FO CSV` line into fields.
+///
+/// `tasklist` quotes every field and escapes a literal quote as `""`.
+/// A naive `split(',')` breaks when the image name itself contains a
+/// comma (e.g. `"my,worker.exe","1234",...`): the PID column shifts and
+/// a live PID is reported as absent. Kept outside `#[cfg(windows)]` so
+/// unit tests run on every platform.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn parse_tasklist_csv_line(line: &str) -> Vec<String> {
+    let mut fields = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        if in_quotes {
+            if c == '"' {
+                if chars.peek() == Some(&'"') {
+                    current.push('"');
+                    chars.next();
+                } else {
+                    in_quotes = false;
+                }
+            } else {
+                current.push(c);
+            }
+        } else if c == '"' {
+            in_quotes = true;
+        } else if c == ',' {
+            fields.push(std::mem::take(&mut current));
+        } else {
+            current.push(c);
+        }
+    }
+    fields.push(current);
+    fields
+}
+
+/// Check `tasklist /FO CSV` output for an exact PID-column match.
+///
+/// The PID is the second CSV field. Only that field is compared, so
+/// unrelated numeric columns (session number, `12,345 K` memory figures)
+/// can never match. Kept outside `#[cfg(windows)]` so unit tests run on
+/// every platform.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn tasklist_csv_contains_pid(stdout: &str, pid: u32) -> bool {
+    let want = pid.to_string();
+    stdout.lines().any(|line| {
+        parse_tasklist_csv_line(line)
+            .get(1)
+            .is_some_and(|field| field.trim() == want)
+    })
+}
+
 #[cfg(windows)]
 fn is_process_running(pid: u32) -> bool {
     use std::os::windows::process::CommandExt;
@@ -785,14 +838,14 @@ fn is_process_running(pid: u32) -> bool {
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
     let output = Command::new("tasklist")
-        .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+        .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
         .creation_flags(CREATE_NO_WINDOW)
         .output();
 
     match output {
         Ok(out) => {
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            stdout.contains(&pid.to_string())
+            out.status.success()
+                && tasklist_csv_contains_pid(&String::from_utf8_lossy(&out.stdout), pid)
         }
         Err(_) => false,
     }
@@ -2227,5 +2280,63 @@ mod tests {
             assert!(status.running);
             assert_eq!(status.pid, Some(pid));
         });
+    }
+
+    #[test]
+    fn tasklist_csv_matches_exact_pid_column() {
+        let stdout = "\"hstry.exe\",\"1234\",\"Console\",\"1\",\"15,232 K\"";
+        assert!(tasklist_csv_contains_pid(stdout, 1234));
+    }
+
+    #[test]
+    fn tasklist_csv_ignores_memory_column_false_positive() {
+        // PID 12 must not match the `12,345 K` memory figure.
+        let stdout = "\"hstry.exe\",\"9999\",\"Console\",\"1\",\"12,345 K\"";
+        assert!(!tasklist_csv_contains_pid(stdout, 12));
+    }
+
+    #[test]
+    fn tasklist_csv_ignores_session_number_false_positive() {
+        // PID 1 must not match session number "1" when the PID column differs.
+        let stdout = "\"hstry.exe\",\"9999\",\"Console\",\"1\",\"15,232 K\"";
+        assert!(!tasklist_csv_contains_pid(stdout, 1));
+    }
+
+    #[test]
+    fn tasklist_csv_rejects_no_tasks_info_line() {
+        let stdout = "INFO: No tasks are running which match the specified criteria.";
+        assert!(!tasklist_csv_contains_pid(stdout, 1234));
+        assert!(!tasklist_csv_contains_pid("", 1234));
+    }
+
+    #[test]
+    fn tasklist_csv_finds_pid_among_multiple_lines() {
+        let stdout = "\"a.exe\",\"1111\",\"Console\",\"1\",\"9,000 K\"\r\n\"hstry.exe\",\"1234\",\"Console\",\"1\",\"15,232 K\"";
+        assert!(tasklist_csv_contains_pid(stdout, 1234));
+        assert!(!tasklist_csv_contains_pid(stdout, 12));
+    }
+
+    #[test]
+    fn tasklist_csv_handles_image_name_with_comma() {
+        // A naive split(',') shifts the PID column here and reports the
+        // live PID 1234 as absent.
+        let stdout = "\"my,worker.exe\",\"1234\",\"Console\",\"1\",\"15,232 K\"";
+        assert!(tasklist_csv_contains_pid(stdout, 1234));
+        assert!(!tasklist_csv_contains_pid(stdout, 1));
+    }
+
+    #[test]
+    fn tasklist_csv_handles_escaped_quotes_in_image_name() {
+        let stdout = "\"weird \"\"quoted\"\".exe\",\"1234\",\"Console\",\"1\",\"15,232 K\"";
+        assert_eq!(parse_tasklist_csv_line(stdout)[0], "weird \"quoted\".exe");
+        assert!(tasklist_csv_contains_pid(stdout, 1234));
+    }
+
+    #[test]
+    fn tasklist_csv_multi_line_with_comma_image_name() {
+        let stdout = "\"a.exe\",\"1111\",\"Console\",\"1\",\"9,000 K\"\r\n\"my,worker.exe\",\"1234\",\"Console\",\"1\",\"15,232 K\"";
+        assert!(tasklist_csv_contains_pid(stdout, 1234));
+        assert!(tasklist_csv_contains_pid(stdout, 1111));
+        assert!(!tasklist_csv_contains_pid(stdout, 15));
     }
 }

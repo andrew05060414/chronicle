@@ -3,7 +3,7 @@
 把多台机器上的 AI 对话收成一份能搜、能按设备分开、坏了能在目标电脑恢复的档案。
 不是聊天 App，不是记忆系统。记忆（Agent Memory）是这份档案的客户。
 
-本页描述通用部署合同。采集优先，恢复说明见 [`restore.md`](./restore.md)。
+本页描述通用部署合同。采集优先，恢复说明见 [`restore.md`](./restore.md)。项目为什么变成这样、对话里拍过的板，见 [`project-thread.md`](./project-thread.md)。
 
 ---
 

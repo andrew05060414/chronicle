@@ -455,13 +455,14 @@ impl Config {
         self.sync.mode == SyncMode::Satellite && self.sync.hub_remote.is_some()
     }
 
-    /// Explicit scope wins; satellite + `hub_remote` defaults to remote; otherwise local.
+    /// Explicit scope wins; satellite + `hub_remote` defaults to all (local + hub);
+    /// otherwise local.
     pub fn resolve_search_scope(&self, explicit: Option<SearchScope>) -> SearchScope {
         if let Some(scope) = explicit {
             return scope;
         }
         if self.prefers_hub_search() {
-            SearchScope::Remote
+            SearchScope::All
         } else {
             SearchScope::Local
         }

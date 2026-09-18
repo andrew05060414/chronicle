@@ -131,11 +131,11 @@ mod search_scope_tests {
     }
 
     #[test]
-    fn satellite_with_hub_defaults_to_remote_search() {
+    fn satellite_with_hub_defaults_to_all_search() {
         let mut config = Config::default();
         config.sync.mode = SyncMode::Satellite;
         config.sync.hub_remote = Some("nas".into());
-        assert_eq!(config.resolve_search_scope(None), SearchScope::Remote);
+        assert_eq!(config.resolve_search_scope(None), SearchScope::All);
     }
 
     #[test]

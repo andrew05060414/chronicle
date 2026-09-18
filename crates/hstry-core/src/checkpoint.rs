@@ -178,7 +178,7 @@ pub async fn create_checkpoint(
     weekly: Option<bool>,
 ) -> Result<CheckpointInfo> {
     let dir = config.resolve_dir(database_path);
-    fs::create_dir_all(&dir)?;
+    fs::create_dir_all(&dir).map_err(|e| create_stage("create checkpoint dir", &dir, e))?;
 
     let created_at = Utc::now();
     let stem = format!("hstry-{}", created_at.format("%Y%m%d-%H%M%S"));
@@ -186,48 +186,67 @@ pub async fn create_checkpoint(
 
     let _lock = acquire_ingest_lock(&ingest_lock_path(database_path))?;
 
+    // Online copy: the live `db` handle stays open. VACUUM INTO writes a
+    // consistent snapshot; we must not `Database::open` that snapshot
+    // (WAL + pooled connections + migrations) or Windows will still hold
+    // `-wal`/`-shm` mappings when we later compress and delete it.
     let raw_path = dir.join(format!("{stem}.db"));
-    db.backup_to(&raw_path).await?;
+    vacuum_into_with_retry(db, &raw_path).await?;
 
-    let copy = Database::open(&raw_path).await?;
-    let integrity = copy.integrity_check().await?;
-    let conversations = copy.count_conversations().await?;
-    let messages = copy.count_messages().await?;
-    let sources = copy.count_sources().await?;
-    copy.close().await;
-
-    if integrity != "ok" {
-        let _ = fs::remove_file(&raw_path);
+    let stats = inspect_snapshot_with_retry(&raw_path).await?;
+    if stats.integrity != "ok" {
+        let _ = safe_remove_file(&raw_path);
         return Err(Error::Other(format!(
-            "checkpoint integrity_check failed: {integrity}"
+            "checkpoint create: integrity_check failed for {}: {}",
+            raw_path.display(),
+            stats.integrity
         )));
     }
 
-    let uncompressed_bytes = fs::metadata(&raw_path)?.len();
+    let uncompressed_bytes = fs::metadata(&raw_path)
+        .map_err(|e| create_stage("stat snapshot", &raw_path, e))?
+        .len();
     let zst_path = archive_path(&dir, &stem);
     {
-        let input = BufReader::new(File::open(&raw_path)?);
-        let output = BufWriter::new(File::create(&zst_path)?);
-        zstd::stream::copy_encode(input, output, 3)?;
+        let input = BufReader::new(
+            safe_open_file(&raw_path)
+                .map_err(|e| create_stage("open snapshot for compress", &raw_path, e))?,
+        );
+        let output = BufWriter::new(
+            safe_create_file(&zst_path)
+                .map_err(|e| create_stage("create archive", &zst_path, e))?,
+        );
+        zstd::stream::copy_encode(input, output, 3)
+            .map_err(|e| create_stage("compress snapshot", &raw_path, e))?;
     }
-    let compressed_bytes = fs::metadata(&zst_path)?.len();
-    fs::remove_file(&raw_path)?;
+    let compressed_bytes = fs::metadata(&zst_path)
+        .map_err(|e| create_stage("stat archive", &zst_path, e))?
+        .len();
+    safe_remove_file(&raw_path).map_err(|e| create_stage("remove snapshot", &raw_path, e))?;
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let mut sidecar_os = raw_path.as_os_str().to_os_string();
+        sidecar_os.push(suffix);
+        let sidecar = PathBuf::from(sidecar_os);
+        safe_remove_file(&sidecar)
+            .map_err(|e| create_stage("remove snapshot sidecar", &sidecar, e))?;
+    }
 
     let manifest = CheckpointManifest {
         version: MANIFEST_VERSION,
         created_at,
         stem: stem.clone(),
         weekly,
-        conversations,
-        messages,
-        sources,
+        conversations: stats.conversations,
+        messages: stats.messages,
+        sources: stats.sources,
         uncompressed_bytes,
         compressed_bytes,
-        integrity,
+        integrity: stats.integrity,
         live_database: database_path.to_string_lossy().to_string(),
     };
     let manifest_path = manifest_path(&dir, &stem);
-    fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest)?)?;
+    fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest)?)
+        .map_err(|e| create_stage("write manifest", &manifest_path, e))?;
 
     Ok(CheckpointInfo {
         manifest,
@@ -353,6 +372,57 @@ fn restore_stage(stage: &str, path: &Path, err: impl std::fmt::Display) -> Error
         "checkpoint restore: {stage} failed for {}: {err}",
         path.display()
     ))
+}
+
+fn create_stage(stage: &str, path: &Path, err: impl std::fmt::Display) -> Error {
+    Error::Other(format!(
+        "checkpoint create: {stage} failed for {}: {err}",
+        path.display()
+    ))
+}
+
+fn error_is_transient_lock(err: &Error) -> bool {
+    if let Error::Io(e) = err
+        && is_transient_lock(e.raw_os_error())
+    {
+        return true;
+    }
+    let s = err.to_string();
+    s.contains("os error 32")
+        || s.contains("os error 5")
+        || s.contains("os error 1224")
+        || s.contains("being used by another process")
+        || s.contains("user-mapped section")
+}
+
+async fn vacuum_into_with_retry(db: &Database, dest: &Path) -> Result<()> {
+    let mut attempts = 0;
+    loop {
+        match db.backup_to(dest).await {
+            Ok(()) => return Ok(()),
+            Err(e) if error_is_transient_lock(&e) && attempts < 40 => {
+                attempts += 1;
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            Err(e) => return Err(create_stage("vacuum into snapshot", dest, e)),
+        }
+    }
+}
+
+async fn inspect_snapshot_with_retry(path: &Path) -> Result<crate::db::SnapshotInspect> {
+    let mut attempts = 0;
+    loop {
+        match Database::inspect_readonly_snapshot(path).await {
+            Ok(stats) => return Ok(stats),
+            Err(e) if error_is_transient_lock(&e) && attempts < 40 => {
+                attempts += 1;
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            Err(e) => {
+                return Err(create_stage("inspect snapshot", path, e));
+            }
+        }
+    }
 }
 
 pub fn restore_checkpoint(dir: &Path, stem: &str, dest: &Path) -> Result<PathBuf> {
@@ -496,20 +566,76 @@ mod tests {
             .unwrap();
         assert_eq!(created.manifest.integrity, "ok");
         assert_eq!(created.manifest.sources, 1);
+        // Live handle must remain usable: checkpoint creation is an online
+        // operation and must not require closing the source database.
+        assert_eq!(db.count_sources().await.unwrap(), 1);
+
+        let ckpt_dir = cfg.dir.clone().unwrap();
+        let leftover_sidecars: Vec<_> = fs::read_dir(&ckpt_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with("-wal") || n.ends_with("-shm") || n.ends_with("-journal"))
+            .collect();
+        assert!(
+            leftover_sidecars.is_empty(),
+            "checkpoint must not leave WAL/SHM on the snapshot: {leftover_sidecars:?}"
+        );
         db.close().await;
 
-        let listed = list_checkpoints(&cfg.dir.clone().unwrap()).unwrap();
+        let listed = list_checkpoints(&ckpt_dir).unwrap();
         assert_eq!(listed.len(), 1);
 
         let restore_path = dir.path().join("restored.db");
-        restore_checkpoint(
-            &cfg.dir.clone().unwrap(),
-            &created.manifest.stem,
-            &restore_path,
-        )
-        .unwrap();
+        restore_checkpoint(&ckpt_dir, &created.manifest.stem, &restore_path).unwrap();
         let restored = Database::open(&restore_path).await.unwrap();
         assert_eq!(restored.count_sources().await.unwrap(), 1);
         restored.close().await;
+    }
+
+    #[tokio::test]
+    async fn inspect_snapshot_does_not_enable_wal_while_source_stays_open() {
+        use crate::models::Source;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("live.db");
+        let db = Database::open(&db_path).await.unwrap();
+        db.upsert_source(&Source {
+            id: "cursor-abc".to_string(),
+            adapter: "cursor".to_string(),
+            path: Some("/tmp".to_string()),
+            last_sync_at: None,
+            config: serde_json::json!({}),
+        })
+        .await
+        .unwrap();
+
+        let raw = dir.path().join("snapshot.db");
+        db.backup_to(&raw).await.unwrap();
+        let stats = Database::inspect_readonly_snapshot(&raw).await.unwrap();
+        assert_eq!(stats.integrity, "ok");
+        assert_eq!(stats.sources, 1);
+
+        let wal = PathBuf::from(format!("{}-wal", raw.display()));
+        let shm = PathBuf::from(format!("{}-shm", raw.display()));
+        assert!(
+            !wal.exists() && !shm.exists(),
+            "readonly snapshot inspect must not create WAL/SHM sidecars"
+        );
+        // Source database remains open and readable.
+        assert_eq!(db.count_sources().await.unwrap(), 1);
+        db.close().await;
+    }
+
+    #[tokio::test]
+    async fn create_failure_names_stage_and_path() {
+        let err = inspect_snapshot_with_retry(Path::new("missing-snapshot.db"))
+            .await
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("inspect snapshot") && msg.contains("missing-snapshot.db"),
+            "create inspect failure must name the stage and path, got: {msg}"
+        );
     }
 }

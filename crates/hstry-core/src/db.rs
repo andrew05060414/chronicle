@@ -58,6 +58,18 @@ fn normalize_source_path(path: Option<&String>) -> Option<String> {
     path.map(|p| p.trim_end_matches('/').to_string())
 }
 
+/// Row counts and integrity of a `VACUUM INTO` snapshot.
+///
+/// Used by checkpoint creation so the live archive can stay open while the
+/// snapshot is verified without enabling WAL on the copy.
+#[derive(Debug, Clone)]
+pub(crate) struct SnapshotInspect {
+    pub integrity: String,
+    pub conversations: i64,
+    pub messages: i64,
+    pub sources: i64,
+}
+
 impl Database {
     pub(crate) fn read_pool(&self) -> &SqlitePool {
         &self.pool
@@ -1085,6 +1097,49 @@ impl Database {
         }
         pool.close().await;
         Ok(())
+    }
+
+    /// Inspect a checkpoint snapshot read-only: no WAL, no migrations, no
+    /// writes.
+    ///
+    /// `Database::open` always enables WAL and runs `init()`. Using it on a
+    /// freshly vacuumed copy creates `-wal`/`-shm` next to the snapshot and
+    /// then races Windows handle release when the copy is compressed and
+    /// deleted. This path is the production inspect for that snapshot.
+    pub(crate) async fn inspect_readonly_snapshot(path: &Path) -> Result<SnapshotInspect> {
+        crate::test_guard::check_path_for_open(path).map_err(Error::Other)?;
+        let options = SqliteConnectOptions::new()
+            .filename(path)
+            .create_if_missing(false)
+            .read_only(true);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await?;
+        let result = Self::inspect_readonly_snapshot_with(&pool).await;
+        pool.close().await;
+        result
+    }
+
+    async fn inspect_readonly_snapshot_with(pool: &SqlitePool) -> Result<SnapshotInspect> {
+        let integrity: (String,) = sqlx::query_as("PRAGMA integrity_check")
+            .fetch_one(pool)
+            .await?;
+        let conversations: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM conversations")
+            .fetch_one(pool)
+            .await?;
+        let messages: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM messages")
+            .fetch_one(pool)
+            .await?;
+        let sources: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM sources")
+            .fetch_one(pool)
+            .await?;
+        Ok(SnapshotInspect {
+            integrity: integrity.0,
+            conversations: conversations.0,
+            messages: messages.0,
+            sources: sources.0,
+        })
     }
 
     /// Consistent online copy of this database via `VACUUM INTO`.

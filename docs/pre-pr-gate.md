@@ -97,7 +97,14 @@ semantics differ (open SQLite files lock on Windows). No step uses
    shape matches PR #30, so it rebases cleanly; the gate adds
    tests/workflow/guard infrastructure, not a second restore
    implementation. No best-effort test helper is used in the production
-   path.
+   path. Checkpoint *creation* is an online operation: the live archive
+   handle stays open. The snapshot is produced with `VACUUM INTO`, then
+   inspected read-only (no WAL, no migrations, no pooled writer) so
+   Windows never has to release a mapped `-wal`/`-shm` on that temp copy
+   before compress/delete. Snapshot file ops reuse the same
+   `safe_open_file` / `safe_create_file` / `safe_remove_file` transient
+   retry (32/5/1224 only); corruption and integrity failures fail fast.
+   Every create filesystem step reports its stage and path.
 6. Fetched/full-sync validation helpers
    (`Database::validate_hstry_database_file`, read-only, local temp files
    only): a valid archive passes; a corrupt file and a SQLite file without

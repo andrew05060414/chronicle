@@ -30,9 +30,9 @@ async fn try_main() -> Result<()> {
         .common
         .config
         .unwrap_or_else(Config::default_config_path);
-    let config = Config::ensure_at(&config_path)?;
+    let config = Config::load_from_path(&config_path)?;
 
-    let db = hstry_core::Database::open(&config.database).await?;
+    let db = hstry_core::Database::open_read_only(&config.database).await?;
     let server = McpServer::new(config, db);
     let transport = stdio();
 

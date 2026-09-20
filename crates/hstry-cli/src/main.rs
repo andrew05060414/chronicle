@@ -116,6 +116,17 @@ struct StatsSummary {
     messages: i64,
     per_source: Vec<hstry_core::db::SourceStats>,
     activity: hstry_core::db::ActivityStats,
+    checkpoint: CheckpointHealth,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct CheckpointHealth {
+    enabled: bool,
+    count: usize,
+    newest_at: Option<chrono::DateTime<chrono::Utc>>,
+    age_seconds: Option<i64>,
+    stale_after_seconds: u64,
+    stale: bool,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -1480,7 +1491,7 @@ async fn main() -> Result<()> {
         Command::Stats => {
             let db = Database::open(&config.database).await?;
             apply_storage_config(&db, &config);
-            cmd_stats(&db, cli.json).await
+            cmd_stats(&db, &config, cli.json).await
         }
         Command::Dedup {
             dry_run,
@@ -6166,13 +6177,40 @@ async fn cmd_index(_config: &Config, db: &Database, rebuild: bool, json: bool) -
     Ok(())
 }
 
-async fn cmd_stats(db: &Database, json: bool) -> Result<()> {
+fn checkpoint_health(config: &Config) -> Result<CheckpointHealth> {
+    let dir = config.checkpoint.resolve_dir(&config.database);
+    let checkpoints =
+        hstry_core::checkpoint::list_checkpoints(&dir).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let newest_at = checkpoints.first().map(|c| c.manifest.created_at);
+    let age_seconds = newest_at.map(|created| {
+        (chrono::Utc::now() - created)
+            .num_seconds()
+            .max(0)
+    });
+    let stale_after_seconds = config.checkpoint.interval_secs.saturating_mul(2);
+    let stale = config.checkpoint.enabled
+        && age_seconds
+            .map(|age| age > i64::try_from(stale_after_seconds).unwrap_or(i64::MAX))
+            .unwrap_or(true);
+
+    Ok(CheckpointHealth {
+        enabled: config.checkpoint.enabled,
+        count: checkpoints.len(),
+        newest_at,
+        age_seconds,
+        stale_after_seconds,
+        stale,
+    })
+}
+
+async fn cmd_stats(db: &Database, config: &Config, json: bool) -> Result<()> {
     let sources = db.list_sources().await?;
     let conv_count = db.count_conversations().await?;
     let msg_count = db.count_messages().await?;
     let sources_count = i64::try_from(sources.len()).unwrap_or(i64::MAX);
     let per_source = db.get_source_stats().await?;
     let activity = db.get_activity_stats(30).await?;
+    let checkpoint = checkpoint_health(config)?;
 
     if json {
         return emit_json(JsonResponse {
@@ -6183,6 +6221,7 @@ async fn cmd_stats(db: &Database, json: bool) -> Result<()> {
                 messages: msg_count,
                 per_source,
                 activity,
+                checkpoint,
             }),
             error: None,
         });
@@ -6204,6 +6243,26 @@ async fn cmd_stats(db: &Database, json: bool) -> Result<()> {
     println!("  Today:      {:>6} conversations", activity.today);
     println!("  This week:  {:>6} conversations", activity.week);
     println!("  This month: {:>6} conversations", activity.month);
+    println!();
+
+    println!("\x1b[1;34mCheckpoint Health\x1b[0m");
+    if !checkpoint.enabled {
+        println!("  Checkpointing: disabled");
+    } else if let (Some(newest), Some(age)) = (checkpoint.newest_at, checkpoint.age_seconds) {
+        println!("  Checkpoints:   {}", checkpoint.count);
+        println!("  Newest:        {} ({}s ago)", newest.to_rfc3339(), age);
+        if checkpoint.stale {
+            println!(
+                "  WARNING: checkpoint is stale (threshold {}s)",
+                checkpoint.stale_after_seconds
+            );
+        } else {
+            println!("  Freshness:     ok");
+        }
+    } else {
+        println!("  Checkpoints:   0");
+        println!("  WARNING: checkpointing is enabled but no valid checkpoint exists");
+    }
     println!();
 
     // Per-source stats

@@ -9,7 +9,10 @@ async fn read_only_open_refuses_missing_database_without_creating_it() -> anyhow
     let result = Database::open_read_only(&path).await;
 
     assert!(result.is_err(), "missing read-only database must fail");
-    assert!(!path.exists(), "read-only open must not create an empty archive");
+    assert!(
+        !path.exists(),
+        "read-only open must not create an empty archive"
+    );
     Ok(())
 }
 

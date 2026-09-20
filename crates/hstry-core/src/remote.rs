@@ -1263,15 +1263,6 @@ pub async fn show_remote(
 mod tests {
     use super::*;
 
-    #[cfg(windows)]
-    const TEST_SHELL: &str = "bash";
-    #[cfg(not(windows))]
-    const TEST_SHELL: &str = "sh";
-    #[cfg(windows)]
-    const TEST_SHELL_ARG: &str = "-lc";
-    #[cfg(not(windows))]
-    const TEST_SHELL_ARG: &str = "-c";
-
     #[test]
     fn test_cached_db_path() {
         let path = cached_db_path("laptop");
@@ -1314,11 +1305,66 @@ mod tests {
 
     #[test]
     fn expand_remote_path_command_uses_printf_not_eval() {
-        let command = expand_remote_path_command("~/db/$HSTRY_DIR/$(touch injected).db");
+        let command = expand_remote_path_command("~/db/$HSTRY_DIR/${HOME}/$(touch injected).db");
         assert!(command.starts_with("printf '%s\\n' "));
+        assert!(!command.contains("eval"));
+        assert!(command.contains("\"${HOME}\""));
+        assert!(command.contains("\"$HSTRY_DIR\""));
+        assert!(command.contains(&shell_quote("/$(touch injected).db")));
+    }
+
+    #[test]
+    fn remote_path_expression_quotes_metacharacters_pipes_globs_and_newlines() {
+        let path =
+            "~/history/$HSTRY_TEST_DIR/it's; touch injected | rm -rf /; $(touch injected)\n*.db";
+        let expression = remote_path_expression(path);
+        assert!(!expression.contains("eval"));
+        assert!(expression.starts_with("\"${HOME}\""));
+        assert!(expression.contains("\"$HSTRY_TEST_DIR\""));
+        assert!(expression.contains(&shell_quote(
+            "/it's; touch injected | rm -rf /; $(touch injected)\n*.db"
+        )));
+        assert_eq!(
+            expand_remote_path_command("/vol1/1000/Code/hstry backup/*.db"),
+            format!(
+                "printf '%s\\n' {}",
+                shell_quote("/vol1/1000/Code/hstry backup/*.db")
+            )
+        );
+    }
+
+    #[test]
+    fn remote_file_check_uses_one_shell_argument() {
+        let malicious_path = "/missing; touch injected\nsecond | cat";
+        let command = file_exists_command(malicious_path);
+        assert_eq!(
+            command,
+            format!(
+                "test -f {} && printf 'yes\\n' || printf 'no\\n'",
+                shell_quote(malicious_path)
+            )
+        );
         assert!(!command.contains("eval"));
     }
 
+    #[cfg(unix)]
+    fn run_posix_shell(
+        command: &str,
+        env: &[(&str, &str)],
+        cwd: Option<&Path>,
+    ) -> std::process::Output {
+        let mut child = Command::new("sh");
+        child.arg("-c").arg(command);
+        for (key, value) in env {
+            child.env(key, value);
+        }
+        if let Some(dir) = cwd {
+            child.current_dir(dir);
+        }
+        child.output().expect("run POSIX shell command")
+    }
+
+    #[cfg(unix)]
     #[test]
     fn remote_path_expansion_treats_shell_metacharacters_as_data() {
         let temp = tempfile::tempdir().expect("temp directory");
@@ -1327,14 +1373,14 @@ mod tests {
             format!("~/history/$HSTRY_TEST_DIR/it's; touch {marker}; $(touch {marker})\n.db");
         let command = expand_remote_path_command(&path);
 
-        let output = Command::new(TEST_SHELL)
-            .arg(TEST_SHELL_ARG)
-            .arg(command)
-            .env("HOME", "/remote/home")
-            .env("HSTRY_TEST_DIR", "folder with spaces")
-            .current_dir(temp.path())
-            .output()
-            .expect("run expansion command");
+        let output = run_posix_shell(
+            &command,
+            &[
+                ("HOME", "/remote/home"),
+                ("HSTRY_TEST_DIR", "folder with spaces"),
+            ],
+            Some(temp.path()),
+        );
 
         assert!(output.status.success());
         assert_eq!(
@@ -1346,6 +1392,7 @@ mod tests {
         assert!(!temp.path().join(marker).exists());
     }
 
+    #[cfg(unix)]
     #[test]
     fn remote_file_check_treats_expanded_path_as_one_shell_word() {
         let temp = tempfile::tempdir().expect("temp directory");
@@ -1353,28 +1400,20 @@ mod tests {
         let malicious_path = format!("/missing; touch {marker}\nsecond");
         let command = file_exists_command(&malicious_path);
 
-        let output = Command::new(TEST_SHELL)
-            .arg(TEST_SHELL_ARG)
-            .arg(command)
-            .current_dir(temp.path())
-            .output()
-            .expect("run file check command");
+        let output = run_posix_shell(&command, &[], Some(temp.path()));
 
         assert!(output.status.success());
         assert_eq!(output.stdout, b"no\n");
         assert!(!temp.path().join(marker).exists());
     }
 
+    #[cfg(unix)]
     #[test]
     fn remote_path_expansion_keeps_spaces_and_globs_literal() {
         let path = "/vol1/1000/Code/hstry backup/*.db";
         let command = expand_remote_path_command(path);
 
-        let output = Command::new(TEST_SHELL)
-            .arg(TEST_SHELL_ARG)
-            .arg(command)
-            .output()
-            .expect("run expansion command");
+        let output = run_posix_shell(&command, &[], None);
 
         assert!(output.status.success());
         assert_eq!(

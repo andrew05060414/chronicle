@@ -99,7 +99,9 @@ v1.0.0 之前做的一次本机盘点（记在 [`archive-model.md`](./archive-mo
 
 分别是远程路径的 printf 转义（#3）、持久化 UUID 设备身份（#4）、SQLite `quick_check` 校验（#7）。13 条发现记在 #16，全部登记见 [`merge-review-register.md`](./merge-review-register.md)。
 
-`4fec377`（2026-09-17）之后的修复都在各自分支上，main 没有再前进。
+修复在 2026-09-18 上午一次性落地：`2829434` 合入 #30、`3b1396e` 合入 #29、`b36cad3` 合入 #31、`c436a65` 合入 #34（记忆完整性门禁，从此 CI 是 `clippy --all-targets -- -D warnings` 加全 target 测试），随后 #28 和本套文档 `fddb223` 也合了进去。main 现在在 `fddb223`。
+
+还在飞的是 #35（修 #17 的 pull 方向）和 #32（文档边界）。
 
 ---
 
@@ -107,12 +109,13 @@ v1.0.0 之前做的一次本机盘点（记在 [`archive-model.md`](./archive-mo
 
 | 分支 | 最后一笔 | 状态 |
 |---|---|---|
-| `main` | `0186b81` | 所有 draft PR 的 base |
+| `main` | `fddb223`（2026-09-18） | 当前 base |
 | `andrew-nas` | `4b77288`（2026-07-30） | **已并入 main**，旧指针 |
 | `feat/rip-out-tantivy` | `740bcbb`（2026-04-26） | **已并入 main**，旧指针 |
 | `release/1.0` | `179aaba`（2026-08-25） | **已并入 main**，旧指针 |
 | `fix/ci-baseline` | `90dcb5a` | 已通过 PR #2 合并 |
-| `ci/pre-pr-memory-integrity-gate` 等 6 个 | 见 [`merge-review-register.md`](./merge-review-register.md) | 进行中 |
+| `fix/backup-safety-5-6-7`、`fix/adapter-defects-batch`、`fix/windows-service-process-detection`、`ci/pre-pr-memory-integrity-gate`、`fix/search-scope-and-mcp-surface` | — | 2026-09-18 上午已合并 |
+| `docs/chronicle-boundary-20-21`、`claude/project-thread-rgec62` | 见 [`merge-review-register.md`](./merge-review-register.md) | 进行中 |
 
 前三个分支上没有任何未并入 main 的提交。它们是遗留指针，不是搁置的探索——删掉不会丢东西。
 

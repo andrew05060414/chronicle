@@ -5,9 +5,9 @@
 
 use std::path::Path;
 
+use crate::Database;
 use crate::config::SyncConfig;
 use crate::remote::expand_remote_path_command;
-use crate::Database;
 
 #[test]
 fn remote_path_expansion_never_evaluates_command_substitution() {

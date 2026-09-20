@@ -33,6 +33,15 @@ use hstry_runtime::{AdapterRunner, Runtime};
 
 const DETECT_THRESHOLD: f32 = 0.5;
 
+/// `Instant::now() - duration` panics on Windows when uptime is shorter than
+/// `duration` (monotonic clock origin is boot). Fresh boots then crash-loop the
+/// service. Fall back to "now" so the first interval simply waits.
+fn instant_ago(secs: u64) -> Instant {
+    Instant::now()
+        .checked_sub(Duration::from_secs(secs))
+        .unwrap_or_else(Instant::now)
+}
+
 #[derive(Clone)]
 struct ServerState {
     db: Arc<Database>,
@@ -644,8 +653,12 @@ pub async fn cmd_service(config_path: &Path, command: ServiceCommand) -> Result<
         ServiceCommand::Start => {
             start_service(config_path)?;
         }
-        ServiceCommand::Run => {
-            run_service(config_path).await?;
+        ServiceCommand::Run {
+            http_port,
+            no_http,
+            http_token,
+        } => {
+            run_service(config_path, http_port, no_http, http_token).await?;
         }
         ServiceCommand::Restart => {
             stop_service()?;
@@ -924,7 +937,12 @@ fn write_pid_file(pid: u32) -> Result<()> {
     Ok(())
 }
 
-async fn run_service(config_path: &Path) -> Result<()> {
+async fn run_service(
+    config_path: &Path,
+    cli_http_port: Option<u16>,
+    no_http: bool,
+    cli_http_token: Option<String>,
+) -> Result<()> {
     let mut state = ServiceState::load(config_path).await?;
     let server_handle = if state.config.service.search_api {
         Some(
@@ -932,6 +950,27 @@ async fn run_service(config_path: &Path) -> Result<()> {
                 state.config.service.transport,
                 state.config.service.search_port,
                 state.db.clone(),
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+
+    let http_handle = if !no_http && state.config.service.http_api {
+        let port = cli_http_port
+            .or(state.config.service.http_port)
+            .unwrap_or(3000);
+        let token = cli_http_token
+            .or_else(|| state.config.service.http_token.clone())
+            .or_else(|| std::env::var("HSTRY_API_TOKEN").ok())
+            .filter(|t| !t.is_empty());
+        Some(
+            start_http_api_server(
+                port,
+                Arc::new(state.config.clone()),
+                state.db.clone(),
+                token,
             )
             .await?,
         )
@@ -996,7 +1035,40 @@ async fn run_service(config_path: &Path) -> Result<()> {
     if let Some(handle) = server_handle {
         handle.abort();
     }
+    if let Some(handle) = http_handle {
+        handle.abort();
+    }
     Ok(())
+}
+
+async fn start_http_api_server(
+    port: u16,
+    config: Arc<Config>,
+    db: Arc<Database>,
+    token: Option<String>,
+) -> Result<tokio::task::JoinHandle<()>> {
+    let has_token = token.is_some();
+    let app_state = hstry_api::AppState::new(config, db, token);
+    let (handle, local_addr) = hstry_api::start_http_server(port, app_state)
+        .await
+        .with_context(|| format!("Failed to bind HTTP API server on port {port}"))?;
+
+    let port_path = hstry_core::paths::http_port_path();
+    if let Some(parent) = port_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(&port_path, local_addr.port().to_string());
+
+    println!(
+        "Service listening on http://{local_addr} (HTTP ingest API, auth: {})",
+        if has_token {
+            "token required"
+        } else {
+            "open on loopback"
+        }
+    );
+
+    Ok(handle)
 }
 
 async fn start_search_server(
@@ -1229,14 +1301,14 @@ impl ServiceState {
             watcher,
             event_rx,
             last_remote_sync: Instant::now(),
-            last_workspace_discovery: Instant::now() - Duration::from_secs(3600),
-            last_event_sync: Instant::now() - Duration::from_secs(300), // allow immediate first sync
+            last_workspace_discovery: instant_ago(3600),
+            last_event_sync: instant_ago(300), // allow immediate first sync when uptime allows
             source_backoff: HashMap::new(),
             source_quiet_until: HashMap::new(),
             source_schedule: HashMap::new(),
             sync_semaphore,
             metrics: Arc::new(tokio::sync::Mutex::new(ServiceMetrics::default())),
-            last_events_compaction: Instant::now() - Duration::from_secs(86_400),
+            last_events_compaction: instant_ago(86_400),
         };
 
         // NOTE: refresh_watches() is called separately by the caller after
@@ -2336,5 +2408,26 @@ mod tests {
         assert!(tasklist_csv_contains_pid(stdout, 1234));
         assert!(tasklist_csv_contains_pid(stdout, 1111));
         assert!(!tasklist_csv_contains_pid(stdout, 15));
+    }
+
+    #[tokio::test]
+    async fn http_api_server_starts_and_handles_health() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let db = Arc::new(Database::open(&dir.path().join("service_http.db")).await?);
+        let config = Arc::new(Config::default());
+        let handle = start_http_api_server(0, config, db, None).await?;
+        let port_path = hstry_core::paths::http_port_path();
+        let port_str = std::fs::read_to_string(port_path)?;
+        let port: u16 = port_str.trim().parse()?;
+        let client = reqwest::Client::new();
+        let resp = client
+            .get(format!("http://127.0.0.1:{port}/health"))
+            .send()
+            .await?;
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        let body: serde_json::Value = resp.json().await?;
+        assert_eq!(body["status"], "ok");
+        handle.abort();
+        Ok(())
     }
 }

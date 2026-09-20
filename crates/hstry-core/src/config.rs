@@ -815,6 +815,18 @@ pub struct ServiceConfig {
     #[serde(default)]
     pub transport: ServiceTransport,
 
+    /// Expose local HTTP API (for ingest and browser extensions).
+    #[serde(default = "default_true")]
+    pub http_api: bool,
+
+    /// Optional port for HTTP API (defaults to 3000 if unset).
+    #[serde(default = "default_http_port")]
+    pub http_port: Option<u16>,
+
+    /// Optional auth token for HTTP API /ingest.
+    #[serde(default)]
+    pub http_token: Option<String>,
+
     /// Per-source adaptive scheduling parameters (trx-z42c.1).
     #[serde(default)]
     pub scheduler: SchedulerConfig,
@@ -892,10 +904,17 @@ impl Default for ServiceConfig {
             search_api: true,
             search_port: None,
             transport: ServiceTransport::Tcp,
+            http_api: true,
+            http_port: Some(3000),
+            http_token: None,
             scheduler: SchedulerConfig::default(),
             resources: ResourceConfig::default(),
         }
     }
+}
+
+fn default_http_port() -> Option<u16> {
+    Some(3000)
 }
 
 fn default_true() -> bool {

@@ -86,6 +86,13 @@ mod default_config_tests {
     }
 
     #[test]
+    fn default_http_api_enabled() {
+        let config = Config::default();
+        assert!(config.service.http_api);
+        assert_eq!(config.service.http_port, Some(3000));
+    }
+
+    #[test]
     fn standalone_does_not_prefer_hub_search() {
         let config = Config::default();
         assert!(!config.prefers_hub_search());

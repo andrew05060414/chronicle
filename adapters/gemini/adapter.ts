@@ -17,6 +17,7 @@ import type {
 import { runAdapter, textOnlyParts } from '../types/index.ts';
 
 const DEFAULT_SEARCH_PATHS = [
+  join(homedir(), 'Documents', 'gemini'),
   join(homedir(), 'Downloads'),
   join(homedir(), 'Desktop'),
   join(homedir(), 'Documents'),

@@ -1004,7 +1004,19 @@ enum ServiceCommand {
     Start,
 
     /// Run the service in the foreground
-    Run,
+    Run {
+        /// HTTP port for browser extension ingest (defaults to config or 3000)
+        #[arg(long)]
+        http_port: Option<u16>,
+
+        /// Disable the HTTP API server
+        #[arg(long)]
+        no_http: bool,
+
+        /// Bearer token required for /ingest (falls back to config or HSTRY_API_TOKEN)
+        #[arg(long)]
+        http_token: Option<String>,
+    },
 
     /// Restart the background service
     Restart,
@@ -1365,7 +1377,9 @@ async fn main() -> Result<()> {
                     service::cmd_service(&config_path, ServiceCommand::Status).await
                 }
             }
-            ServiceCommand::Run => service::cmd_service(&config_path, ServiceCommand::Run).await,
+            run_cmd @ ServiceCommand::Run { .. } => {
+                service::cmd_service(&config_path, run_cmd).await
+            }
             other => {
                 service::cmd_service(&config_path, other).await?;
                 if cli.json {

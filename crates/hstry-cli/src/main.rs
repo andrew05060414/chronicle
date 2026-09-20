@@ -6182,11 +6182,7 @@ fn checkpoint_health(config: &Config) -> Result<CheckpointHealth> {
     let checkpoints =
         hstry_core::checkpoint::list_checkpoints(&dir).map_err(|e| anyhow::anyhow!("{e}"))?;
     let newest_at = checkpoints.first().map(|c| c.manifest.created_at);
-    let age_seconds = newest_at.map(|created| {
-        (chrono::Utc::now() - created)
-            .num_seconds()
-            .max(0)
-    });
+    let age_seconds = newest_at.map(|created| (chrono::Utc::now() - created).num_seconds().max(0));
     let stale_after_seconds = config.checkpoint.interval_secs.saturating_mul(2);
     let stale = config.checkpoint.enabled
         && age_seconds

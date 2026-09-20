@@ -33,6 +33,16 @@ use hstry_runtime::{AdapterRunner, Runtime};
 
 const DETECT_THRESHOLD: f32 = 0.5;
 
+/// Subtract `ago` from `Instant::now()` without panicking on Windows.
+///
+/// `tokio::time::Instant` is backed by `std::time::Instant`. On Windows that
+/// clock starts at boot, so `now - 1 day` overflows and panics if uptime is
+/// shorter than `ago` (common after a reboot). Fall back to `now` so the
+/// first cycle is delayed rather than crashing the service.
+fn instant_ago(ago: Duration) -> Instant {
+    Instant::now().checked_sub(ago).unwrap_or_else(Instant::now)
+}
+
 #[derive(Clone)]
 struct ServerState {
     db: Arc<Database>,
@@ -1229,14 +1239,14 @@ impl ServiceState {
             watcher,
             event_rx,
             last_remote_sync: Instant::now(),
-            last_workspace_discovery: Instant::now() - Duration::from_secs(3600),
-            last_event_sync: Instant::now() - Duration::from_secs(300), // allow immediate first sync
+            last_workspace_discovery: instant_ago(Duration::from_secs(3600)),
+            last_event_sync: instant_ago(Duration::from_secs(300)), // allow immediate first sync
             source_backoff: HashMap::new(),
             source_quiet_until: HashMap::new(),
             source_schedule: HashMap::new(),
             sync_semaphore,
             metrics: Arc::new(tokio::sync::Mutex::new(ServiceMetrics::default())),
-            last_events_compaction: Instant::now() - Duration::from_secs(86_400),
+            last_events_compaction: instant_ago(Duration::from_secs(86_400)),
         };
 
         // NOTE: refresh_watches() is called separately by the caller after
@@ -2173,6 +2183,14 @@ fn is_candidate_file(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn instant_ago_survives_offsets_longer_than_windows_uptime() {
+        let _ = instant_ago(Duration::from_secs(300));
+        let _ = instant_ago(Duration::from_secs(3600));
+        let _ = instant_ago(Duration::from_secs(86_400));
+        let _ = instant_ago(Duration::from_secs(365 * 86_400));
+    }
 
     #[tokio::test]
     async fn search_service_defaults_to_bounded_evidence_not_raw_content() -> anyhow::Result<()> {

@@ -605,7 +605,7 @@ async function findRolloutFiles(
 
   const files: string[] = [];
   for (const root of roots) {
-    const found = await walkForJsonl(root, opts.shallowOnly ? 2 : 4);
+    const found = await walkForJsonl(root, opts.shallowOnly ? 5 : 6);
     files.push(...found.filter(file => file.includes('rollout-') || file.endsWith('.jsonl')));
   }
 

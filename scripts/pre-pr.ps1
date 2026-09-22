@@ -47,24 +47,32 @@ try {
 
   Write-Host "== pre-pr: cargo fmt --all --check"
   cargo fmt --all --check
+  if ($LASTEXITCODE -ne 0) { Fail "pre-pr: cargo fmt failed" }
 
   Write-Host "== pre-pr: cargo check --workspace --all-targets"
   cargo check --workspace --all-targets
+  if ($LASTEXITCODE -ne 0) { Fail "pre-pr: cargo check failed" }
 
   Write-Host "== pre-pr: cargo clippy --workspace --all-targets -- -D warnings"
   cargo clippy --workspace --all-targets -- -D warnings
+  if ($LASTEXITCODE -ne 0) { Fail "pre-pr: cargo clippy failed" }
 
   Write-Host "== pre-pr: cargo test --workspace --all-targets --no-fail-fast"
   cargo test --workspace --all-targets --no-fail-fast
+  if ($LASTEXITCODE -ne 0) { Fail "pre-pr: cargo test failed" }
 
   Write-Host "== pre-pr: memory-integrity gate (explicit)"
-  cargo test -p hstry-core --test memory_integrity --no-fail-fast
+  cargo test -p hstry-core --test memory_integrity --no-fail-fast -- --test-threads=1
+  if ($LASTEXITCODE -ne 0) { Fail "pre-pr: memory-integrity gate failed" }
 
   if (Get-Command bun -ErrorAction SilentlyContinue) {
     Write-Host "== pre-pr: adapter fixtures (bun)"
     bun run adapters/cursor/test.js
+    if ($LASTEXITCODE -ne 0) { Fail "pre-pr: cursor adapter fixture failed with exit $LASTEXITCODE" }
     bun run adapters/gemini-cli/test.js
+    if ($LASTEXITCODE -ne 0) { Fail "pre-pr: gemini-cli adapter fixture failed with exit $LASTEXITCODE" }
     bun run adapters/workbuddy/test.js
+    if ($LASTEXITCODE -ne 0) { Fail "pre-pr: workbuddy adapter fixture failed with exit $LASTEXITCODE" }
   } else {
     Write-Host "pre-pr: bun not installed; skipping bun adapter fixtures (CI runs them)"
   }
@@ -80,6 +88,7 @@ try {
       foreach ($f in $files) {
         Write-Host "--- node $($f.FullName)"
         node $f.FullName
+        if ($LASTEXITCODE -ne 0) { Fail "pre-pr: $($f.Name) failed with exit $LASTEXITCODE" }
       }
       Write-Host ("adapter-regressions: all {0} file(s) passed" -f $files.Count)
     }

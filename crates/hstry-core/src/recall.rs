@@ -18,6 +18,16 @@ pub struct Provenance {
     pub snapshot_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub basis: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_ingest_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_confirmed_remote_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_contact_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending: Option<bool>,
 }
 
 impl Provenance {
@@ -58,6 +68,32 @@ impl Provenance {
                 .as_str()
                 .map(str::to_owned),
             basis: None,
+            last_ingest_at: source
+                .config
+                .get("last_ingest_at")
+                .and_then(Value::as_str)
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                .map(|dt| dt.with_timezone(&chrono::Utc))
+                .or(source.last_sync_at),
+            last_confirmed_remote_at: source
+                .config
+                .get("last_confirmed_remote_at")
+                .and_then(Value::as_str)
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                .map(|dt| dt.with_timezone(&chrono::Utc)),
+            last_contact_at: source
+                .config
+                .get("last_contact_at")
+                .and_then(Value::as_str)
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                .map(|dt| dt.with_timezone(&chrono::Utc)),
+            last_error: source
+                .config
+                .get("last_error")
+                .or_else(|| source.config.get("last_ingest_error"))
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            pending: source.config.get("pending").and_then(Value::as_bool),
         }
     }
 }
@@ -454,7 +490,7 @@ pub fn project(report: &SearchReport, budget: Budget, raw: bool) -> Result<Value
     }
     let hits: Vec<Value> = report.hits.iter().map(|h| {
         let snippet = if let Some(pos) = h.match_position { window(&h.content, pos, budget.snippet.min(300)) } else { clip(&h.snippet, budget.snippet.min(300)) };
-        json!({"conversation_id":h.conversation_id,"readable_id":h.readable_id.as_deref().map(|s|clip(s,120)),"message_idx":h.message_idx,"role":h.role,"title":h.title.as_deref().map(|s|clip(s,120)),"timestamp":h.created_at.unwrap_or(h.conv_created_at),"snippet":snippet,"match_position":h.match_position,"provenance":h.provenance,"snippet_truncated":snippet.chars().count()<h.content.chars().count()})
+        json!({"conversation_id":h.conversation_id,"readable_id":h.readable_id.as_deref().map(|s|clip(s,120)),"message_idx":h.message_idx,"role":h.role,"title":h.title.as_deref().map(|s|clip(s,120)),"timestamp":h.created_at.unwrap_or(h.conv_created_at),"snippet":snippet,"match_position":h.match_position,"conversation_version":h.conversation_version,"provenance":h.provenance,"snippet_truncated":snippet.chars().count()<h.content.chars().count()})
     }).collect();
     let mut value = json!({"ok":true,"result":{"hits":hits,"attempts":report.attempts,"scope":report.scope,"stores":report.stores,"available_remotes":report.available_remotes,"warnings":report.warnings,"absence_is_global":false,"truncated":report.has_more,"omitted_hits":0,"has_more":report.has_more,"provenance_truncated":false,"filters":report.filters,"offset":report.offset},"error":null});
     loop {
@@ -499,4 +535,136 @@ pub fn project(report: &SearchReport, budget: Budget, raw: bool) -> Result<Value
         }
     }
     Ok(value)
+}
+
+fn content_fingerprint(content: &str) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    content.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Conservative duplicate folding: only fold hits that share the same
+/// provenance source+machine and identical content. Never folds on title/fuzzy.
+pub fn fold_exact_duplicates(hits: &mut Vec<SearchHit>) {
+    let mut seen = std::collections::HashSet::new();
+    hits.retain(|hit| {
+        let machine = hit
+            .host
+            .as_deref()
+            .or(hit.provenance.machine.as_deref())
+            .unwrap_or("");
+        let key = (
+            hit.source_id.clone(),
+            machine.to_string(),
+            hit.conversation_id,
+            hit.message_id,
+            hit.conversation_version.unwrap_or(-1),
+            content_fingerprint(&hit.content),
+            hit.message_idx,
+        );
+        seen.insert(key)
+    });
+}
+
+/// Merge another report into `target` while preserving per-store coverage.
+pub fn merge_reports(target: &mut SearchReport, other: SearchReport) {
+    target.hits.extend(other.hits);
+    target.stores.extend(other.stores);
+    target.attempts.extend(other.attempts);
+    target.warnings.extend(other.warnings);
+    target.has_more |= other.has_more;
+    if !other.filters.is_null() {
+        target.filters = other.filters;
+    }
+    if other.offset != 0 {
+        target.offset = other.offset;
+    }
+}
+
+/// Combine optional local/remote reports for a resolved scope.
+///
+/// One side failing still returns the other with an explicit coverage warning.
+/// Both failing returns an error. Multi-store paging stays non-global.
+pub fn combine_scoped_reports(
+    scope: crate::config::SearchScope,
+    remotes: &[String],
+    local: Option<Result<SearchReport>>,
+    remote: Option<Result<SearchReport>>,
+) -> Result<SearchReport> {
+    use crate::config::SearchScope;
+    let mut report = SearchReport::default();
+    let mut local_ok = false;
+    let mut remote_ok = false;
+    let mut local_err: Option<String> = None;
+    let mut remote_err: Option<String> = None;
+
+    if let Some(local) = local {
+        match local {
+            Ok(local) => {
+                local_ok = true;
+                merge_reports(&mut report, local);
+            }
+            Err(err) => local_err = Some(err.to_string()),
+        }
+    }
+    if let Some(remote) = remote {
+        match remote {
+            Ok(remote) => {
+                remote_ok = true;
+                merge_reports(&mut report, remote);
+            }
+            Err(err) => remote_err = Some(err.to_string()),
+        }
+    }
+
+    if let Some(err) = local_err {
+        report
+            .warnings
+            .push(format!("Coverage error: local search failed: {err}"));
+        report.stores.push(Provenance {
+            source: "local".into(),
+            completeness: "unknown".into(),
+            last_error: Some(err),
+            last_contact_at: Some(chrono::Utc::now()),
+            ..Default::default()
+        });
+    }
+    if let Some(err) = remote_err {
+        report
+            .warnings
+            .push(format!("Coverage error: remote search failed: {err}"));
+    }
+
+    let needed_local = !matches!(scope, SearchScope::Remote);
+    let needed_remote = !matches!(scope, SearchScope::Local);
+    if !(needed_local && local_ok || needed_remote && remote_ok) {
+        return Err(crate::Error::Other(
+            report
+                .warnings
+                .last()
+                .cloned()
+                .unwrap_or_else(|| "No requested search store succeeded".into()),
+        ));
+    }
+    if needed_local && !local_ok && needed_remote && remote_ok {
+        // keep remote hits
+    } else if needed_remote && !remote_ok && needed_local && local_ok {
+        // keep local hits
+    }
+
+    report.scope = match scope {
+        SearchScope::Local => "local_snapshot".into(),
+        SearchScope::Remote if remotes.len() == 1 => format!("remote:{}", remotes[0]),
+        SearchScope::Remote => "remote".into(),
+        SearchScope::All => "local_snapshot_and_remote".into(),
+    };
+    if needed_remote && !(matches!(scope, SearchScope::Remote) && remotes.len() == 1) {
+        report
+            .warnings
+            .push("Multi-store discovery: narrow to local or one named remote to paginate".into());
+    }
+    fold_exact_duplicates(&mut report.hits);
+    Ok(report)
 }

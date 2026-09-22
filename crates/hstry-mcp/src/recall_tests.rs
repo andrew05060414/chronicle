@@ -16,7 +16,7 @@ async fn search_and_expand_share_a_real_message_anchor() -> anyhow::Result<()> {
         serde_json::json!({"externalId":"test","createdAt":1767225600000_i64,"messages":[{"role":"tool","content":"needle@example.test FixtureOnlyValue"}]}),
     )?;
     hstry_core::ingest::ingest_batch(&db, "test", vec![conv]).await?;
-    let server = McpServer::new(Config::default(), db);
+    let server = McpServer::new(Config::default(), db, None);
     let request = serde_json::from_value(serde_json::json!({"query":"needle@example.test"}))?;
     let output = server.search(Parameters(request)).await;
     assert!(output.chars().count() <= 3000);

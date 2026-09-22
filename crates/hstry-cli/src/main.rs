@@ -56,6 +56,7 @@ struct SearchInput {
     model: Option<String>,
     harness_filter: Option<String>,
     tag: Option<String>,
+    refresh_local: Option<bool>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -238,7 +239,7 @@ enum Command {
         #[arg(long, value_enum, default_value = "auto")]
         mode: SearchModeArg,
 
-        /// Search scope (local, remote, all). Satellite + hub_remote defaults to remote.
+        /// Search scope (local, remote, all). Satellite + hub_remote defaults to all.
         #[arg(long, value_enum)]
         scope: Option<SearchScopeArg>,
 
@@ -285,6 +286,10 @@ enum Command {
         /// Show each session only once with occurrence count
         #[arg(short, long)]
         compact: bool,
+
+        /// Refresh local collection before searching (local only, never remote push)
+        #[arg(long)]
+        refresh_local: bool,
 
         /// Read JSON input from file or "-" for stdin
         #[arg(long)]
@@ -1100,6 +1105,12 @@ fn default_log_filter(verbose: u8) -> &'static str {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    if std::env::args().nth(1).as_deref() == Some("native") {
+        use clap::Parser as _;
+        let mut args: Vec<_> = std::env::args_os().collect();
+        args.remove(1);
+        return chronicle_backup::run(chronicle_backup::NativeArgs::parse_from(args));
+    }
     let cli = Cli::parse();
 
     // Initialize logging
@@ -1139,6 +1150,7 @@ async fn main() -> Result<()> {
             harness_filter,
             tag,
             compact,
+            refresh_local,
             input,
         } => {
             skill::warn_if_stale();
@@ -1174,6 +1186,10 @@ async fn main() -> Result<()> {
                 .and_then(|v| v.harness_filter.clone())
                 .or(harness_filter);
             let tag = input.as_ref().and_then(|v| v.tag.clone()).or(tag);
+            let refresh_local = input
+                .as_ref()
+                .and_then(|v| v.refresh_local)
+                .unwrap_or(refresh_local);
             cmd_search_fast(
                 &config,
                 &query,
@@ -1193,6 +1209,7 @@ async fn main() -> Result<()> {
                 harness_filter,
                 tag,
                 compact,
+                refresh_local,
                 cli.json,
                 hstry_core::recall::Budget {
                     total: max_chars,
@@ -2308,6 +2325,7 @@ async fn cmd_search_fast(
     harness_filter: Option<String>,
     tag: Option<String>,
     compact: bool,
+    refresh_local: bool,
     json: bool,
     budget: hstry_core::recall::Budget,
     raw: bool,
@@ -2379,65 +2397,84 @@ async fn cmd_search_fast(
         harness: harness_filter,
         tag,
     };
-    let mut report = hstry_core::recall::SearchReport::default();
-
-    if scope != SearchScopeArg::Remote {
-        let service_expected = std::env::var("HSTRY_NO_SERVICE").is_err()
-            && config.service.enabled
-            && config.service.search_api;
-
-        let local = if service_expected {
-            if let Some(results) =
-                hstry_core::service::try_service_search_report(query, &opts).await?
-            {
-                results
-            } else {
-                anyhow::bail!(
-                    "Search service unavailable. Run `hstry service start` or set HSTRY_NO_SERVICE=1 to use local search."
-                );
-            }
-        } else if let Some(results) = try_api_search(query, &opts, mode).await? {
-            results
-        } else {
-            let db = Database::open(&config.database).await?;
-            apply_storage_config(&db, config);
-            db.search_report(query, opts.clone()).await?
-        };
-        report = local;
+    let mut refresh_warnings = Vec::new();
+    if refresh_local {
+        match refresh_local_collection(config).await {
+            Ok(()) => {}
+            Err(err) => refresh_warnings.push(format!(
+                "refresh-local warning: {err}; continuing with existing local snapshot"
+            )),
+        }
     }
 
-    if scope != SearchScopeArg::Local {
-        let remote_list = config.remotes_for_search(&remotes)?;
+    let need_local = scope != SearchScopeArg::Remote;
+    let need_remote = scope != SearchScopeArg::Local;
+    let remote_list = if need_remote {
+        let list = config.remotes_for_search(&remotes)?;
         for name in &remotes {
-            if !remote_list.iter().any(|r| r.enabled && r.name == *name) {
+            if !list.iter().any(|r| r.enabled && r.name == *name) {
                 anyhow::bail!("Unknown or disabled remote: {name}");
             }
         }
-        if !remote_list.iter().any(|r| r.enabled) {
+        if !list.iter().any(|r| r.enabled) {
             anyhow::bail!("No enabled remotes to search");
         }
-        let remote = hstry_core::remote::search_remotes(&remote_list, query, &opts).await?;
-        if scope == SearchScopeArg::Remote {
-            report.filters = remote.filters;
-        }
-        report.hits.extend(remote.hits);
-        report.stores.extend(remote.stores);
-        report.attempts.extend(remote.attempts);
-        report.warnings.extend(remote.warnings);
-        report.has_more |= remote.has_more;
-    }
-    report.scope = match scope {
-        SearchScopeArg::Local => "local_snapshot".into(),
-        SearchScopeArg::Remote if remotes.len() == 1 => format!("remote:{}", remotes[0]),
-        SearchScopeArg::Remote => "remote".into(),
-        SearchScopeArg::All => "local_snapshot_and_remote".into(),
+        Some(list)
+    } else {
+        None
     };
+
+    let local_fut = async {
+        if !need_local {
+            return None;
+        }
+        let service_expected = std::env::var("HSTRY_NO_SERVICE").is_err()
+            && config.service.enabled
+            && config.service.search_api;
+        let result: Result<hstry_core::recall::SearchReport, hstry_core::Error> = async {
+            if service_expected {
+                match hstry_core::service::try_service_search_report(query, &opts).await {
+                    Ok(Some(results)) => Ok(results),
+                    Ok(None) => Err(hstry_core::Error::Other(
+                        "Search service unavailable. Run `hstry service start` or set HSTRY_NO_SERVICE=1 to use local search.".into(),
+                    )),
+                    Err(err) => Err(err),
+                }
+            } else {
+                match try_api_search(query, &opts, mode).await {
+                    Ok(Some(results)) => Ok(results),
+                    Ok(None) => {
+                        let db = Database::open(&config.database).await.map_err(|e| {
+                            hstry_core::Error::Other(e.to_string())
+                        })?;
+                        apply_storage_config(&db, config);
+                        db.search_report(query, opts.clone()).await
+                    }
+                    Err(err) => Err(hstry_core::Error::Other(err.to_string())),
+                }
+            }
+        }
+        .await;
+        Some(result)
+    };
+
+    let remote_fut = async {
+        if let Some(list) = remote_list.as_ref() {
+            Some(
+                hstry_core::remote::search_remotes(list, query, &opts)
+                    .await
+                    .map_err(|e| hstry_core::Error::Other(e.to_string())),
+            )
+        } else {
+            None
+        }
+    };
+
+    let (local, remote) = tokio::join!(local_fut, remote_fut);
+    let mut report =
+        hstry_core::recall::combine_scoped_reports(scope.into(), &remotes, local, remote)?;
     report.offset = offset;
-    if scope != SearchScopeArg::Local && !(scope == SearchScopeArg::Remote && remotes.len() == 1) {
-        report
-            .warnings
-            .push("Multi-store discovery: narrow to local or one named remote to paginate".into());
-    }
+    report.warnings.splice(0..0, refresh_warnings);
     report.available_remotes = config
         .remotes
         .iter()
@@ -2656,6 +2693,25 @@ async fn try_api_search(
         anyhow::anyhow!("Search API predates recall protocol; upgrade it or set HSTRY_NO_API=1")
     })?;
     Ok(Some(report))
+}
+
+/// Local-only collection refresh used by `--refresh-local`.
+/// Never pushes to remotes; bounded to 5 seconds and returns warnings on failure.
+async fn refresh_local_collection(config: &Config) -> Result<()> {
+    let refresh = async {
+        let db = Database::open(&config.database).await?;
+        apply_storage_config(&db, config);
+        let runtime = Runtime::parse(&config.js_runtime).ok_or_else(|| {
+            anyhow::anyhow!("No JavaScript runtime found. Install bun, deno, or node.")
+        })?;
+        let runner = AdapterRunner::new(runtime, config.adapter_paths.clone());
+        sync_sources(&db, &runner, config, None, Some(1), false).await
+    };
+    match tokio::time::timeout(std::time::Duration::from_secs(5), refresh).await {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(err)) => Err(err),
+        Err(_) => Err(anyhow::anyhow!("local refresh timed out after 5s")),
+    }
 }
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum, serde::Deserialize, serde::Serialize)]

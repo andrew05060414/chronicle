@@ -782,6 +782,9 @@ fn terminate_process(pid: u32) -> Result<()> {
 
 #[cfg(unix)]
 fn is_process_running(pid: u32) -> bool {
+    if pid == std::process::id() {
+        return true;
+    }
     use nix::sys::signal::kill;
     use nix::unistd::Pid;
 
@@ -845,6 +848,9 @@ fn tasklist_csv_contains_pid(stdout: &str, pid: u32) -> bool {
 
 #[cfg(windows)]
 fn is_process_running(pid: u32) -> bool {
+    if pid == std::process::id() {
+        return true;
+    }
     use std::os::windows::process::CommandExt;
     use std::process::Command;
 
@@ -972,7 +978,8 @@ async fn run_service(
                 state.db.clone(),
                 token,
             )
-            .await?,
+            .await?
+            .0,
         )
     } else {
         None
@@ -1046,7 +1053,7 @@ async fn start_http_api_server(
     config: Arc<Config>,
     db: Arc<Database>,
     token: Option<String>,
-) -> Result<tokio::task::JoinHandle<()>> {
+) -> Result<(tokio::task::JoinHandle<()>, u16)> {
     let has_token = token.is_some();
     let app_state = hstry_api::AppState::new(config, db, token);
     let (handle, local_addr) = hstry_api::start_http_server(port, app_state)
@@ -1068,7 +1075,7 @@ async fn start_http_api_server(
         }
     );
 
-    Ok(handle)
+    Ok((handle, local_addr.port()))
 }
 
 async fn start_search_server(
@@ -1529,7 +1536,7 @@ impl ServiceState {
             return Ok(());
         }
 
-        let interval_secs = self.config.sync.auto_sync_interval_secs.max(30);
+        let interval_secs = self.config.sync.auto_sync_interval_secs.max(60);
         if self.last_remote_sync.elapsed() < Duration::from_secs(interval_secs) {
             return Ok(());
         }
@@ -1866,6 +1873,35 @@ impl ServiceState {
         Ok(())
     }
 
+    async fn persist_sync_state(
+        &self,
+        source: &Source,
+        pending: bool,
+        error: Option<&str>,
+        ingested_at: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<()> {
+        let Some(mut updated) = self.db.get_source(&source.id).await? else {
+            return Ok(());
+        };
+        let mut config = match updated.config {
+            serde_json::Value::Object(map) => map,
+            _ => serde_json::Map::default(),
+        };
+        let now = chrono::Utc::now().to_rfc3339();
+        config.insert("last_attempt_at".into(), now.into());
+        config.insert("ingest_pending".into(), pending.into());
+        config.insert(
+            "last_ingest_error".into(),
+            error.map_or(serde_json::Value::Null, Into::into),
+        );
+        if let Some(time) = ingested_at {
+            config.insert("last_ingest_at".into(), time.to_rfc3339().into());
+        }
+        updated.config = serde_json::Value::Object(config);
+        self.db.upsert_source(&updated).await?;
+        Ok(())
+    }
+
     async fn sync_one_source(
         &mut self,
         source: &Source,
@@ -1886,6 +1922,8 @@ impl ServiceState {
             None => return Ok(SourceSyncOutcome::Skipped),
         };
         if !source_path.exists() {
+            self.persist_sync_state(source, true, Some("source path missing"), None)
+                .await?;
             return Ok(SourceSyncOutcome::Skipped);
         }
 
@@ -1943,6 +1981,7 @@ impl ServiceState {
             id = source.id,
             adapter = source.adapter
         );
+        self.persist_sync_state(source, true, None, None).await?;
         let sync_fut = sync::sync_source(&self.db, &self.runner, source);
         let outcome_result = if budget_ms > 0 {
             match tokio::time::timeout(Duration::from_millis(budget_ms), sync_fut).await {
@@ -2015,9 +2054,13 @@ impl ServiceState {
                     self.persist_source_fingerprint(source, &fingerprint)
                         .await?;
                 }
+                self.persist_sync_state(source, false, None, Some(chrono::Utc::now()))
+                    .await?;
                 Ok(SourceSyncOutcome::Synced)
             }
             Err(err) => {
+                self.persist_sync_state(source, true, Some(&err.to_string()), None)
+                    .await?;
                 {
                     let mut metrics = self.metrics.lock().await;
                     metrics.syncs_failed += 1;
@@ -2415,10 +2458,7 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let db = Arc::new(Database::open(&dir.path().join("service_http.db")).await?);
         let config = Arc::new(Config::default());
-        let handle = start_http_api_server(0, config, db, None).await?;
-        let port_path = hstry_core::paths::http_port_path();
-        let port_str = std::fs::read_to_string(port_path)?;
-        let port: u16 = port_str.trim().parse()?;
+        let (handle, port) = start_http_api_server(0, config, db, None).await?;
         let client = reqwest::Client::new();
         let resp = client
             .get(format!("http://127.0.0.1:{port}/health"))

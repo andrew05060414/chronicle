@@ -455,13 +455,14 @@ impl Config {
         self.sync.mode == SyncMode::Satellite && self.sync.hub_remote.is_some()
     }
 
-    /// Explicit scope wins; satellite + `hub_remote` defaults to remote; otherwise local.
+    /// Explicit scope wins; satellite + `hub_remote` defaults to local+hub; otherwise local.
     pub fn resolve_search_scope(&self, explicit: Option<SearchScope>) -> SearchScope {
         if let Some(scope) = explicit {
             return scope;
         }
         if self.prefers_hub_search() {
-            SearchScope::Remote
+            // Ordinary satellite search covers local plus the configured hub in parallel.
+            SearchScope::All
         } else {
             SearchScope::Local
         }
@@ -552,7 +553,7 @@ impl Default for SyncConfig {
             device_id: None,
             hub_remote: None,
             auto_sync: false,
-            auto_sync_interval_secs: 300,
+            auto_sync_interval_secs: 60,
         }
     }
 }
@@ -900,7 +901,7 @@ impl Default for ServiceConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            poll_interval_secs: 1_200,
+            poll_interval_secs: 300,
             search_api: true,
             search_port: None,
             transport: ServiceTransport::Tcp,

@@ -2365,6 +2365,7 @@ impl Database {
                 s.path AS source_path,
                 COALESCE(c.metadata, '{{}}') AS conversation_metadata,
                 c.message_count AS local_message_count,
+                c.version AS conversation_version,
                 {snippet_sql} AS snippet,
                 {score_sql} AS score
             FROM {from_sql}
@@ -2537,6 +2538,10 @@ impl Database {
                 source_adapter: row.get("source_adapter"),
                 source_path: row.get("source_path"),
                 host: None,
+                conversation_version: row
+                    .try_get::<Option<i64>, _>("conversation_version")
+                    .ok()
+                    .flatten(),
                 occurrences: None,
             });
             if regex.is_some() && hits.len() >= opts.limit.unwrap_or(20).max(0) as usize {

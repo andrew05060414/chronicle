@@ -239,6 +239,9 @@ pub struct SearchHit {
     pub source_path: Option<String>,
     #[serde(default)]
     pub host: Option<String>,
+    /// Conversation version at the time of the hit; keep for anchored reads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation_version: Option<i64>,
     /// Number of occurrences in the original result set (for compact mode)
     #[serde(default)]
     pub occurrences: Option<i32>,

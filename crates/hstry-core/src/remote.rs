@@ -557,6 +557,8 @@ pub struct DeltaExport {
     pub messages: usize,
     pub sources: usize,
     pub empty: bool,
+    /// Inclusive capture boundary used for the next watermark (export cut).
+    pub export_cut: DateTime<Utc>,
 }
 
 pub fn push_watermark_key(remote_name: &str) -> String {
@@ -582,15 +584,23 @@ pub async fn export_delta(
         std::fs::remove_file(dest_path)?;
     }
 
+    // Begin at a conservative cut before the consistent copy. Mutations that
+    // race the copy can be included now but remain pending next time; duplicate
+    // upserts are safe, while advancing past unseen mutations would lose data.
+    let export_cut = Utc::now();
+    let snapshot_dir = tempfile::tempdir()?;
+    let snapshot_path = snapshot_dir.path().join("source-snapshot.db");
+    source.backup_to(&snapshot_path).await?;
+    let source_snapshot = Database::open(&snapshot_path).await?;
     let dest = Database::open(dest_path).await?;
-    let convs = source
+    let convs = source_snapshot
         .list_conversations(crate::db::ListConversationsOptions {
             updated_after,
             ..Default::default()
         })
         .await?;
     let conv_source_ids: HashSet<String> = convs.iter().map(|c| c.source_id.clone()).collect();
-    let all_sources = source.list_sources().await?;
+    let all_sources = source_snapshot.list_sources().await?;
     let sources_to_copy: Vec<_> = all_sources
         .into_iter()
         .filter(|s| {
@@ -608,13 +618,16 @@ pub async fn export_delta(
         .collect();
 
     if convs.is_empty() && sources_to_copy.is_empty() {
+        source_snapshot.close().await;
         dest.close().await;
         let _ = std::fs::remove_file(dest_path);
+        let _ = std::fs::remove_file(snapshot_path);
         return Ok(DeltaExport {
             conversations: 0,
             messages: 0,
             sources: 0,
             empty: true,
+            export_cut,
         });
     }
 
@@ -625,18 +638,21 @@ pub async fn export_delta(
     let mut messages = 0usize;
     for conv in &convs {
         dest.upsert_conversation(conv).await?;
-        for msg in source.get_messages(conv.id).await? {
+        for msg in source_snapshot.get_messages(conv.id).await? {
             dest.insert_message(&msg).await?;
             messages += 1;
         }
     }
 
+    source_snapshot.close().await;
     dest.close().await;
+    let _ = std::fs::remove_file(snapshot_path);
     Ok(DeltaExport {
         conversations: convs.len(),
         messages,
         sources: sources_to_copy.len(),
         empty: false,
+        export_cut,
     })
 }
 
@@ -706,16 +722,15 @@ pub async fn sync_to_remote(
         Some(raw) => parse_watermark(&raw),
         None => None,
     };
-    let export_started = Utc::now();
-
     let temp_dir = tempfile::tempdir()?;
     let delta_path = temp_dir.path().join("delta.db");
     let export = export_delta(local_db, &delta_path, watermark).await?;
     if export.empty {
+        // No-change skip: record contact, but do not advance the push watermark.
         local_db
             .set_search_state(
-                &push_watermark_key(&config.name),
-                &export_started.to_rfc3339(),
+                &format!("push_last_contact:{}", config.name),
+                &Utc::now().to_rfc3339(),
             )
             .await?;
         return Ok(SyncResult {
@@ -739,7 +754,7 @@ pub async fn sync_to_remote(
 
     let remote_delta = format!(
         "{inbox}/{namespace}-{}.db",
-        export_started.timestamp_millis()
+        export.export_cut.timestamp_millis()
     );
     transport.push_file(&delta_path, &remote_delta)?;
 
@@ -785,10 +800,18 @@ pub async fn sync_to_remote(
     sync_result.remote_name = config.name.clone();
     sync_result.direction = SyncDirection::Push;
 
+    // Advance ONLY after hub commit succeeded. Use the export cut, never wall
+    // time after the remote push, so concurrent mutations remain pending.
     local_db
         .set_search_state(
             &push_watermark_key(&config.name),
-            &export_started.to_rfc3339(),
+            &export.export_cut.to_rfc3339(),
+        )
+        .await?;
+    local_db
+        .set_search_state(
+            &format!("push_last_confirmed:{}", config.name),
+            &Utc::now().to_rfc3339(),
         )
         .await?;
 
@@ -992,29 +1015,55 @@ pub async fn search_remotes(
         let remote = remote.clone();
         let query = query.to_string();
         let opts = opts.clone();
-        set.spawn(async move { search_remote(&remote, &query, &opts).await });
+        set.spawn(async move {
+            let name = remote.name.clone();
+            (name, search_remote(&remote, &query, &opts).await)
+        });
     }
 
     let mut hits = SearchReport {
         scope: "remote".into(),
         ..Default::default()
     };
+    let mut successes = 0usize;
+    let mut failures = 0usize;
     while let Some(result) = set.join_next().await {
         match result {
-            Ok(Ok(remote)) => {
-                hits.filters = remote.filters;
-                hits.offset = remote.offset;
-                hits.hits.extend(remote.hits);
-                hits.stores.extend(remote.stores);
-                hits.attempts.extend(remote.attempts);
-                hits.warnings.extend(remote.warnings);
-                hits.has_more |= remote.has_more;
+            Ok((_name, Ok(remote))) => {
+                successes += 1;
+                crate::recall::merge_reports(&mut hits, remote);
             }
-            Ok(Err(err)) => return Err(err),
-            Err(err) => return Err(Error::Remote(format!("Remote search task failed: {err}"))),
+            Ok((name, Err(err))) => {
+                failures += 1;
+                hits.warnings.push(format!(
+                    "Coverage error: remote '{name}' search failed: {err}"
+                ));
+                hits.stores.push(crate::recall::Provenance {
+                    source: format!("remote:{name}"),
+                    machine: Some(name),
+                    completeness: "unknown".into(),
+                    last_error: Some(err.to_string()),
+                    last_contact_at: Some(Utc::now()),
+                    ..Default::default()
+                });
+            }
+            Err(err) => {
+                failures += 1;
+                hits.warnings
+                    .push(format!("Coverage error: remote search task failed: {err}"));
+            }
         }
     }
 
+    if successes == 0 && failures > 0 {
+        return Err(Error::Remote(
+            hits.warnings
+                .last()
+                .cloned()
+                .unwrap_or_else(|| "All remote searches failed".into()),
+        ));
+    }
+    crate::recall::fold_exact_duplicates(&mut hits.hits);
     Ok(hits)
 }
 
@@ -1458,6 +1507,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(export.conversations, 1);
+        assert!(export.export_cut <= Utc::now());
         src.close().await;
 
         let delta = Database::open(&delta_path).await.unwrap();
@@ -1769,5 +1819,133 @@ mod tests {
             .await
             .expect_err("reject non-hstry database without conversations table");
         assert!(matches!(error, Error::Remote(_)));
+    }
+
+    #[tokio::test]
+    async fn empty_export_records_cut_without_requiring_remote_push() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = Database::open(&dir.path().join("src.db")).await.unwrap();
+        let watermark = Utc::now();
+        let delta_path = dir.path().join("delta.db");
+        let export = export_delta(&src, &delta_path, Some(watermark))
+            .await
+            .unwrap();
+        assert!(export.empty);
+        assert!(export.export_cut >= watermark);
+        src.close().await;
+    }
+
+    #[test]
+    fn fold_exact_duplicates_keeps_distinct_provenance() {
+        use crate::models::{MessageRole, SearchHit};
+        use crate::recall::{Provenance, fold_exact_duplicates};
+        use uuid::Uuid;
+
+        let mk = |source: &str, machine: Option<&str>, content: &str| SearchHit {
+            message_id: Uuid::new_v4(),
+            conversation_id: Uuid::new_v4(),
+            message_idx: 0,
+            role: MessageRole::User,
+            content: content.into(),
+            snippet: content.into(),
+            match_position: Some(0),
+            provenance: Provenance {
+                source: source.into(),
+                machine: machine.map(str::to_owned),
+                completeness: "unknown".into(),
+                ..Default::default()
+            },
+            created_at: None,
+            conv_created_at: Utc::now(),
+            conv_updated_at: None,
+            score: 0.0,
+            source_id: source.into(),
+            external_id: None,
+            readable_id: None,
+            title: Some("same-title".into()),
+            workspace: None,
+            source_adapter: "pi".into(),
+            source_path: None,
+            host: machine.map(str::to_owned),
+            conversation_version: Some(1),
+            occurrences: None,
+        };
+
+        let mut hits = vec![
+            mk("pi", Some("local"), "same body"),
+            mk("pi", Some("local"), "same body"),
+            mk("pi", Some("hub"), "same body"),
+            mk("pi", Some("local"), "different body"),
+        ];
+        hits.push(hits[0].clone());
+        fold_exact_duplicates(&mut hits);
+        assert_eq!(hits.len(), 4);
+    }
+
+    #[test]
+    fn combine_scoped_reports_keeps_other_side_on_partial_outage() {
+        use crate::config::SearchScope;
+        use crate::recall::{SearchReport, combine_scoped_reports};
+
+        let local = SearchReport {
+            hits: Vec::new(),
+            scope: "local_snapshot".into(),
+            warnings: Vec::new(),
+            ..Default::default()
+        };
+        let report = combine_scoped_reports(
+            SearchScope::All,
+            &[],
+            Some(Ok(local)),
+            Some(Err(Error::Remote("hub down".into()))),
+        )
+        .expect("local should survive");
+        assert!(report.warnings.iter().any(|w| w.contains("Coverage error")));
+        assert_eq!(report.scope, "local_snapshot_and_remote");
+
+        let err = combine_scoped_reports(
+            SearchScope::All,
+            &[],
+            Some(Err(Error::Other("local down".into()))),
+            Some(Err(Error::Remote("hub down".into()))),
+        )
+        .expect_err("both sides failing must error");
+        assert!(err.to_string().contains("Coverage error") || err.to_string().contains("failed"));
+        assert!(
+            combine_scoped_reports(
+                SearchScope::Local,
+                &[],
+                Some(Err(Error::Other("local down".into()))),
+                None
+            )
+            .is_err()
+        );
+        assert!(
+            combine_scoped_reports(
+                SearchScope::Remote,
+                &[],
+                None,
+                Some(Err(Error::Remote("hub down".into())))
+            )
+            .is_err()
+        );
+        assert!(
+            combine_scoped_reports(
+                SearchScope::Local,
+                &[],
+                Some(Ok(SearchReport::default())),
+                None
+            )
+            .is_ok()
+        );
+        assert!(
+            combine_scoped_reports(
+                SearchScope::Remote,
+                &[],
+                None,
+                Some(Ok(SearchReport::default()))
+            )
+            .is_ok()
+        );
     }
 }

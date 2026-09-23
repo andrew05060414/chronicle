@@ -98,6 +98,35 @@ Client installation is guarded by a strict host version gate backed by the regis
   - `hosts check`: Detects the current host versions against configured native sources, compares each with the registry (`verified`, `unverified`, `revoked`, or `unknown`), and writes `<root>/hosts-check.json` (also surfaced in `chronicle native status`).
 - **Drill mode**: Unverified or revoked versions are permitted to build and apply installation plans *only* under isolated drill conditions: every plan target must reside within an ancestor directory containing a `.chronicle-drill` marker file, and no target may fall within standard client data roots under the user's home directory. Plans generated in this mode are tagged `"drill": true`, and drill isolation constraints are strictly re-verified upon plan execution.
 
+### Automated host drill script (`scripts/native-drill.ps1`)
+
+To verify client recovery end-to-end and qualify a host version for registry recording, run `scripts/native-drill.ps1`. It automates the full drill lifecycle (session creation, capture, replication to a dedicated drill NAS repository, local data wipe, pull from remote, restore-install into an isolated avatar profile, and continuation checks):
+
+```powershell
+# Preflight validation (guards, commands, and version probe; no client launch, no NAS access)
+pwsh -NoProfile -File scripts/native-drill.ps1 `
+    -App <codex|claude-code|grok|cursor> `
+    -DrillRoot '/path/to/isolated-drill-root' `
+    -NasRepository 'rest:http://nas.local:8000/chronicle-drill' `
+    -Restic '/path/to/restic' `
+    -ChronicleExe 'chronicle' `
+    -Preflight
+
+# Full automated drill with automatic host registration upon passing
+pwsh -NoProfile -File scripts/native-drill.ps1 `
+    -App <codex|claude-code|grok|cursor> `
+    -DrillRoot '/path/to/isolated-drill-root' `
+    -NasRepository 'rest:http://nas.local:8000/chronicle-drill' `
+    -Restic '/path/to/restic' `
+    -ChronicleExe 'chronicle' `
+    -Register
+```
+
+#### Drill repository isolation and credentials
+- **Dedicated repository**: `-NasRepository` must be dedicated exclusively to drills and must never point to a production backup repository.
+- **Dedicated password**: The script maintains an isolated 32-byte cryptographic random password at `<DrillRoot>/.restic-drill-password` (generated on first run and reused on subsequent runs). Production password files are never used or read. If this password file is lost, simply specify a new drill repository path.
+- **Path guards and extra roots**: Real client directories under `$HOME` and `AppData` are strictly forbidden as drill roots or targets. Additional paths to protect (such as private repositories or secret directories) can be supplied via `-ProtectedRoot <string[]>`, and any path in `CHRONICLE_NATIVE_ROOT` is automatically protected. All deletion operations are validated to strictly reside inside `DrillRoot`.
+
 ### Per-host unsupported items
 
 During capture (recorded as manifest exclusions) and native install (enforced as plan refusal), unsupported files fail closed according to `is_unsupported_path`:

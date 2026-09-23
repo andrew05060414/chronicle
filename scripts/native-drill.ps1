@@ -90,6 +90,16 @@ function Assert-InsideDrillRoot {
     Assert-NotForbiddenPath $PathToCheck 'Target inside DrillRoot'
 }
 
+function Get-ChronicleResult {
+    # chronicle --json wraps payloads as {"ok":..,"result":{..}}; StrictMode forbids reading absent properties.
+    param([string]$Json, [string]$Field)
+    try { $obj = $Json | ConvertFrom-Json } catch { return $null }
+    if ($obj.PSObject.Properties['result']) { $obj = $obj.result }
+    $prop = $obj.PSObject.Properties[$Field]
+    if ($prop) { return $prop.Value }
+    return $null
+}
+
 function Resolve-Executable {
     param([string]$CommandOrPath, [string]$Label)
     if ([string]::IsNullOrWhiteSpace($CommandOrPath)) {
@@ -310,7 +320,8 @@ $Drivers = @{
         SessionTargets = @(
             'sessions', 'archived_sessions', 'state_5.sqlite',
             'state_5.sqlite-wal', 'state_5.sqlite-shm',
-            'session_index.jsonl', 'thread_history_1.sqlite'
+            'session_index.jsonl', 'thread_history_1.sqlite',
+            'thread_history_1.sqlite-wal', 'thread_history_1.sqlite-shm'
         )
         GetMapArgs = {
             param($HomeDir)
@@ -569,7 +580,8 @@ if ($App -eq 'cursor') {
     if ($isUnauthenticated) {
         Add-Evidence 'login-check' $loginHintMsg 1 $hostVersion $null $probeLog 'blocked-login' | Out-Null
         Add-Evidence 'summary' 'summary' 1 $hostVersion $null $null 'blocked-login' $App | Out-Null
-        Write-Host "分身未登录。请运行以下命令完成登录:`n$loginHintMsg" -ForegroundColor Yellow
+        # A non-zero probe can also be quota or network; show the client's own words.
+        Write-Host "分身探测失败（可能未登录，也可能是额度/网络问题）。客户端输出:`n$($probeRes.Output.Trim())`n如需登录:`n$loginHintMsg" -ForegroundColor Yellow
         exit 1
     } else {
         $loginPassed = $true
@@ -608,9 +620,8 @@ if ($App -eq 'cursor') {
         foreach ($line in ($createRes.Output -split "`r?`n")) {
             try {
                 $j = ConvertFrom-Json $line
-                if ($j.session_id) { $sessionId = $j.session_id }
-                elseif ($j.id) { $sessionId = $j.id }
-                elseif ($j.thread_id) { $sessionId = $j.thread_id }
+                # StrictMode throws on absent properties, so read only the thread.started event.
+                if ($j.type -eq 'thread.started') { $sessionId = $j.thread_id }
             } catch {}
         }
         if (-not $sessionId -and (Test-Path (Join-Path $AvatarHome 'sessions'))) {
@@ -684,12 +695,17 @@ if ($catProc.ExitCode -ne 0) {
     }
 }
 
+# Each run starts from a fresh local repository that replicate backs up into.
+& $ResticExePath -r $LocalRepo init *> $null
+if ($LASTEXITCODE -ne 0) {
+    throw "Failed to initialize local restic repository at '$LocalRepo'."
+}
+
 $cap = Invoke-Chronicle 'capture' @('native', '--native-config', $ConfigPath, '--json', 'capture', '--app', $App)
 $snapshotId = $null
 if ($cap.ExitCode -eq 0) {
     try {
-        $capObj = $cap.Output | ConvertFrom-Json
-        $snapshotId = if ($capObj.snapshot_id) { $capObj.snapshot_id } elseif ($capObj.result.snapshot_id) { $capObj.result.snapshot_id } else { $null }
+        $snapshotId = Get-ChronicleResult $cap.Output 'snapshot_id'
     } catch {}
 }
 if (-not $snapshotId) {
@@ -763,8 +779,7 @@ if ($plan.ExitCode -ne 0) {
     Add-Evidence 'summary' 'summary' 1 $hostVersion $null $null 'uat-incomplete' $App | Out-Null
     throw "Restore plan generation failed."
 }
-$planObj = $plan.Output | ConvertFrom-Json
-$applyPlanPath = if ($planObj.apply_plan) { $planObj.apply_plan } elseif ($planObj.result.apply_plan) { $planObj.result.apply_plan } else { $null }
+$applyPlanPath = Get-ChronicleResult $plan.Output 'apply_plan'
 if (-not $applyPlanPath) {
     Add-Evidence 'restore-install' $plan.Command 1 $hostVersion $null $plan.LogPath 'failed' | Out-Null
     Add-Evidence 'summary' 'summary' 1 $hostVersion $null $null 'uat-incomplete' $App | Out-Null

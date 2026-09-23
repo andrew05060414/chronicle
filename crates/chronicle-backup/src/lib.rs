@@ -1641,6 +1641,63 @@ fn apply_saved_plan(root: &Path, path: &Path, force: bool) -> Result<serde_json:
     )
 }
 
+fn rollback_journal(journal: &InstallJournal) -> Result<()> {
+    for rec in journal.mutations.iter().rev() {
+        if rec.action_kind == InstallActionKind::CursorSessionMerge {
+            if rec.target_existed {
+                if let Some(cm) = &rec.cursor_mutations {
+                    cursor::rollback_cursor_mutations(&rec.target, cm)?;
+                }
+            } else {
+                let _ = fs::remove_file(&rec.target);
+                for suffix in ["-wal", "-shm", "-journal"] {
+                    let _ =
+                        fs::remove_file(PathBuf::from(format!("{}{suffix}", rec.target.display())));
+                }
+            }
+        } else if rec.target_existed {
+            if let Some(backup) = &rec.backup_file {
+                for suffix in ["-wal", "-shm", "-journal"] {
+                    let _ =
+                        fs::remove_file(PathBuf::from(format!("{}{suffix}", rec.target.display())));
+                }
+                fs::copy(backup, &rec.target)?;
+            }
+        } else {
+            let _ = fs::remove_file(&rec.target);
+            for suffix in ["-wal", "-shm", "-journal"] {
+                let _ = fs::remove_file(PathBuf::from(format!("{}{suffix}", rec.target.display())));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn recover_interrupted_installs(root: &Path, app: &str) -> Result<Vec<String>> {
+    let rollback_root = root.join("rollback");
+    if !rollback_root.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut recovered = Vec::new();
+    let mut entries: Vec<_> =
+        fs::read_dir(&rollback_root)?.collect::<std::result::Result<Vec<_>, _>>()?;
+    entries.sort_by_key(|e| e.path());
+    for entry in entries {
+        let journal_path = entry.path().join("journal.json");
+        if journal_path.is_file() {
+            let content = fs::read_to_string(&journal_path)?;
+            let mut journal: InstallJournal = serde_json::from_str(&content)?;
+            if journal.app == app && journal.phase == "applying" {
+                rollback_journal(&journal)?;
+                journal.phase = "rolled-back-after-interruption".into();
+                atomic_json(&journal_path, &journal)?;
+                recovered.push(journal.snapshot_id);
+            }
+        }
+    }
+    Ok(recovered)
+}
+
 fn apply_install_plan(root: &Path, plan: InstallPlan, force: bool) -> Result<serde_json::Value> {
     let manifest = verify_local(root, &plan.snapshot_id)?;
     ensure!(
@@ -1651,11 +1708,12 @@ fn apply_install_plan(root: &Path, plan: InstallPlan, force: bool) -> Result<ser
         plan.version == VERSION && plan.kind == InstallPlanKind::Install,
         "unsupported install plan"
     );
+    ensure_host_stopped(&plan.app, force)?;
+    let recovered_interrupted = recover_interrupted_installs(root, &plan.app)?;
     ensure!(
         plan.target_fingerprint == install_fingerprint(&plan.actions)?,
         "restore target changed; generate a new plan"
     );
-    ensure_host_stopped(&plan.app, force)?;
     for action in &plan.actions {
         ensure!(
             manifest
@@ -1700,54 +1758,26 @@ fn apply_install_plan(root: &Path, plan: InstallPlan, force: bool) -> Result<ser
     atomic_json(&journal_path, &journal)?;
     let result = (|| -> Result<()> {
         for (index, action) in plan.actions.iter().enumerate() {
-            let cursor_mutations = apply_install_action(root, &plan, action)?;
-            journal.completed.push(action.target.display().to_string());
             journal.mutations.push(JournalActionRecord {
                 index,
                 action_kind: action.kind,
                 target: action.target.clone(),
                 target_existed: prepared[index].1,
                 backup_file: prepared[index].2.clone(),
-                cursor_mutations,
+                cursor_mutations: None,
             });
+            atomic_json(&journal_path, &journal)?;
+            let cursor_mutations = apply_install_action(root, &plan, action)?;
+            if let Some(record) = journal.mutations.last_mut() {
+                record.cursor_mutations = cursor_mutations;
+            }
+            journal.completed.push(action.target.display().to_string());
             atomic_json(&journal_path, &journal)?;
         }
         Ok(())
     })();
     if let Err(error) = result {
-        for rec in journal.mutations.iter().rev() {
-            if rec.action_kind == InstallActionKind::CursorSessionMerge {
-                if rec.target_existed {
-                    if let Some(cm) = &rec.cursor_mutations {
-                        cursor::rollback_cursor_mutations(&rec.target, cm)?;
-                    }
-                } else {
-                    let _ = fs::remove_file(&rec.target);
-                    for suffix in ["-wal", "-shm", "-journal"] {
-                        let _ = fs::remove_file(PathBuf::from(format!(
-                            "{}{suffix}",
-                            rec.target.display()
-                        )));
-                    }
-                }
-            } else if rec.target_existed {
-                if let Some(backup) = &rec.backup_file {
-                    for suffix in ["-wal", "-shm", "-journal"] {
-                        let _ = fs::remove_file(PathBuf::from(format!(
-                            "{}{suffix}",
-                            rec.target.display()
-                        )));
-                    }
-                    fs::copy(backup, &rec.target)?;
-                }
-            } else {
-                let _ = fs::remove_file(&rec.target);
-                for suffix in ["-wal", "-shm", "-journal"] {
-                    let _ =
-                        fs::remove_file(PathBuf::from(format!("{}{suffix}", rec.target.display())));
-                }
-            }
-        }
+        rollback_journal(&journal)?;
         journal.phase = "rolled-back-after-error".into();
         atomic_json(&journal_path, &journal)?;
         return Err(error);
@@ -1761,6 +1791,7 @@ fn apply_install_plan(root: &Path, plan: InstallPlan, force: bool) -> Result<ser
         "app": plan.app,
         "actions": plan.actions.len(),
         "rollback": plan.rollback_dir,
+        "recovered_interrupted": recovered_interrupted,
         "file_verification": "passed",
         "client_open": "not-verified",
         "client_restart": "not-verified",
@@ -4140,6 +4171,257 @@ mod tests {
         assert_eq!(
             fs::read(snap2_dir.join("codex/sessions/session.jsonl")).unwrap(),
             b"offline change during restart\n"
+        );
+    }
+
+    #[test]
+    fn recover_interrupted_install_on_apply_and_succeeds() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let source_file = home.join("source/session.jsonl");
+        fs::create_dir_all(source_file.parent().unwrap()).unwrap();
+        fs::write(&source_file, b"valid new session content\n").unwrap();
+
+        let root = temp.path().join("backup");
+        let config = NativeConfig {
+            sources: vec![SourceConfig {
+                app: "grok".into(),
+                component: ComponentKind::Sessions,
+                slot: "sessions".into(),
+                path: source_file,
+                host_version: Some("fixture-v1".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let captured = capture_sources(&config, &root, &AppArgs::default(), Some(&home)).unwrap();
+        let snap_id = captured["snapshot_id"].as_str().unwrap();
+        let manifest = verify_local(&root, snap_id).unwrap();
+
+        // 1. Normal plan generation
+        let plan = build_install_plan(&manifest, "grok", Some(&home), &[], &root).unwrap();
+        assert_eq!(plan.actions.len(), 1);
+
+        // 2. Manually construct interrupted install state with an older interrupted snapshot
+        let interrupted_snap_id = "interrupted-snapshot-123";
+        let rollback_dir = root.join("rollback").join(interrupted_snap_id);
+        fs::create_dir_all(&rollback_dir).unwrap();
+
+        // Action 1: "新建目标" (target did not exist initially) - half written
+        let half_written_target = home.join(".grok/sessions/half_written.jsonl");
+        fs::create_dir_all(half_written_target.parent().unwrap()).unwrap();
+        fs::write(&half_written_target, b"half written uncompleted data").unwrap();
+
+        // Action 2: "已存在目标 + 备份文件" (target existed initially, but was modified/corrupted)
+        let existed_target = home.join(".grok/sessions/preexisting.jsonl");
+        fs::write(&existed_target, b"corrupted during interrupted install").unwrap();
+        let backup_file = rollback_dir.join("0001.backup");
+        fs::write(&backup_file, b"safe original content").unwrap();
+
+        let interrupted_journal = InstallJournal {
+            snapshot_id: interrupted_snap_id.to_string(),
+            app: "grok".into(),
+            phase: "applying".into(),
+            target_fingerprint_before: "fake-fingerprint".into(),
+            target_fingerprint_after: None,
+            completed: vec![],
+            mutations: vec![
+                JournalActionRecord {
+                    index: 0,
+                    action_kind: InstallActionKind::Copy,
+                    target: half_written_target.clone(),
+                    target_existed: false,
+                    backup_file: None,
+                    cursor_mutations: None,
+                },
+                JournalActionRecord {
+                    index: 1,
+                    action_kind: InstallActionKind::Copy,
+                    target: existed_target.clone(),
+                    target_existed: true,
+                    backup_file: Some(backup_file),
+                    cursor_mutations: None,
+                },
+            ],
+        };
+        atomic_json(&rollback_dir.join("journal.json"), &interrupted_journal).unwrap();
+
+        // 3. Call apply
+        let res = apply_install_plan(&root, plan, true).unwrap();
+
+        // Assertions:
+        // - 半截文件被删
+        assert!(
+            !half_written_target.exists(),
+            "half written file must be deleted"
+        );
+        // - 已存在目标恢复为备份内容
+        assert_eq!(
+            fs::read(&existed_target).unwrap(),
+            b"safe original content",
+            "preexisting file must be restored from backup"
+        );
+        // - 旧 journal 的 phase 变为 "rolled-back-after-interruption"
+        let updated_journal: InstallJournal =
+            serde_json::from_str(&fs::read_to_string(rollback_dir.join("journal.json")).unwrap())
+                .unwrap();
+        assert_eq!(updated_journal.phase, "rolled-back-after-interruption");
+        // - 返回 JSON 含该 snapshot_id
+        let recovered = res["recovered_interrupted"].as_array().unwrap();
+        assert!(
+            recovered
+                .iter()
+                .any(|v| v.as_str() == Some(interrupted_snap_id)),
+            "result must contain interrupted snapshot_id"
+        );
+        // - 且安装最终成功完成
+        assert_eq!(res["file_verification"], "passed");
+        let installed_file = home.join(".grok/sessions/session.jsonl");
+        assert_eq!(
+            fs::read(&installed_file).unwrap(),
+            b"valid new session content\n"
+        );
+    }
+
+    #[test]
+    fn dry_run_and_plan_generation_do_not_trigger_recovery() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let source_file = home.join("source/session.jsonl");
+        fs::create_dir_all(source_file.parent().unwrap()).unwrap();
+        fs::write(&source_file, b"session content\n").unwrap();
+
+        let root = temp.path().join("backup");
+        let config = NativeConfig {
+            sources: vec![SourceConfig {
+                app: "grok".into(),
+                component: ComponentKind::Sessions,
+                slot: "sessions".into(),
+                path: source_file,
+                host_version: Some("fixture-v1".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let captured = capture_sources(&config, &root, &AppArgs::default(), Some(&home)).unwrap();
+        let snap_id = captured["snapshot_id"].as_str().unwrap();
+
+        // Interrupted state
+        let interrupted_snap_id = "interrupted-snapshot-dryrun";
+        let rollback_dir = root.join("rollback").join(interrupted_snap_id);
+        fs::create_dir_all(&rollback_dir).unwrap();
+
+        let half_written_target = home.join(".grok/sessions/half_written.jsonl");
+        fs::create_dir_all(half_written_target.parent().unwrap()).unwrap();
+        fs::write(&half_written_target, b"half written uncompleted data").unwrap();
+
+        let existed_target = home.join(".grok/sessions/preexisting.jsonl");
+        fs::write(&existed_target, b"corrupted during interrupted install").unwrap();
+        let backup_file = rollback_dir.join("0001.backup");
+        fs::write(&backup_file, b"safe original content").unwrap();
+
+        let interrupted_journal = InstallJournal {
+            snapshot_id: interrupted_snap_id.to_string(),
+            app: "grok".into(),
+            phase: "applying".into(),
+            target_fingerprint_before: "fake-fingerprint".into(),
+            target_fingerprint_after: None,
+            completed: vec![],
+            mutations: vec![
+                JournalActionRecord {
+                    index: 0,
+                    action_kind: InstallActionKind::Copy,
+                    target: half_written_target.clone(),
+                    target_existed: false,
+                    backup_file: None,
+                    cursor_mutations: None,
+                },
+                JournalActionRecord {
+                    index: 1,
+                    action_kind: InstallActionKind::Copy,
+                    target: existed_target.clone(),
+                    target_existed: true,
+                    backup_file: Some(backup_file),
+                    cursor_mutations: None,
+                },
+            ],
+        };
+        atomic_json(&rollback_dir.join("journal.json"), &interrupted_journal).unwrap();
+
+        // 1. Plan generation via restore_snapshot(into: "grok")
+        let plan_args = RestoreArgs {
+            snapshot_id: Some(snap_id.to_string()),
+            target: None,
+            into: Some("grok".to_string()),
+            dry_run: false,
+            apply_plan: None,
+            map: vec![],
+            force: false,
+        };
+        let plan_res = restore_snapshot(&root, plan_args, Some(&home)).unwrap();
+        assert_eq!(plan_res["mode"], "plan-ready");
+        let plan_path_str = plan_res["apply_plan"].as_str().unwrap();
+
+        // Verify NO recovery occurred during plan generation:
+        assert!(
+            half_written_target.exists(),
+            "half written target must remain untouched"
+        );
+        assert_eq!(
+            fs::read(&existed_target).unwrap(),
+            b"corrupted during interrupted install",
+            "existed target must remain untouched"
+        );
+        let journal_check: InstallJournal =
+            serde_json::from_str(&fs::read_to_string(rollback_dir.join("journal.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            journal_check.phase, "applying",
+            "journal must remain in applying phase"
+        );
+
+        // 2. Dry run with into + dry_run: true
+        let dry_run_into_args = RestoreArgs {
+            snapshot_id: Some(snap_id.to_string()),
+            target: None,
+            into: Some("grok".to_string()),
+            dry_run: true,
+            apply_plan: None,
+            map: vec![],
+            force: false,
+        };
+        let dry_run_res = restore_snapshot(&root, dry_run_into_args, Some(&home)).unwrap();
+        assert_eq!(dry_run_res["mode"], "install-dry-run");
+
+        // 3. Dry run with apply_plan + dry_run: true
+        let dry_run_apply_args = RestoreArgs {
+            snapshot_id: None,
+            target: None,
+            into: None,
+            dry_run: true,
+            apply_plan: Some(PathBuf::from(plan_path_str)),
+            map: vec![],
+            force: false,
+        };
+        let dry_run_apply_res = restore_snapshot(&root, dry_run_apply_args, Some(&home)).unwrap();
+        assert_eq!(dry_run_apply_res["mode"], "apply-dry-run");
+
+        // Final verification: still NO recovery!
+        assert!(
+            half_written_target.exists(),
+            "half written target must still exist after dry-runs"
+        );
+        assert_eq!(
+            fs::read(&existed_target).unwrap(),
+            b"corrupted during interrupted install",
+            "existed target must remain unchanged after dry-runs"
+        );
+        let final_journal: InstallJournal =
+            serde_json::from_str(&fs::read_to_string(rollback_dir.join("journal.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            final_journal.phase, "applying",
+            "journal must still be applying"
         );
     }
 }

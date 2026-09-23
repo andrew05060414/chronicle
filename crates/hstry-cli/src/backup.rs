@@ -574,10 +574,8 @@ pub fn parse_snapshot_filename(
 
     let (stem, is_encrypted) = if let Some(s) = filename.strip_suffix(".db.zst.enc") {
         (s, true)
-    } else if let Some(s) = filename.strip_suffix(".db.zst") {
-        (s, false)
     } else {
-        return None;
+        (filename.strip_suffix(".db.zst")?, false)
     };
 
     let rest = stem.strip_prefix("hstry-")?;

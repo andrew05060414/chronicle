@@ -354,7 +354,7 @@ $Drivers = @{
             }
             return $m
         }
-        LoginHint = "`$env:CLAUDE_CONFIG_DIR = '{0}'; claude auth"
+        LoginHint = "`$env:CLAUDE_CONFIG_DIR = '{0}'; claude auth login"
     }
 
     'grok' = @{

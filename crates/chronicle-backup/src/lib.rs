@@ -61,6 +61,7 @@ pub enum NativeCommand {
     Verify { snapshot_id: String },
     Restore(RestoreArgs),
     Hosts(hosts::HostsArgs),
+    Pull(PullArgs),
 }
 
 #[derive(Debug, Args, Default)]
@@ -103,6 +104,30 @@ pub struct RestoreArgs {
     pub map: Vec<String>,
     #[arg(long)]
     pub force: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum PullSource {
+    #[default]
+    Remote,
+    Local,
+}
+
+impl std::fmt::Display for PullSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Remote => write!(f, "remote"),
+            Self::Local => write!(f, "local"),
+        }
+    }
+}
+
+#[derive(Debug, Args, Default)]
+pub struct PullArgs {
+    pub snapshot_id: Option<String>,
+    #[arg(long, value_enum, default_value = "remote")]
+    pub from: PullSource,
 }
 
 #[derive(
@@ -359,6 +384,7 @@ pub fn run(args: NativeArgs) -> Result<()> {
                 hosts::handle_hosts_check(&config, &root, args.home.as_deref())?
             }
         },
+        NativeCommand::Pull(pull_args) => pull_snapshot(&config, &root, pull_args)?,
     };
     println!(
         "{}",
@@ -1324,6 +1350,211 @@ fn restic_command(
         String::from_utf8_lossy(&output.stderr)
     );
     Ok(String::from_utf8(output.stdout)?)
+}
+
+fn pull_snapshot(config: &NativeConfig, root: &Path, args: PullArgs) -> Result<serde_json::Value> {
+    let restic = config
+        .restic
+        .clone()
+        .context("restic executable is not configured")?;
+    let password = config
+        .password_file
+        .clone()
+        .context("external password file is not configured")?;
+    ensure!(
+        password.is_file() && password.metadata()?.len() > 0,
+        "password reference is invalid"
+    );
+    let repo = match args.from {
+        PullSource::Remote => config
+            .remote_repository
+            .as_ref()
+            .context("remote repository is not configured")?,
+        PullSource::Local => config
+            .local_repository
+            .as_ref()
+            .context("local repository is not configured")?,
+    };
+
+    let _lock = exclusive_lock(&root.join("pull.lock"))?;
+
+    let snapshots_val = restic_json(
+        &restic,
+        &password,
+        root,
+        &["-r", repo, "snapshots", "--json"],
+    )?;
+    let items = snapshots_val
+        .as_array()
+        .context("restic snapshots returned non-array JSON")?;
+
+    struct Candidate {
+        restic_id: String,
+        chronicle_id: String,
+        time: DateTime<Utc>,
+    }
+
+    let mut candidates: Vec<Candidate> = Vec::new();
+    let mut available_ids: BTreeSet<String> = BTreeSet::new();
+
+    for item in items {
+        let restic_id = match item.get("id").and_then(|v| v.as_str()) {
+            Some(id) => id.to_string(),
+            None => continue,
+        };
+        let time = item.get("time").and_then(|v| v.as_str()).and_then(|s| {
+            DateTime::parse_from_rfc3339(s)
+                .ok()
+                .map(|dt| dt.with_timezone(&Utc))
+        });
+
+        if let Some(tags) = item.get("tags").and_then(|v| v.as_array()) {
+            for tag in tags {
+                if let Some(tag_str) = tag.as_str()
+                    && let Some(chronicle_id) = tag_str.strip_prefix("chronicle-native:")
+                {
+                    available_ids.insert(chronicle_id.to_string());
+                    if let Some(time) = time {
+                        candidates.push(Candidate {
+                            restic_id: restic_id.clone(),
+                            chronicle_id: chronicle_id.to_string(),
+                            time,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    let chosen = match &args.snapshot_id {
+        Some(target_id) => {
+            let mut matching: Vec<Candidate> = candidates
+                .into_iter()
+                .filter(|c| &c.chronicle_id == target_id)
+                .collect();
+            if matching.is_empty() {
+                let available_list: Vec<String> = available_ids.into_iter().take(20).collect();
+                if available_list.is_empty() {
+                    bail!(
+                        "snapshot '{target_id}' not found in repository '{repo}': no chronicle-native snapshots available"
+                    );
+                } else {
+                    bail!(
+                        "snapshot '{target_id}' not found in repository '{repo}'; available chronicle-native snapshots (up to 20): {}",
+                        available_list.join(", ")
+                    );
+                }
+            }
+            matching.sort_by_key(|b| std::cmp::Reverse(b.time));
+            matching.swap_remove(0)
+        }
+        None => {
+            if candidates.is_empty() {
+                bail!("no chronicle-native snapshots found in repository '{repo}'");
+            }
+            candidates.sort_by_key(|b| std::cmp::Reverse(b.time));
+            candidates.swap_remove(0)
+        }
+    };
+
+    let snapshot_id = chosen.chronicle_id;
+    let restic_id = chosen.restic_id;
+
+    let snapshots_root = root.join("snapshots");
+    fs::create_dir_all(&snapshots_root)?;
+    let dest_dir = snapshots_root.join(&snapshot_id);
+
+    if dest_dir.exists() {
+        let manifest = verify_local(root, &snapshot_id).map_err(|err| {
+            anyhow::anyhow!(
+                "local snapshot '{snapshot_id}' already exists but failed verification: {err}; manual resolution required"
+            )
+        })?;
+        return Ok(serde_json::json!({
+            "mode": "already-present",
+            "snapshot_id": snapshot_id,
+            "from": args.from.to_string(),
+            "restic_snapshot": restic_id,
+            "files": manifest.files.len(),
+            "next": "restore --target <dir> or restore --into <app>",
+        }));
+    }
+
+    let timestamp = Utc::now().format("%Y%m%d%H%M%S%3f").to_string();
+    let staging_root = root.join("staging");
+    fs::create_dir_all(&staging_root)?;
+    let staging_dir = staging_root.join(format!("pull-{snapshot_id}-{timestamp}"));
+
+    let restore_res = restic_command(
+        &restic,
+        &password,
+        root,
+        &[
+            "-r",
+            repo,
+            "restore",
+            &restic_id,
+            "--target",
+            &staging_dir.display().to_string(),
+        ],
+    );
+    if let Err(err) = restore_res {
+        let _ = fs::remove_dir_all(&staging_dir);
+        return Err(err);
+    }
+
+    let mut found_dir: Option<PathBuf> = None;
+    for entry in WalkDir::new(&staging_dir)
+        .into_iter()
+        .filter_map(Result::ok)
+    {
+        if entry.file_type().is_dir()
+            && entry.file_name() == std::ffi::OsStr::new(&snapshot_id)
+            && entry.path().join("manifest.json").is_file()
+        {
+            found_dir = Some(entry.path().to_path_buf());
+            break;
+        }
+    }
+
+    let found_dir = match found_dir {
+        Some(dir) => dir,
+        None => {
+            let _ = fs::remove_dir_all(&staging_dir);
+            bail!(
+                "restored snapshot '{snapshot_id}' directory with manifest.json not found in staging tree at {}",
+                staging_dir.display()
+            );
+        }
+    };
+
+    if let Err(err) = fs::rename(&found_dir, &dest_dir) {
+        let _ = fs::remove_dir_all(&staging_dir);
+        return Err(err.into());
+    }
+
+    match verify_local(root, &snapshot_id) {
+        Ok(manifest) => {
+            let _ = fs::remove_dir_all(&staging_dir);
+            Ok(serde_json::json!({
+                "mode": "pulled",
+                "snapshot_id": snapshot_id,
+                "from": args.from.to_string(),
+                "restic_snapshot": restic_id,
+                "files": manifest.files.len(),
+                "next": "restore --target <dir> or restore --into <app>",
+            }))
+        }
+        Err(err) => {
+            let _ = fs::remove_dir_all(&staging_dir);
+            let failed_dir = staging_root.join(format!("failed-pull-{snapshot_id}-{timestamp}"));
+            let _ = fs::rename(&dest_dir, &failed_dir);
+            bail!(
+                "pulled snapshot '{snapshot_id}' failed local verification: {err}; isolated to {}",
+                failed_dir.display()
+            );
+        }
+    }
 }
 
 fn restore_snapshot(
@@ -5143,5 +5374,312 @@ mod tests {
         let st = status(&root).unwrap();
         assert!(!st["hosts_check"].is_null());
         assert_eq!(st["hosts_check"]["hosts"].as_array().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn test_native_pull_cli_parsing() {
+        let parsed = NativeArgs::try_parse_from(["chronicle-native", "pull"]).unwrap();
+        assert!(matches!(
+            parsed.command,
+            NativeCommand::Pull(PullArgs {
+                snapshot_id: None,
+                from: PullSource::Remote
+            })
+        ));
+
+        let parsed = NativeArgs::try_parse_from([
+            "chronicle-native",
+            "pull",
+            "0afca009-7911-4ed8-8121-4601a64aa5bd",
+            "--from",
+            "local",
+        ])
+        .unwrap();
+        assert!(matches!(
+            parsed.command,
+            NativeCommand::Pull(PullArgs {
+                snapshot_id: Some(ref id),
+                from: PullSource::Local
+            }) if id == "0afca009-7911-4ed8-8121-4601a64aa5bd"
+        ));
+    }
+
+    #[test]
+    fn test_native_pull_disaster_recovery_and_edge_cases() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("source-root");
+        fs::create_dir_all(&root).unwrap();
+        let source_root = temp.path().join("source-sessions");
+        fs::create_dir_all(&source_root).unwrap();
+        let db_path = source_root.join("conversation.db");
+        let connection = Connection::open(&db_path).unwrap();
+        connection
+            .execute("CREATE TABLE steps (value BLOB)", [])
+            .unwrap();
+        connection
+            .execute("INSERT INTO steps VALUES (X'0102')", [])
+            .unwrap();
+        let source = SourceConfig {
+            app: "fixture".into(),
+            component: ComponentKind::Sessions,
+            slot: "sessions".into(),
+            path: source_root,
+            host_version: Some("fixture".into()),
+            ..Default::default()
+        };
+        let password = temp.path().join("password");
+        fs::write(&password, "synthetic-test-password").unwrap();
+        let local_repo = temp.path().join("local-repo");
+        let remote_repo = temp.path().join("remote-repo");
+        let restic = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tmp/native-tools/restic_0.19.1_windows_amd64.exe");
+        if !restic.is_file() {
+            return;
+        }
+
+        // Initialize local and remote repos
+        for repo in [&local_repo, &remote_repo] {
+            let status = Command::new(&restic)
+                .args(["-r"])
+                .arg(repo)
+                .arg("init")
+                .env("RESTIC_PASSWORD_FILE", &password)
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
+
+        let config = NativeConfig {
+            data_root: Some(root.clone()),
+            restic: Some(restic.clone()),
+            password_file: Some(password.clone()),
+            local_repository: Some(local_repo.display().to_string()),
+            remote_repository: Some(remote_repo.display().to_string()),
+            sources: vec![source],
+            ..NativeConfig::default()
+        };
+
+        // Capture snapshot 1 and replicate
+        let captured1 = capture_sources(&config, &root, &AppArgs::default(), None).unwrap();
+        let snapshot_id1 = captured1["snapshot_id"].as_str().unwrap().to_string();
+        let rep1 = replicate(&config, &root, Some(&snapshot_id1)).unwrap();
+        assert!(rep1["local_restic_snapshot"].is_string());
+        assert!(rep1["remote_restic_snapshot"].is_string());
+
+        // Capture snapshot 2 with newer timestamp and replicate
+        std::thread::sleep(Duration::from_millis(1100));
+        connection
+            .execute("INSERT INTO steps VALUES (X'0304')", [])
+            .unwrap();
+        let captured2 = capture_sources(&config, &root, &AppArgs::default(), None).unwrap();
+        let snapshot_id2 = captured2["snapshot_id"].as_str().unwrap().to_string();
+        assert_ne!(snapshot_id1, snapshot_id2);
+        let rep2 = replicate(&config, &root, Some(&snapshot_id2)).unwrap();
+        assert!(rep2["remote_restic_snapshot"].is_string());
+
+        // 1. End-to-end disaster recovery:
+        // Fresh empty root, config only points to remote repository
+        let disaster_root = temp.path().join("disaster-recovery-root");
+        fs::create_dir_all(&disaster_root).unwrap();
+        let disaster_config = NativeConfig {
+            data_root: Some(disaster_root.clone()),
+            restic: Some(restic.clone()),
+            password_file: Some(password.clone()),
+            remote_repository: Some(remote_repo.display().to_string()),
+            local_repository: None,
+            ..NativeConfig::default()
+        };
+
+        // When no snapshot ID is given, pull latest (snapshot_id2)
+        let pulled_latest = pull_snapshot(
+            &disaster_config,
+            &disaster_root,
+            PullArgs {
+                snapshot_id: None,
+                from: PullSource::Remote,
+            },
+        )
+        .unwrap();
+        assert_eq!(pulled_latest["mode"], "pulled");
+        assert_eq!(pulled_latest["snapshot_id"], snapshot_id2);
+        assert_eq!(pulled_latest["from"], "remote");
+        assert!(pulled_latest["restic_snapshot"].is_string());
+        assert_eq!(pulled_latest["files"].as_u64().unwrap(), 1);
+        assert_eq!(
+            pulled_latest["next"],
+            "restore --target <dir> or restore --into <app>"
+        );
+
+        // Verify local on the pulled snapshot passes
+        let manifest2 = verify_local(&disaster_root, &snapshot_id2).unwrap();
+        for file in &manifest2.files {
+            let orig_file = root
+                .join("snapshots")
+                .join(&snapshot_id2)
+                .join(&file.relative);
+            let pulled_file = disaster_root
+                .join("snapshots")
+                .join(&snapshot_id2)
+                .join(&file.relative);
+            assert_eq!(
+                hash_file(&orig_file).unwrap(),
+                hash_file(&pulled_file).unwrap()
+            );
+        }
+
+        // Verify restore --target extracts successfully
+        let extracted = temp.path().join("extracted-from-disaster");
+        let restore_args = RestoreArgs {
+            snapshot_id: Some(snapshot_id2.clone()),
+            target: Some(extracted.clone()),
+            into: None,
+            dry_run: false,
+            map: Vec::new(),
+            apply_plan: None,
+            force: false,
+        };
+        restore_snapshot(&disaster_root, restore_args, None).unwrap();
+        let restored_db = extracted.join("fixture/sessions/conversation.db");
+        assert!(restored_db.is_file());
+        let conn = Connection::open(&restored_db).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT count(*) FROM steps", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 2);
+
+        // 2. Duplicate pull returns already-present without downloading from restic
+        let staging_root = disaster_root.join("staging");
+        if staging_root.exists() {
+            let left_over: Vec<_> = fs::read_dir(&staging_root)
+                .unwrap()
+                .filter_map(Result::ok)
+                .collect();
+            assert!(
+                left_over.is_empty(),
+                "staging should be clean before duplicate pull"
+            );
+        }
+
+        let dup_pull = pull_snapshot(
+            &disaster_config,
+            &disaster_root,
+            PullArgs {
+                snapshot_id: Some(snapshot_id2.clone()),
+                from: PullSource::Remote,
+            },
+        )
+        .unwrap();
+        assert_eq!(dup_pull["mode"], "already-present");
+        assert_eq!(dup_pull["snapshot_id"], snapshot_id2);
+        assert_eq!(dup_pull["files"].as_u64().unwrap(), 1);
+
+        // Assert that staging was never touched/created during duplicate pull
+        if staging_root.exists() {
+            let entries: Vec<_> = fs::read_dir(&staging_root)
+                .unwrap()
+                .filter_map(Result::ok)
+                .collect();
+            assert!(
+                entries.is_empty(),
+                "staging must remain completely empty (no restic restore executed): {:?}",
+                entries
+            );
+        }
+
+        // 3. Pull non-existent snapshot id returns clear error listing available ids
+        let fake_id = uuid::Uuid::new_v4().to_string();
+        let err_pull = pull_snapshot(
+            &disaster_config,
+            &disaster_root,
+            PullArgs {
+                snapshot_id: Some(fake_id.clone()),
+                from: PullSource::Remote,
+            },
+        );
+        assert!(err_pull.is_err());
+        let err_msg = err_pull.unwrap_err().to_string();
+        assert!(err_msg.contains(&fake_id));
+        assert!(err_msg.contains(&snapshot_id1) || err_msg.contains(&snapshot_id2));
+
+        // 4. Local snapshot exists but tampered -> rejected and not overwritten without downloading
+        let tampered_file = disaster_root
+            .join("snapshots")
+            .join(&snapshot_id2)
+            .join("fixture/sessions/conversation.db");
+        fs::write(&tampered_file, b"corrupted-tampered-bytes").unwrap();
+
+        let tampered_pull = pull_snapshot(
+            &disaster_config,
+            &disaster_root,
+            PullArgs {
+                snapshot_id: Some(snapshot_id2.clone()),
+                from: PullSource::Remote,
+            },
+        );
+        assert!(tampered_pull.is_err());
+        let tampered_msg = tampered_pull.unwrap_err().to_string();
+        assert!(tampered_msg.contains("failed verification"));
+        assert_eq!(
+            fs::read(&tampered_file).unwrap(),
+            b"corrupted-tampered-bytes"
+        );
+        if staging_root.exists() {
+            let entries: Vec<_> = fs::read_dir(&staging_root)
+                .unwrap()
+                .filter_map(Result::ok)
+                .collect();
+            assert!(
+                entries.is_empty(),
+                "staging must not have been created on tampered pull rejection: {:?}",
+                entries
+            );
+        }
+
+        // 5. Pull older snapshot (snapshot_id1) explicitly
+        let pulled_older = pull_snapshot(
+            &disaster_config,
+            &disaster_root,
+            PullArgs {
+                snapshot_id: Some(snapshot_id1.clone()),
+                from: PullSource::Remote,
+            },
+        )
+        .unwrap();
+        assert_eq!(pulled_older["mode"], "pulled");
+        assert_eq!(pulled_older["snapshot_id"], snapshot_id1);
+        let manifest1 = verify_local(&disaster_root, &snapshot_id1).unwrap();
+        assert_eq!(manifest1.snapshot_id, snapshot_id1);
+
+        // 6. Pull from local repository using --from local
+        let local_pull_root = temp.path().join("local-pull-root");
+        fs::create_dir_all(&local_pull_root).unwrap();
+        let local_pull_config = NativeConfig {
+            data_root: Some(local_pull_root.clone()),
+            restic: Some(restic.clone()),
+            password_file: Some(password.clone()),
+            local_repository: Some(local_repo.display().to_string()),
+            remote_repository: None,
+            ..NativeConfig::default()
+        };
+        let pulled_local = pull_snapshot(
+            &local_pull_config,
+            &local_pull_root,
+            PullArgs {
+                snapshot_id: Some(snapshot_id1.clone()),
+                from: PullSource::Local,
+            },
+        )
+        .unwrap();
+        assert_eq!(pulled_local["mode"], "pulled");
+        assert_eq!(pulled_local["from"], "local");
+
+        // 7. Missing config errors
+        let no_restic_config = NativeConfig::default();
+        let err =
+            pull_snapshot(&no_restic_config, &disaster_root, PullArgs::default()).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("restic executable is not configured")
+        );
     }
 }

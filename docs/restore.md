@@ -51,7 +51,41 @@ Off-site Drive copies remain optional and out of band (rclone / Feiniu Cloud Syn
 
 ## Native recovery
 
-`chronicle native discover/capture/verify/replicate/restore` manages source snapshots and Restic repositories. `restore --target <directory>` extracts and verifies files in isolation. `restore --into <app> --dry-run` previews a native installation plan; omitting `--dry-run` saves a plan, and `--apply-plan` applies it.
+`chronicle native discover/capture/verify/replicate/pull/restore` manages source snapshots and Restic repositories. `restore --target <directory>` extracts and verifies files in isolation. `restore --into <app> --dry-run` previews a native installation plan; omitting `--dry-run` saves a plan, and `--apply-plan` applies it.
+
+### Disaster recovery from the NAS
+
+When a machine is lost or rebuilt, native agent snapshots can be retrieved directly from the remote Restic repository on the NAS:
+
+1. Install Chronicle on the new machine:
+   ```bash
+   cargo install --path crates/hstry-cli
+   ```
+2. Write a minimal configuration pointing to the remote repository (e.g. `chronicle-native.toml`):
+   ```toml
+   restic = "/path/to/restic"
+   password_file = "/path/to/password-file"
+   remote_repository = "rest:http://nas.local:8000/chronicle"
+   data_root = "/path/to/data-root"
+   ```
+3. Pull the snapshot from the NAS:
+   ```bash
+   # Pull the latest available snapshot across all chronicle-native archives
+   chronicle native pull
+
+   # Or pull a specific snapshot ID
+   chronicle native pull <snapshot-id>
+   ```
+   `chronicle native pull` queries the repository, restores into staging under `<root>/staging/pull-<id>-<timestamp>`, verifies the manifest and file hashes, and records the verified snapshot at `<root>/snapshots/<id>`. By default `--from remote` is used; `--from local` pulls from a local repository.
+4. Extract or install:
+   - For isolated extraction:
+     ```bash
+     chronicle native restore <snapshot-id> --target /path/to/extracted
+     ```
+   - For native client installation (guarded by the host version verification registry):
+     ```bash
+     chronicle native restore <snapshot-id> --into <app> --dry-run
+     ```
 
 ### Host version gate & verification registry
 

@@ -24,9 +24,14 @@ pub mod capture;
 mod codex;
 mod cursor;
 mod filehosts;
+pub mod hosts;
 pub use capture::*;
 pub mod components;
 pub use components::*;
+pub use hosts::{
+    HostCheckItem, HostCheckStatus, HostRecordStatus, HostsArgs, HostsCheckResult, HostsRecordArgs,
+    HostsRevokeArgs, HostsSubcommand, VerifiedHostRecord, VerifiedHostsRegistry, load_hosts_check,
+};
 
 const VERSION: u32 = 1;
 
@@ -55,6 +60,7 @@ pub enum NativeCommand {
     Replicate(ReplicateArgs),
     Verify { snapshot_id: String },
     Restore(RestoreArgs),
+    Hosts(hosts::HostsArgs),
 }
 
 #[derive(Debug, Args, Default)]
@@ -243,12 +249,14 @@ enum ExtractPlanKind {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct InstallPlan {
+pub(crate) struct InstallPlan {
     kind: InstallPlanKind,
     version: u32,
     snapshot_id: String,
     app: String,
     host_version: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    drill: bool,
     target_fingerprint: String,
     actions: Vec<InstallAction>,
     path_map: BTreeMap<String, PathBuf>,
@@ -262,7 +270,7 @@ enum InstallPlanKind {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct InstallAction {
+pub(crate) struct InstallAction {
     kind: InstallActionKind,
     source: String,
     target: PathBuf,
@@ -340,6 +348,17 @@ pub fn run(args: NativeArgs) -> Result<()> {
             serde_json::json!({"verified": snapshot_id})
         }
         NativeCommand::Restore(restore) => restore_snapshot(&root, restore, args.home.as_deref())?,
+        NativeCommand::Hosts(hosts_args) => match hosts_args.command {
+            hosts::HostsSubcommand::Record(record_args) => {
+                hosts::handle_hosts_record(&root, record_args)?
+            }
+            hosts::HostsSubcommand::Revoke(revoke_args) => {
+                hosts::handle_hosts_revoke(&root, revoke_args)?
+            }
+            hosts::HostsSubcommand::Check => {
+                hosts::handle_hosts_check(&config, &root, args.home.as_deref())?
+            }
+        },
     };
     println!(
         "{}",
@@ -1317,7 +1336,7 @@ fn restore_snapshot(
             let raw: serde_json::Value = serde_json::from_str(&fs::read_to_string(&plan_path)?)?;
             return Ok(serde_json::json!({"mode": "apply-dry-run", "plan": raw}));
         }
-        return apply_saved_plan(root, &plan_path, args.force);
+        return apply_saved_plan_with_home(root, &plan_path, args.force, home);
     }
     let id = args.snapshot_id.context("snapshot id required")?;
     let manifest = verify_local(root, &id)?;
@@ -1529,19 +1548,27 @@ fn build_install_plan(
     });
     let host_version = host_version.context("host version missing")?;
     ensure!(
-        host_version != "unknown",
+        !host_version.is_empty() && host_version != "unknown",
         "unknown host version: native installation is refused"
     );
-    ensure!(
-        verified_install_host(app, &host_version),
-        "native installation has not been verified for this host version; isolate files with --target and complete host acceptance first"
-    );
+    let is_verified = verified_install_host(root, app, &host_version);
+    let drill = if !is_verified {
+        hosts::validate_drill_targets(&actions, home).map_err(|e| {
+            anyhow::anyhow!(
+                "native installation has not been verified for this host version ({e}); isolate files with --target and complete host acceptance first"
+            )
+        })?;
+        true
+    } else {
+        false
+    };
     Ok(InstallPlan {
         kind: InstallPlanKind::Install,
         version: VERSION,
         snapshot_id: manifest.snapshot_id.clone(),
         app: app.into(),
         host_version,
+        drill,
         target_fingerprint: install_fingerprint(&actions)?,
         actions,
         path_map,
@@ -1612,11 +1639,21 @@ fn install_fingerprint(actions: &[InstallAction]) -> Result<String> {
     Ok(hex(&Sha256::digest(serde_json::to_vec(&files)?)))
 }
 
-fn apply_saved_plan(root: &Path, path: &Path, force: bool) -> Result<serde_json::Value> {
+#[cfg(test)]
+pub(crate) fn apply_saved_plan(root: &Path, path: &Path, force: bool) -> Result<serde_json::Value> {
+    apply_saved_plan_with_home(root, path, force, None)
+}
+
+fn apply_saved_plan_with_home(
+    root: &Path,
+    path: &Path,
+    force: bool,
+    home: Option<&Path>,
+) -> Result<serde_json::Value> {
     let raw: serde_json::Value = serde_json::from_str(&fs::read_to_string(path)?)?;
     if raw.get("kind").and_then(serde_json::Value::as_str) == Some("install") {
         let plan: InstallPlan = serde_json::from_value(raw)?;
-        return apply_install_plan(root, plan, force);
+        return apply_install_plan_with_home(root, plan, force, home);
     }
     let plan: ExtractPlan = serde_json::from_value(raw)?;
     let manifest = verify_local(root, &plan.snapshot_id)?;
@@ -1698,12 +1735,38 @@ fn recover_interrupted_installs(root: &Path, app: &str) -> Result<Vec<String>> {
     Ok(recovered)
 }
 
-fn apply_install_plan(root: &Path, plan: InstallPlan, force: bool) -> Result<serde_json::Value> {
+#[cfg(test)]
+pub(crate) fn apply_install_plan(
+    root: &Path,
+    plan: InstallPlan,
+    force: bool,
+) -> Result<serde_json::Value> {
+    apply_install_plan_with_home(root, plan, force, None)
+}
+
+fn apply_install_plan_with_home(
+    root: &Path,
+    plan: InstallPlan,
+    force: bool,
+    home: Option<&Path>,
+) -> Result<serde_json::Value> {
     let manifest = verify_local(root, &plan.snapshot_id)?;
     ensure!(
-        verified_install_host(&plan.app, &plan.host_version),
-        "native installation has not been verified for this host version; isolate files with --target and complete host acceptance first"
+        !plan.host_version.is_empty() && plan.host_version != "unknown",
+        "unknown host version: native installation is refused"
     );
+    let is_verified = verified_install_host(root, &plan.app, &plan.host_version);
+    if !is_verified {
+        ensure!(
+            plan.drill,
+            "native installation has not been verified for this host version; isolate files with --target and complete host acceptance first"
+        );
+        hosts::validate_drill_targets(&plan.actions, home).map_err(|e| {
+            anyhow::anyhow!(
+                "native installation has not been verified for this host version ({e}); isolate files with --target and complete host acceptance first"
+            )
+        })?;
+    }
     ensure!(
         plan.version == VERSION && plan.kind == InstallPlanKind::Install,
         "unsupported install plan"
@@ -1802,15 +1865,8 @@ fn apply_install_plan(root: &Path, plan: InstallPlan, force: bool) -> Result<ser
     }))
 }
 
-fn verified_install_host(app: &str, version: &str) -> bool {
-    // Fixture coverage is not a production version allowlist. Add a real host
-    // version only with recorded isolated open/restart/continuation evidence.
-    cfg!(test)
-        && version == "fixture-v1"
-        && matches!(
-            app,
-            "codex" | "cursor" | "claude-code" | "antigravity" | "grok"
-        )
+fn verified_install_host(root: &Path, app: &str, version: &str) -> bool {
+    hosts::verified_install_host(root, app, version)
 }
 
 fn apply_install_action(
@@ -2068,6 +2124,7 @@ fn status(root: &Path) -> Result<serde_json::Value> {
     let latest = manifests.first();
     let watch_queue = load_watch_queue(root).unwrap_or_default();
     let rep_state = load_replication_state(root).unwrap_or_default();
+    let hosts_check = hosts::load_hosts_check(root);
     Ok(serde_json::json!({
         "local_snapshot": latest.map(|m| &m.snapshot_id),
         "local_restic_snapshot": latest.and_then(|m| m.local_restic_snapshot.clone()),
@@ -2080,7 +2137,8 @@ fn status(root: &Path) -> Result<serde_json::Value> {
         "replication_failures": {
             "failure_count": rep_state.failures.len(),
             "failures": rep_state.failures,
-        }
+        },
+        "hosts_check": hosts_check,
     }))
 }
 
@@ -4452,5 +4510,638 @@ mod tests {
             final_journal.phase, "applying",
             "journal must still be applying"
         );
+    }
+
+    #[test]
+    fn test_registry_verified_allows_install_and_revoke_refuses() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let source_dir = home.join("source/codex");
+        fs::create_dir_all(source_dir.join("sessions")).unwrap();
+        fs::write(
+            source_dir.join("sessions/session.jsonl"),
+            b"{\"type\":\"session\"}\n",
+        )
+        .unwrap();
+        let root = temp.path().join("backup");
+        let config = NativeConfig {
+            sources: vec![SourceConfig {
+                app: "codex".into(),
+                component: ComponentKind::Sessions,
+                slot: "sessions".into(),
+                path: source_dir.join("sessions"),
+                host_version: Some("9.9.9".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let captured = capture_sources(&config, &root, &AppArgs::default(), Some(&home)).unwrap();
+        let id = captured["snapshot_id"].as_str().unwrap();
+        let manifest = verify_local(&root, id).unwrap();
+
+        let target_dir = home.join("target/codex/sessions");
+        let mappings = vec![format!("sessions={}", target_dir.display())];
+
+        // 1. Unregistered version 9.9.9 fails closed on build_install_plan
+        let err =
+            build_install_plan(&manifest, "codex", Some(&home), &mappings, &root).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("native installation has not been verified")
+        );
+
+        // 2. Unregistered version fails on apply even with force=true
+        let forged_plan = InstallPlan {
+            kind: InstallPlanKind::Install,
+            version: VERSION,
+            snapshot_id: manifest.snapshot_id.clone(),
+            app: "codex".into(),
+            host_version: "9.9.9".into(),
+            drill: false,
+            target_fingerprint: install_fingerprint(&[InstallAction {
+                kind: InstallActionKind::Copy,
+                source: "codex/sessions/session.jsonl".into(),
+                target: target_dir.join("session.jsonl"),
+            }])
+            .unwrap(),
+            actions: vec![InstallAction {
+                kind: InstallActionKind::Copy,
+                source: "codex/sessions/session.jsonl".into(),
+                target: target_dir.join("session.jsonl"),
+            }],
+            path_map: [(
+                "codex/sessions/session.jsonl".into(),
+                target_dir.join("session.jsonl"),
+            )]
+            .into_iter()
+            .collect(),
+            rollback_dir: root.join("rollback").join(&manifest.snapshot_id),
+        };
+        let apply_unverified_err = apply_install_plan(&root, forged_plan, true).unwrap_err();
+        assert!(
+            apply_unverified_err
+                .to_string()
+                .contains("native installation has not been verified")
+        );
+
+        // 3. Register "9.9.9" as verified in verified-hosts.json
+        let reg = VerifiedHostsRegistry {
+            hosts: vec![VerifiedHostRecord {
+                app: "codex".into(),
+                version: "9.9.9".into(),
+                status: HostRecordStatus::Verified,
+                recorded_at: "2026-09-23T00:00:00Z".into(),
+                evidence_path: Some("D:/evidence/uat.json".into()),
+                evidence_sha256: Some("abcd1234".into()),
+                reason: None,
+            }],
+        };
+        hosts::save_verified_hosts_registry(&root, &reg).unwrap();
+
+        // 4. Now build_install_plan succeeds and produces a normal plan
+        let plan = build_install_plan(&manifest, "codex", Some(&home), &mappings, &root).unwrap();
+        assert!(!plan.drill);
+        assert_eq!(plan.host_version, "9.9.9");
+
+        // 5. Apply plan succeeds
+        let res = apply_install_plan(&root, plan.clone(), true).unwrap();
+        assert_eq!(res["file_verification"], "passed");
+        assert!(target_dir.join("session.jsonl").is_file());
+
+        // 6. Revoke version 9.9.9
+        hosts::handle_hosts_revoke(
+            &root,
+            HostsRevokeArgs {
+                app: "codex".into(),
+                version: "9.9.9".into(),
+                reason: Some("compromised client version".into()),
+            },
+        )
+        .unwrap();
+
+        // 7. After revocation, building new plan is refused
+        let revoke_err =
+            build_install_plan(&manifest, "codex", Some(&home), &mappings, &root).unwrap_err();
+        assert!(
+            revoke_err
+                .to_string()
+                .contains("native installation has not been verified")
+        );
+
+        // 8. Applying previously built plan is also refused even with force=true
+        let apply_revoke_err = apply_install_plan(&root, plan, true).unwrap_err();
+        assert!(
+            apply_revoke_err
+                .to_string()
+                .contains("native installation has not been verified")
+        );
+    }
+
+    #[test]
+    fn test_hosts_record_validation_and_failures() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("backup");
+        fs::create_dir_all(&root).unwrap();
+        let evidence_dir = temp.path().join("evidence");
+        fs::create_dir_all(&evidence_dir).unwrap();
+        let evidence_file = evidence_dir.join("evidence.json");
+
+        let make_evidence = |records: &[serde_json::Value]| {
+            fs::write(&evidence_file, serde_json::to_vec_pretty(records).unwrap()).unwrap();
+        };
+
+        let valid_steps = vec![
+            serde_json::json!({"step": "preflight", "exit_code": 0, "result": "passed"}),
+            serde_json::json!({"step": "capture", "exit_code": 0, "result": "passed", "host_version": "5.4.3"}),
+            serde_json::json!({"step": "replicate", "exit_code": 0, "result": "passed", "host_version": "5.4.3"}),
+            serde_json::json!({"step": "verify", "exit_code": 0, "result": "passed", "host_version": "5.4.3"}),
+            serde_json::json!({"step": "remove-source", "exit_code": 0, "result": "passed", "host_version": "5.4.3"}),
+            serde_json::json!({"step": "restore-install", "exit_code": 0, "result": "passed", "host_version": "5.4.3"}),
+            serde_json::json!({"step": "open", "exit_code": 0, "result": "passed", "host_version": "5.4.3"}),
+            serde_json::json!({"step": "restart", "exit_code": 0, "result": "passed", "host_version": "5.4.3"}),
+            serde_json::json!({"step": "continue", "exit_code": 0, "result": "passed", "host_version": "5.4.3"}),
+            serde_json::json!({"step": "summary", "exit_code": 0, "result": "uat-passed", "host_version": "5.4.3", "app": "codex"}),
+        ];
+
+        // 1. Success case: valid evidence records verified entry
+        make_evidence(&valid_steps);
+        let res = hosts::handle_hosts_record(
+            &root,
+            HostsRecordArgs {
+                app: "codex".into(),
+                evidence: evidence_file.clone(),
+            },
+        )
+        .unwrap();
+        assert_eq!(res["app"], "codex");
+        assert_eq!(res["version"], "5.4.3");
+        assert_eq!(res["status"], "verified");
+
+        let reg = hosts::load_verified_hosts_registry(&root).unwrap();
+        assert_eq!(reg.hosts.len(), 1);
+        assert_eq!(reg.hosts[0].status, HostRecordStatus::Verified);
+        let initial_reg_count = reg.hosts.len();
+
+        // 2. Failure: missing step (e.g. missing 'verify')
+        let mut missing_step = valid_steps.clone();
+        missing_step.retain(|s| s["step"] != "verify");
+        make_evidence(&missing_step);
+        let err = hosts::handle_hosts_record(
+            &root,
+            HostsRecordArgs {
+                app: "codex".into(),
+                evidence: evidence_file.clone(),
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("missing required step: 'verify'"));
+        assert_eq!(
+            hosts::load_verified_hosts_registry(&root)
+                .unwrap()
+                .hosts
+                .len(),
+            initial_reg_count
+        );
+
+        // 3. Failure: step failed
+        let mut step_failed = valid_steps.clone();
+        for item in &mut step_failed {
+            if item["step"] == "restore-install" {
+                item["result"] = serde_json::json!("failed");
+            }
+        }
+        make_evidence(&step_failed);
+        let err = hosts::handle_hosts_record(
+            &root,
+            HostsRecordArgs {
+                app: "codex".into(),
+                evidence: evidence_file.clone(),
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("step 'restore-install' result is Some(\"failed\")")
+        );
+        assert_eq!(
+            hosts::load_verified_hosts_registry(&root)
+                .unwrap()
+                .hosts
+                .len(),
+            initial_reg_count
+        );
+
+        // 4. Failure: exit code non-zero
+        let mut exit_code_fail = valid_steps.clone();
+        for item in &mut exit_code_fail {
+            if item["step"] == "capture" {
+                item["exit_code"] = serde_json::json!(1);
+            }
+        }
+        make_evidence(&exit_code_fail);
+        let err = hosts::handle_hosts_record(
+            &root,
+            HostsRecordArgs {
+                app: "codex".into(),
+                evidence: evidence_file.clone(),
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("step 'capture' exit_code is Some(1)")
+        );
+        assert_eq!(
+            hosts::load_verified_hosts_registry(&root)
+                .unwrap()
+                .hosts
+                .len(),
+            initial_reg_count
+        );
+
+        // 5. Failure: inconsistent host_version
+        let mut inconsistent_ver = valid_steps.clone();
+        for item in &mut inconsistent_ver {
+            if item["step"] == "replicate" {
+                item["host_version"] = serde_json::json!("9.9.9");
+            }
+        }
+        make_evidence(&inconsistent_ver);
+        let err = hosts::handle_hosts_record(
+            &root,
+            HostsRecordArgs {
+                app: "codex".into(),
+                evidence: evidence_file.clone(),
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("inconsistent host_versions across steps")
+        );
+        assert_eq!(
+            hosts::load_verified_hosts_registry(&root)
+                .unwrap()
+                .hosts
+                .len(),
+            initial_reg_count
+        );
+
+        // 6. Failure: summary is not uat-passed
+        let mut summary_incomplete = valid_steps.clone();
+        for item in &mut summary_incomplete {
+            if item["step"] == "summary" {
+                item["result"] = serde_json::json!("uat-incomplete");
+            }
+        }
+        make_evidence(&summary_incomplete);
+        let err = hosts::handle_hosts_record(
+            &root,
+            HostsRecordArgs {
+                app: "codex".into(),
+                evidence: evidence_file.clone(),
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("step 'summary' result is Some(\"uat-incomplete\")")
+        );
+        assert_eq!(
+            hosts::load_verified_hosts_registry(&root)
+                .unwrap()
+                .hosts
+                .len(),
+            initial_reg_count
+        );
+
+        // 7. Failure: host_version is unknown
+        let mut ver_unknown = valid_steps.clone();
+        for item in &mut ver_unknown {
+            item["host_version"] = serde_json::json!("unknown");
+        }
+        make_evidence(&ver_unknown);
+        let err = hosts::handle_hosts_record(
+            &root,
+            HostsRecordArgs {
+                app: "codex".into(),
+                evidence: evidence_file.clone(),
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("host_version is 'unknown'"));
+        assert_eq!(
+            hosts::load_verified_hosts_registry(&root)
+                .unwrap()
+                .hosts
+                .len(),
+            initial_reg_count
+        );
+
+        // 8. Multiple issues listed in a single error message
+        let mut multi_issues = valid_steps.clone();
+        multi_issues.retain(|s| s["step"] != "verify");
+        for item in &mut multi_issues {
+            if item["step"] == "capture" {
+                item["exit_code"] = serde_json::json!(2);
+            }
+            if item["step"] == "summary" {
+                item["result"] = serde_json::json!("failed");
+            }
+        }
+        make_evidence(&multi_issues);
+        let multi_err = hosts::handle_hosts_record(
+            &root,
+            HostsRecordArgs {
+                app: "codex".into(),
+                evidence: evidence_file.clone(),
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(multi_err.contains("missing required step: 'verify'"));
+        assert!(multi_err.contains("step 'capture' exit_code is Some(2)"));
+        assert!(multi_err.contains("step 'summary' result is Some(\"failed\")"));
+
+        // 9. Failure: summary missing required 'app' field
+        let mut missing_app = valid_steps.clone();
+        for item in &mut missing_app {
+            if item["step"] == "summary" {
+                item.as_object_mut().unwrap().remove("app");
+            }
+        }
+        make_evidence(&missing_app);
+        let err = hosts::handle_hosts_record(
+            &root,
+            HostsRecordArgs {
+                app: "codex".into(),
+                evidence: evidence_file.clone(),
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("step 'summary' missing required 'app' field")
+        );
+        assert_eq!(
+            hosts::load_verified_hosts_registry(&root)
+                .unwrap()
+                .hosts
+                .len(),
+            initial_reg_count
+        );
+
+        // 10. Failure: summary app mismatch (e.g. cursor evidence recorded for codex)
+        let mut wrong_app = valid_steps.clone();
+        for item in &mut wrong_app {
+            if item["step"] == "summary" {
+                item["app"] = serde_json::json!("cursor");
+            }
+        }
+        make_evidence(&wrong_app);
+        let err = hosts::handle_hosts_record(
+            &root,
+            HostsRecordArgs {
+                app: "codex".into(),
+                evidence: evidence_file.clone(),
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("step 'summary' app is 'cursor' (expected 'codex')")
+        );
+        assert_eq!(
+            hosts::load_verified_hosts_registry(&root)
+                .unwrap()
+                .hosts
+                .len(),
+            initial_reg_count
+        );
+
+        // 11. Success: summary app case-insensitive match (e.g. CODEX vs codex)
+        let mut case_app = valid_steps.clone();
+        for item in &mut case_app {
+            if item["step"] == "summary" {
+                item["app"] = serde_json::json!("CODEX");
+            }
+        }
+        make_evidence(&case_app);
+        let res = hosts::handle_hosts_record(
+            &root,
+            HostsRecordArgs {
+                app: "codex".into(),
+                evidence: evidence_file,
+            },
+        )
+        .unwrap();
+        assert_eq!(res["app"], "codex");
+    }
+
+    #[test]
+    fn test_drill_mode_execution_and_safeguards() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let drill_root = temp.path().join("drill_sandbox");
+        fs::create_dir_all(&drill_root).unwrap();
+        let drill_marker = drill_root.join(".chronicle-drill");
+        fs::write(&drill_marker, b"marker").unwrap();
+
+        let source_dir = home.join("source/codex");
+        fs::create_dir_all(source_dir.join("sessions")).unwrap();
+        fs::write(
+            source_dir.join("sessions/session.jsonl"),
+            b"{\"type\":\"session\"}\n",
+        )
+        .unwrap();
+
+        let root = temp.path().join("backup");
+        let config = NativeConfig {
+            sources: vec![SourceConfig {
+                app: "codex".into(),
+                component: ComponentKind::Sessions,
+                slot: "sessions".into(),
+                path: source_dir.join("sessions"),
+                host_version: Some("unverified-7.7.7".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let captured = capture_sources(&config, &root, &AppArgs::default(), Some(&home)).unwrap();
+        let id = captured["snapshot_id"].as_str().unwrap();
+        let manifest = verify_local(&root, id).unwrap();
+
+        // 1. Drill targets inside drill_root containing .chronicle-drill: succeeds with drill: true
+        let isolated_target = drill_root.join("codex_home/sessions");
+        let mappings = vec![format!("sessions={}", isolated_target.display())];
+
+        let plan = build_install_plan(&manifest, "codex", Some(&home), &mappings, &root).unwrap();
+        assert!(plan.drill);
+        assert_eq!(plan.host_version, "unverified-7.7.7");
+
+        let res = apply_install_plan_with_home(&root, plan.clone(), true, Some(&home)).unwrap();
+        assert_eq!(res["file_verification"], "passed");
+        assert!(isolated_target.join("session.jsonl").is_file());
+
+        // 2. Missing marker: if target directory has NO .chronicle-drill in any ancestor, build fails
+        let no_marker_dir = temp.path().join("no_marker_dir/sessions");
+        let no_marker_mappings = vec![format!("sessions={}", no_marker_dir.display())];
+        let err = build_install_plan(&manifest, "codex", Some(&home), &no_marker_mappings, &root)
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("native installation has not been verified")
+        );
+        assert!(err.to_string().contains(".chronicle-drill"));
+
+        // 3. Marker deleted before apply: build succeeds when marker exists, but apply fails if marker is removed
+        let plan_to_break =
+            build_install_plan(&manifest, "codex", Some(&home), &mappings, &root).unwrap();
+        assert!(plan_to_break.drill);
+        fs::remove_file(&drill_marker).unwrap(); // delete marker
+        let apply_fail =
+            apply_install_plan_with_home(&root, plan_to_break, true, Some(&home)).unwrap_err();
+        assert!(
+            apply_fail
+                .to_string()
+                .contains("native installation has not been verified")
+        );
+        assert!(apply_fail.to_string().contains(".chronicle-drill"));
+
+        // Restore marker for remaining tests
+        fs::write(&drill_marker, b"marker").unwrap();
+
+        // 4. Protection of real home: target inside default client data root in user home is refused even if marker exists
+        let home_target = home.join(".codex/sessions");
+        fs::create_dir_all(&home_target).unwrap();
+        // Even if home has a .chronicle-drill marker
+        fs::write(home.join(".chronicle-drill"), b"marker").unwrap();
+        let home_mappings = vec![format!("sessions={}", home_target.display())];
+        let home_err =
+            build_install_plan(&manifest, "codex", Some(&home), &home_mappings, &root).unwrap_err();
+        assert!(
+            home_err
+                .to_string()
+                .contains("native installation has not been verified")
+        );
+        assert!(
+            home_err
+                .to_string()
+                .contains("falls within default client data root")
+        );
+
+        // 5. Revoked version is permitted in drill mode
+        hosts::handle_hosts_revoke(
+            &root,
+            HostsRevokeArgs {
+                app: "codex".into(),
+                version: "unverified-7.7.7".into(),
+                reason: Some("testing re-drill".into()),
+            },
+        )
+        .unwrap();
+
+        let drill_target2 = drill_root.join("drill_run2/sessions");
+        let mappings2 = vec![format!("sessions={}", drill_target2.display())];
+        let plan2 = build_install_plan(&manifest, "codex", Some(&home), &mappings2, &root).unwrap();
+        assert!(plan2.drill);
+        let res2 = apply_install_plan_with_home(&root, plan2, true, Some(&home)).unwrap();
+        assert_eq!(res2["file_verification"], "passed");
+        assert!(drill_target2.join("session.jsonl").is_file());
+    }
+
+    #[test]
+    fn test_hosts_check_and_status_integration() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("backup");
+        fs::create_dir_all(&root).unwrap();
+
+        // 1. Initial status has hosts_check as null when hosts-check.json is absent
+        let st_initial = status(&root).unwrap();
+        assert!(st_initial["hosts_check"].is_null());
+
+        // 2. Set up registry with 1 verified and 1 revoked
+        let reg = VerifiedHostsRegistry {
+            hosts: vec![
+                VerifiedHostRecord {
+                    app: "codex".into(),
+                    version: "1.0.0".into(),
+                    status: HostRecordStatus::Verified,
+                    recorded_at: "2026-09-23T00:00:00Z".into(),
+                    evidence_path: None,
+                    evidence_sha256: None,
+                    reason: None,
+                },
+                VerifiedHostRecord {
+                    app: "claude-code".into(),
+                    version: "2.0.0".into(),
+                    status: HostRecordStatus::Revoked,
+                    recorded_at: "2026-09-23T01:00:00Z".into(),
+                    evidence_path: None,
+                    evidence_sha256: None,
+                    reason: Some("revoked".into()),
+                },
+            ],
+        };
+        hosts::save_verified_hosts_registry(&root, &reg).unwrap();
+
+        // 3. Config with 3 apps: codex (verified), grok (unverified), claude-code (revoked)
+        let config = NativeConfig {
+            sources: vec![
+                SourceConfig {
+                    app: "codex".into(),
+                    component: ComponentKind::Sessions,
+                    slot: "sessions".into(),
+                    path: PathBuf::from("sessions"),
+                    host_version: Some("1.0.0".into()),
+                    ..Default::default()
+                },
+                SourceConfig {
+                    app: "grok".into(),
+                    component: ComponentKind::Sessions,
+                    slot: "sessions".into(),
+                    path: PathBuf::from("sessions"),
+                    host_version: Some("3.0.0".into()),
+                    ..Default::default()
+                },
+                SourceConfig {
+                    app: "claude-code".into(),
+                    component: ComponentKind::Sessions,
+                    slot: "projects".into(),
+                    path: PathBuf::from("projects"),
+                    host_version: Some("2.0.0".into()),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        // 4. Run handle_hosts_check
+        let check_res = hosts::handle_hosts_check(&config, &root, None).unwrap();
+        let hosts_arr = check_res["hosts"].as_array().unwrap();
+        assert_eq!(hosts_arr.len(), 3);
+
+        let find_app = |app_name: &str| hosts_arr.iter().find(|h| h["app"] == app_name).unwrap();
+
+        let codex_item = find_app("codex");
+        assert_eq!(codex_item["version"], "1.0.0");
+        assert_eq!(codex_item["status"], "verified");
+
+        let grok_item = find_app("grok");
+        assert_eq!(grok_item["version"], "3.0.0");
+        assert_eq!(grok_item["status"], "unverified");
+
+        let claude_item = find_app("claude-code");
+        assert_eq!(claude_item["version"], "2.0.0");
+        assert_eq!(claude_item["status"], "revoked");
+
+        // 5. hosts-check.json is written
+        let check_file = root.join("hosts-check.json");
+        assert!(check_file.is_file());
+
+        // 6. status() reads hosts_check without re-probing
+        let st = status(&root).unwrap();
+        assert!(!st["hosts_check"].is_null());
+        assert_eq!(st["hosts_check"]["hosts"].as_array().unwrap().len(), 3);
     }
 }

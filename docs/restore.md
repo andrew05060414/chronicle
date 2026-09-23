@@ -51,7 +51,18 @@ Off-site Drive copies remain optional and out of band (rclone / Feiniu Cloud Syn
 
 ## Native recovery
 
-`chronicle native discover/capture/verify/replicate/restore` manages source snapshots and Restic repositories. `restore --target <directory>` extracts and verifies files in isolation. `restore --into <app> --dry-run` previews a native installation plan; omitting `--dry-run` saves a plan, and `--apply-plan` applies it. Production native installation currently fails closed for every host version; only synthetic tests enable the installation prototype. `--force` cannot bypass the host-version gate. Recovery is accepted only after file verification, client opening after restart, and a test continuation where the host supports it.
+`chronicle native discover/capture/verify/replicate/restore` manages source snapshots and Restic repositories. `restore --target <directory>` extracts and verifies files in isolation. `restore --into <app> --dry-run` previews a native installation plan; omitting `--dry-run` saves a plan, and `--apply-plan` applies it.
+
+### Host version gate & verification registry
+
+Client installation is guarded by a strict host version gate backed by the registry `<root>/verified-hosts.json`:
+
+- **Fail-closed**: Any unknown, unverified, or revoked host version fails closed. Production installation into real client directories is refused, and `--force` cannot bypass this gate. Files can only be extracted in isolation via `restore --target <directory>`.
+- **Management commands (`native hosts`)**:
+  - `hosts record --app <app> --evidence <path>`: Validates a complete UAT drill evidence log (verifying capture, replication, isolation, file restoration, client opening, restart, and continuation) and registers the host version as `verified`.
+  - `hosts revoke --app <app> --version <v> --reason <text>`: Appends a `revoked` record for a previously trusted version.
+  - `hosts check`: Detects the current host versions against configured native sources, compares each with the registry (`verified`, `unverified`, `revoked`, or `unknown`), and writes `<root>/hosts-check.json` (also surfaced in `chronicle native status`).
+- **Drill mode**: Unverified or revoked versions are permitted to build and apply installation plans *only* under isolated drill conditions: every plan target must reside within an ancestor directory containing a `.chronicle-drill` marker file, and no target may fall within standard client data roots under the user's home directory. Plans generated in this mode are tagged `"drill": true`, and drill isolation constraints are strictly re-verified upon plan execution.
 
 ### Per-host unsupported items
 

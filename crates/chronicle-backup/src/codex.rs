@@ -1,8 +1,9 @@
 //! Version-checked Codex index merge. Raw rollout files are authoritative.
 use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, types::Value};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -18,13 +19,19 @@ const THREAD_REQUIRED: &[&str] = &[
     "title",
 ];
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) struct SkippedCodexThread {
+    pub(super) id: String,
+    pub(super) reason: String,
+}
+
 pub(super) fn merge_index(
     source: &Path,
     target: &Path,
     path_map: &BTreeMap<String, PathBuf>,
-) -> Result<()> {
+) -> Result<Vec<SkippedCodexThread>> {
     let existed = target.exists();
-    let res = (|| -> Result<()> {
+    let res = (|| -> Result<Vec<SkippedCodexThread>> {
         if let Some(parent) = target.parent()
             && !parent.exists()
         {
@@ -44,6 +51,8 @@ pub(super) fn merge_index(
             "duplicate Codex path mapping"
         );
 
+        let empty_skipped = BTreeSet::new();
+
         merge_table(
             &source,
             &transaction,
@@ -51,6 +60,7 @@ pub(super) fn merge_index(
             &["id"],
             &normalized,
             None,
+            &empty_skipped,
         )?;
         merge_table(
             &source,
@@ -59,15 +69,18 @@ pub(super) fn merge_index(
             &["id"],
             &normalized,
             None,
+            &empty_skipped,
         )?;
-        merge_table(
+        let skipped_threads = merge_table(
             &source,
             &transaction,
             "threads",
             &["id"],
             &normalized,
             Some("rollout_path"),
+            &empty_skipped,
         )?;
+        let skipped_ids: BTreeSet<String> = skipped_threads.iter().map(|t| t.id.clone()).collect();
         merge_table(
             &source,
             &transaction,
@@ -75,6 +88,7 @@ pub(super) fn merge_index(
             &["thread_id", "position"],
             &normalized,
             None,
+            &skipped_ids,
         )?;
         merge_table(
             &source,
@@ -83,6 +97,7 @@ pub(super) fn merge_index(
             &["child_thread_id"],
             &normalized,
             None,
+            &skipped_ids,
         )?;
 
         // Validate foreign keys inside the transaction
@@ -107,7 +122,7 @@ pub(super) fn merge_index(
         );
 
         transaction.commit()?;
-        Ok(())
+        Ok(skipped_threads)
     })();
 
     if res.is_err() && !existed && target.exists() {
@@ -127,9 +142,10 @@ fn merge_table(
     keys: &[&str],
     path_map: &BTreeMap<String, PathBuf>,
     mapped_path_column: Option<&str>,
-) -> Result<()> {
+    skipped_thread_ids: &BTreeSet<String>,
+) -> Result<Vec<SkippedCodexThread>> {
     if !table_exists(source, table)? {
-        return Ok(());
+        return Ok(Vec::new());
     }
 
     if !table_exists(target, table)? {
@@ -210,9 +226,8 @@ fn merge_table(
 
     let mut select = source.prepare(&format!("SELECT {column_sql} FROM {}", quote(table)))?;
     let mut rows = select.query([])?;
-    let mut registered = 0;
     let mut verified = 0;
-    let mut skipped = 0;
+    let mut skipped_threads = Vec::new();
 
     while let Some(row) = rows.next()? {
         let mut values = (0..columns.len())
@@ -238,13 +253,28 @@ fn merge_table(
                 .iter()
                 .position(|c| Some(c.as_str()) == mapped_path_column)
                 .unwrap();
+            let id_index = columns.iter().position(|c| c == "id").unwrap();
+            let thread_id = match &values[id_index] {
+                Value::Text(s) => s.clone(),
+                Value::Integer(i) => i.to_string(),
+                Value::Real(f) => f.to_string(),
+                Value::Blob(b) => String::from_utf8_lossy(b).into_owned(),
+                Value::Null => String::new(),
+            };
+
             let Value::Text(path) = &values[path_index] else {
-                skipped += 1;
+                skipped_threads.push(SkippedCodexThread {
+                    id: thread_id,
+                    reason: "rollout path missing".to_string(),
+                });
                 continue;
             };
             let mapped = remap_path_on_boundary(path, path_map);
             let Some(mapped) = mapped else {
-                skipped += 1;
+                skipped_threads.push(SkippedCodexThread {
+                    id: thread_id,
+                    reason: "rollout not in snapshot".to_string(),
+                });
                 continue;
             };
             ensure!(
@@ -296,6 +326,9 @@ fn merge_table(
             if let Some(thread_id_idx) = columns.iter().position(|c| c == "thread_id")
                 && let Value::Text(thread_id) = &values[thread_id_idx]
             {
+                if skipped_thread_ids.contains(thread_id) {
+                    continue;
+                }
                 let thread_exists: bool = target.query_row(
                     "SELECT EXISTS(SELECT 1 FROM threads WHERE id = ?1)",
                     [thread_id],
@@ -307,9 +340,28 @@ fn merge_table(
                 );
             }
         } else if table == "thread_spawn_edges" {
-            if let Some(child_idx) = columns.iter().position(|c| c == "child_thread_id")
-                && let Value::Text(child_id) = &values[child_idx]
+            let child_id_opt = columns
+                .iter()
+                .position(|c| c == "child_thread_id")
+                .and_then(|idx| match &values[idx] {
+                    Value::Text(s) => Some(s.as_str()),
+                    _ => None,
+                });
+            let parent_id_opt = columns
+                .iter()
+                .position(|c| c == "parent_thread_id")
+                .and_then(|idx| match &values[idx] {
+                    Value::Text(s) if !s.is_empty() => Some(s.as_str()),
+                    _ => None,
+                });
+
+            if child_id_opt.is_some_and(|id| skipped_thread_ids.contains(id))
+                || parent_id_opt.is_some_and(|id| skipped_thread_ids.contains(id))
             {
+                continue;
+            }
+
+            if let Some(child_id) = child_id_opt {
                 let child_exists: bool = target.query_row(
                     "SELECT EXISTS(SELECT 1 FROM threads WHERE id = ?1)",
                     [child_id],
@@ -320,10 +372,7 @@ fn merge_table(
                     "missing dependency: thread_spawn_edges references missing child thread '{child_id}'"
                 );
             }
-            if let Some(parent_idx) = columns.iter().position(|c| c == "parent_thread_id")
-                && let Value::Text(parent_id) = &values[parent_idx]
-                && !parent_id.is_empty()
-            {
+            if let Some(parent_id) = parent_id_opt {
                 let parent_exists: bool = target.query_row(
                     "SELECT EXISTS(SELECT 1 FROM threads WHERE id = ?1)",
                     [parent_id],
@@ -368,20 +417,17 @@ fn merge_table(
                 values_equal(table, &columns, &target_values, &values),
                 "conflict: same Codex {table} identity has different content"
             );
-            skipped += 1;
             continue;
         }
 
         target.execute(&insert_sql, rusqlite::params_from_iter(values.iter()))?;
-        registered += 1;
     }
 
     ensure!(
         table != "threads" || verified > 0,
         "Codex snapshot has no verified rollout files"
     );
-    let _ = (registered, skipped);
-    Ok(())
+    Ok(skipped_threads)
 }
 
 fn values_equal(_table: &str, columns: &[String], a: &[Value], b: &[Value]) -> bool {
@@ -960,6 +1006,112 @@ CREATE TABLE thread_spawn_edges (
         assert!(
             !target_db.exists(),
             "target file should have been cleaned up on failure when it was originally absent"
+        );
+    }
+
+    #[test]
+    fn test_merge_index_skips_unmapped_rollout_and_associated_child_rows() {
+        let temp = tempfile::tempdir().unwrap();
+        let source_db = temp.path().join("source/state.sqlite");
+        fs::create_dir_all(source_db.parent().unwrap()).unwrap();
+        let (s_rollout_1, _s_rollout_2) = setup_source_db(&source_db);
+
+        let source_conn = Connection::open(&source_db).unwrap();
+        source_conn
+            .execute(
+                "INSERT INTO thread_dynamic_tools VALUES ('t-2', 0, 'python')",
+                [],
+            )
+            .unwrap();
+        drop(source_conn);
+
+        let target_db = temp.path().join("target/state.sqlite");
+        let t_rollout_1 = temp.path().join("target/rollouts/t1.jsonl");
+        fs::create_dir_all(t_rollout_1.parent().unwrap()).unwrap();
+        fs::copy(&s_rollout_1, &t_rollout_1).unwrap();
+
+        let path_map = BTreeMap::from([(s_rollout_1.display().to_string(), t_rollout_1)]);
+
+        let skipped = merge_index(&source_db, &target_db, &path_map).unwrap();
+        assert_eq!(
+            skipped,
+            vec![SkippedCodexThread {
+                id: "t-2".to_string(),
+                reason: "rollout not in snapshot".to_string(),
+            }]
+        );
+
+        let target_conn = Connection::open(&target_db).unwrap();
+        let t1_exists: bool = target_conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM threads WHERE id='t-1')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(t1_exists);
+
+        let t2_exists: bool = target_conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM threads WHERE id='t-2')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(!t2_exists);
+
+        let t2_tools_count: i64 = target_conn
+            .query_row(
+                "SELECT COUNT(*) FROM thread_dynamic_tools WHERE thread_id='t-2'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(t2_tools_count, 0);
+
+        let t1_tools_count: i64 = target_conn
+            .query_row(
+                "SELECT COUNT(*) FROM thread_dynamic_tools WHERE thread_id='t-1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(t1_tools_count, 1);
+
+        let edge_count: i64 = target_conn
+            .query_row("SELECT COUNT(*) FROM thread_spawn_edges", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(edge_count, 0);
+    }
+
+    #[test]
+    fn test_merge_index_skips_thread_with_missing_rollout_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let source_db = temp.path().join("source/state.sqlite");
+        fs::create_dir_all(source_db.parent().unwrap()).unwrap();
+        let (s_rollout_1, _s_rollout_2) = setup_source_db(&source_db);
+
+        let source_conn = Connection::open(&source_db).unwrap();
+        source_conn
+            .execute(
+                "INSERT INTO threads VALUES ('t-3', zeroblob(10), 100, 200, 'user', 'openai', 'C:/work/app', 'Title 3')",
+                [],
+            )
+            .unwrap();
+        drop(source_conn);
+
+        let target_db = temp.path().join("target/state.sqlite");
+        let t_rollout_1 = temp.path().join("target/rollouts/t1.jsonl");
+        fs::create_dir_all(t_rollout_1.parent().unwrap()).unwrap();
+        fs::copy(&s_rollout_1, &t_rollout_1).unwrap();
+
+        let path_map = BTreeMap::from([(s_rollout_1.display().to_string(), t_rollout_1)]);
+
+        let skipped = merge_index(&source_db, &target_db, &path_map).unwrap();
+        assert!(
+            skipped
+                .iter()
+                .any(|s| s.id == "t-3" && s.reason == "rollout path missing")
         );
     }
 }

@@ -1756,6 +1756,7 @@ fn apply_install_plan(root: &Path, plan: InstallPlan, force: bool) -> Result<ser
         mutations: Vec::new(),
     };
     atomic_json(&journal_path, &journal)?;
+    let mut codex_unregistered_threads = Vec::new();
     let result = (|| -> Result<()> {
         for (index, action) in plan.actions.iter().enumerate() {
             journal.mutations.push(JournalActionRecord {
@@ -1767,7 +1768,8 @@ fn apply_install_plan(root: &Path, plan: InstallPlan, force: bool) -> Result<ser
                 cursor_mutations: None,
             });
             atomic_json(&journal_path, &journal)?;
-            let cursor_mutations = apply_install_action(root, &plan, action)?;
+            let (cursor_mutations, skipped) = apply_install_action(root, &plan, action)?;
+            codex_unregistered_threads.extend(skipped);
             if let Some(record) = journal.mutations.last_mut() {
                 record.cursor_mutations = cursor_mutations;
             }
@@ -1795,7 +1797,8 @@ fn apply_install_plan(root: &Path, plan: InstallPlan, force: bool) -> Result<ser
         "file_verification": "passed",
         "client_open": "not-verified",
         "client_restart": "not-verified",
-        "continuation": "not-verified"
+        "continuation": "not-verified",
+        "codex_unregistered_threads": codex_unregistered_threads,
     }))
 }
 
@@ -1814,7 +1817,10 @@ fn apply_install_action(
     root: &Path,
     plan: &InstallPlan,
     action: &InstallAction,
-) -> Result<Option<cursor::CursorMutations>> {
+) -> Result<(
+    Option<cursor::CursorMutations>,
+    Vec<codex::SkippedCodexThread>,
+)> {
     let source = root
         .join("snapshots")
         .join(&plan.snapshot_id)
@@ -1823,7 +1829,7 @@ fn apply_install_action(
         InstallActionKind::Copy | InstallActionKind::CopyIfMissing => {
             if action.target.exists() {
                 if action.kind == InstallActionKind::CopyIfMissing {
-                    return Ok(None);
+                    return Ok((None, Vec::new()));
                 }
                 let source_hash = hash_file(&source)?;
                 ensure!(
@@ -1831,7 +1837,7 @@ fn apply_install_action(
                     "restore conflict: {}",
                     action.target.display()
                 );
-                return Ok(None);
+                return Ok((None, Vec::new()));
             }
             if let Some(parent) = action.target.parent() {
                 fs::create_dir_all(parent)?;
@@ -1847,18 +1853,18 @@ fn apply_install_action(
                 hash_file(&source)? == hash_file(&action.target)?,
                 "installed file hash mismatch"
             );
-            Ok(None)
+            Ok((None, Vec::new()))
         }
         InstallActionKind::CursorSessionMerge => {
             if let Some(parent) = action.target.parent() {
                 fs::create_dir_all(parent)?;
             }
             let (_copied, muts) = cursor::merge_sessions_strictly(&source, &action.target)?;
-            Ok(Some(muts))
+            Ok((Some(muts), Vec::new()))
         }
         InstallActionKind::CodexIndexMerge => {
-            codex::merge_index(&source, &action.target, &plan.path_map)?;
-            Ok(None)
+            let skipped = codex::merge_index(&source, &action.target, &plan.path_map)?;
+            Ok((None, skipped))
         }
         InstallActionKind::SessionIndexMerge => {
             let registered = plan
@@ -1867,7 +1873,7 @@ fn apply_install_action(
                 .find(|action| action.kind == InstallActionKind::CodexIndexMerge)
                 .map(|action| action.target.as_path());
             merge_session_index(&source, &action.target, registered)?;
-            Ok(None)
+            Ok((None, Vec::new()))
         }
     }
 }
@@ -2840,6 +2846,12 @@ mod tests {
                     .to_string()],
             )
             .unwrap();
+        state_db
+            .execute(
+                "INSERT INTO thread_dynamic_tools VALUES('ghost', 0, 'bash')",
+                [],
+            )
+            .unwrap();
         drop(state_db);
         let source_index = source_root.join("index/session_index.jsonl");
         fs::create_dir_all(source_index.parent().unwrap()).unwrap();
@@ -2903,9 +2915,16 @@ mod tests {
         target_db.execute_batch("CREATE TABLE projects(id TEXT PRIMARY KEY,name TEXT NOT NULL,metadata TEXT NOT NULL,position INTEGER NOT NULL,created_at_ms INTEGER NOT NULL,updated_at_ms INTEGER NOT NULL); CREATE TABLE thread_sections(id TEXT PRIMARY KEY,name TEXT,updated_at INTEGER); CREATE TABLE threads(id TEXT PRIMARY KEY,rollout_path TEXT NOT NULL,created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,source TEXT NOT NULL,model_provider TEXT NOT NULL,cwd TEXT NOT NULL,title TEXT NOT NULL); CREATE TABLE thread_dynamic_tools(thread_id TEXT,position INTEGER,name TEXT,PRIMARY KEY(thread_id,position)); CREATE TABLE thread_spawn_edges(child_thread_id TEXT PRIMARY KEY,parent_thread_id TEXT,status TEXT);").unwrap();
         drop(target_db);
         let plan = build_install_plan(&manifest, "codex", Some(&home), &[], &root).unwrap();
+        let install_result = apply_install_plan(&root, plan, true).unwrap();
+        assert_eq!(install_result["file_verification"], "passed");
         assert_eq!(
-            apply_install_plan(&root, plan, true).unwrap()["file_verification"],
-            "passed"
+            install_result["codex_unregistered_threads"],
+            serde_json::json!([
+                {
+                    "id": "ghost",
+                    "reason": "rollout not in snapshot"
+                }
+            ])
         );
         let target_db = Connection::open(&target_state).unwrap();
         assert_eq!(
@@ -2913,6 +2932,16 @@ mod tests {
                 .query_row("SELECT COUNT(*) FROM threads", [], |r| r.get::<_, i64>(0))
                 .unwrap(),
             1
+        );
+        assert_eq!(
+            target_db
+                .query_row(
+                    "SELECT COUNT(*) FROM thread_dynamic_tools WHERE thread_id='ghost'",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
         );
         let index = fs::read_to_string(home.join(".codex/session_index.jsonl")).unwrap();
         assert!(index.contains("thread-1"));

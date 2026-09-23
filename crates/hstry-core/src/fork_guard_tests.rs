@@ -51,7 +51,7 @@ async fn fetched_archive_validation_requires_sqlite_integrity_and_schema() -> an
     Database::validate_hstry_database_file(&valid).await?;
 
     let garbage = tmp.path().join("garbage.db");
-    std::fs::write(&garbage, b"not a sqlite database")?;
+    std::fs::write(&garbage, vec![b'x'; 2_048])?;
     assert!(
         Database::validate_hstry_database_file(Path::new(&garbage))
             .await

@@ -245,17 +245,21 @@ async fn checkpoint_mutate_restore_preserves_sentinels() -> anyhow::Result<()> {
     );
     scratch_db.close().await;
 
-    // Restore the immutable checkpoint into a fresh slot. Replacing an
-    // existing closed slot and clearing stale WAL/SHM sidecars are covered by
-    // `wal_shm_lifecycle_closed_before_replace` below.
-    let restored_again = tmp_dir.join("restored-again.db");
+    // Restore over the mutated scratch database. Restore must replace the old
+    // contents and clear stale sidecars before reopening the restored copy.
+    let stale_wal = format!("{}-wal", scratch.display());
+    write_stale_sidecar(&scratch, "-wal").await?;
     restore_checkpoint(
         &tmp_dir.join("checkpoints"),
         &created.manifest.stem,
-        &restored_again,
+        &scratch,
     )?;
+    anyhow::ensure!(
+        !Path::new(&stale_wal).exists(),
+        "stale WAL sidecar must be removed by restore"
+    );
 
-    let restored = Database::open(&restored_again).await?;
+    let restored = Database::open(&scratch).await?;
     assert_sentinels_present(&restored).await?;
     anyhow::ensure!(
         restored.count_conversations().await? == 2,

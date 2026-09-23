@@ -425,11 +425,17 @@ pub async fn merge_databases(
         // Namespace the source_id
         let namespaced_source_id = format!("{}:{}", remote_name, conv.source_id);
 
-        // Check if conversation already exists (by external_id within namespaced source)
+        // Check if conversation already exists (by external_id within namespaced source, or by direct id match)
         let existing_id = if let Some(ref external_id) = conv.external_id {
             target
                 .get_conversation_id(&namespaced_source_id, external_id)
                 .await?
+        } else if let Ok(Some(existing_conv)) = target.get_conversation(conv.id).await {
+            if existing_conv.source_id == namespaced_source_id {
+                Some(conv.id)
+            } else {
+                None
+            }
         } else {
             None
         };
@@ -439,10 +445,17 @@ pub async fn merge_databases(
             if let Some(existing_conv) = target.get_conversation(existing_uuid).await? {
                 // Compare updated_at timestamps (newer wins)
                 let should_update = match (conv.updated_at, existing_conv.updated_at) {
-                    (Some(new_ts), Some(old_ts)) => new_ts > old_ts,
+                    (Some(new_ts), Some(old_ts)) => {
+                        new_ts > old_ts
+                            || (new_ts == old_ts && conv.version > existing_conv.version)
+                    }
                     (Some(_), None) => true,
                     (None, Some(_)) => false,
-                    (None, None) => conv.created_at > existing_conv.created_at,
+                    (None, None) => {
+                        conv.created_at > existing_conv.created_at
+                            || (conv.created_at == existing_conv.created_at
+                                && conv.version > existing_conv.version)
+                    }
                 };
                 if should_update {
                     conversations_updated += 1;
@@ -456,7 +469,7 @@ pub async fn merge_databases(
         } else {
             // New conversation
             conversations_added += 1;
-            (true, Uuid::new_v4())
+            (true, conv.id)
         };
 
         if should_insert {
@@ -557,25 +570,19 @@ pub struct DeltaExport {
     pub messages: usize,
     pub sources: usize,
     pub empty: bool,
-    /// Inclusive capture boundary used for the next watermark (export cut).
-    pub export_cut: DateTime<Utc>,
+    /// Inclusive capture boundary used for the next watermark (change cursor).
+    pub export_cut: i64,
 }
 
 pub fn push_watermark_key(remote_name: &str) -> String {
     format!("push_watermark:{remote_name}")
 }
 
-pub fn parse_watermark(value: &str) -> Option<DateTime<Utc>> {
-    DateTime::parse_from_rfc3339(value)
-        .ok()
-        .map(|dt| dt.with_timezone(&Utc))
-}
-
-/// Copy conversations/sources changed since `updated_after` into `dest_path`.
+/// Copy conversations/sources changed since `confirmed_cursor` into `dest_path`.
 pub async fn export_delta(
     source: &Database,
     dest_path: &Path,
-    updated_after: Option<DateTime<Utc>>,
+    confirmed_cursor: Option<i64>,
 ) -> Result<DeltaExport> {
     if let Some(parent) = dest_path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -584,53 +591,50 @@ pub async fn export_delta(
         std::fs::remove_file(dest_path)?;
     }
 
-    // Begin at a conservative cut before the consistent copy. Mutations that
-    // race the copy can be included now but remain pending next time; duplicate
-    // upserts are safe, while advancing past unseen mutations would lose data.
-    let export_cut = Utc::now();
     let snapshot_dir = tempfile::tempdir()?;
     let snapshot_path = snapshot_dir.path().join("source-snapshot.db");
     source.backup_to(&snapshot_path).await?;
     let source_snapshot = Database::open(&snapshot_path).await?;
-    let dest = Database::open(dest_path).await?;
-    let convs = source_snapshot
-        .list_conversations(crate::db::ListConversationsOptions {
-            updated_after,
-            ..Default::default()
-        })
-        .await?;
+    let cut = source_snapshot.get_max_local_change().await?.unwrap_or(0);
+
+    let convs = if let Some(since) = confirmed_cursor {
+        let changed_ids = source_snapshot
+            .get_changed_conversation_ids(since, cut)
+            .await?;
+        source_snapshot
+            .get_conversations_by_ids(&changed_ids)
+            .await?
+    } else {
+        source_snapshot
+            .list_conversations(crate::db::ListConversationsOptions::default())
+            .await?
+    };
+
     let conv_source_ids: HashSet<String> = convs.iter().map(|c| c.source_id.clone()).collect();
     let all_sources = source_snapshot.list_sources().await?;
     let sources_to_copy: Vec<_> = all_sources
         .into_iter()
         .filter(|s| {
-            if updated_after.is_none() {
+            if confirmed_cursor.is_none() {
                 return true;
             }
-            if conv_source_ids.contains(&s.id) {
-                return true;
-            }
-            match (s.last_sync_at, updated_after) {
-                (Some(ts), Some(watermark)) => ts >= watermark,
-                _ => false,
-            }
+            conv_source_ids.contains(&s.id)
         })
         .collect();
 
     if convs.is_empty() && sources_to_copy.is_empty() {
         source_snapshot.close().await;
-        dest.close().await;
-        let _ = std::fs::remove_file(dest_path);
         let _ = std::fs::remove_file(snapshot_path);
         return Ok(DeltaExport {
             conversations: 0,
             messages: 0,
             sources: 0,
             empty: true,
-            export_cut,
+            export_cut: cut,
         });
     }
 
+    let dest = Database::open(dest_path).await?;
     for source_row in &sources_to_copy {
         dest.upsert_source(source_row).await?;
     }
@@ -652,7 +656,7 @@ pub async fn export_delta(
         messages,
         sources: sources_to_copy.len(),
         empty: false,
-        export_cut,
+        export_cut: cut,
     })
 }
 
@@ -708,18 +712,18 @@ pub async fn sync_to_remote(
     full: bool,
 ) -> Result<SyncResult> {
     if full {
-        return sync_to_remote_full(local_db_path, config, device_namespace).await;
+        return sync_to_remote_full(local_db, local_db_path, config, device_namespace).await;
     }
 
     let transport = SshTransport::from_config(config);
     transport.test_connection()?;
 
     let namespace = crate::config::sanitize_device_namespace(device_namespace);
-    let watermark = match local_db
+    let watermark: Option<i64> = match local_db
         .get_search_state(&push_watermark_key(&config.name))
         .await?
     {
-        Some(raw) => parse_watermark(&raw),
+        Some(raw) => raw.trim().parse::<i64>().ok(),
         None => None,
     };
     let temp_dir = tempfile::tempdir()?;
@@ -728,10 +732,7 @@ pub async fn sync_to_remote(
     if export.empty {
         // No-change skip: record contact, but do not advance the push watermark.
         local_db
-            .set_search_state(
-                &format!("push_last_contact:{}", config.name),
-                &Utc::now().to_rfc3339(),
-            )
+            .record_push_contact(&config.name, Utc::now())
             .await?;
         return Ok(SyncResult {
             remote_name: config.name.clone(),
@@ -752,10 +753,7 @@ pub async fn sync_to_remote(
     let inbox = remote_inbox_dir(&expanded_path);
     transport.exec(&format!("mkdir -p {}", shell_quote(&inbox)))?;
 
-    let remote_delta = format!(
-        "{inbox}/{namespace}-{}.db",
-        export.export_cut.timestamp_millis()
-    );
+    let remote_delta = format!("{inbox}/{namespace}-{}.db", export.export_cut);
     transport.push_file(&delta_path, &remote_delta)?;
 
     let ingest_cmd = format!(
@@ -776,7 +774,8 @@ pub async fn sync_to_remote(
                     "hub ingest not available on remote; falling back to whole-file push"
                 );
                 let _ = transport.exec(&format!("rm -f {}", shell_quote(&remote_delta)));
-                return sync_to_remote_full(local_db_path, config, device_namespace).await;
+                return sync_to_remote_full(local_db, local_db_path, config, device_namespace)
+                    .await;
             }
             return Err(err);
         }
@@ -800,19 +799,9 @@ pub async fn sync_to_remote(
     sync_result.remote_name = config.name.clone();
     sync_result.direction = SyncDirection::Push;
 
-    // Advance ONLY after hub commit succeeded. Use the export cut, never wall
-    // time after the remote push, so concurrent mutations remain pending.
+    // Advance ONLY after hub commit succeeded. Use the export cut cursor.
     local_db
-        .set_search_state(
-            &push_watermark_key(&config.name),
-            &export.export_cut.to_rfc3339(),
-        )
-        .await?;
-    local_db
-        .set_search_state(
-            &format!("push_last_confirmed:{}", config.name),
-            &Utc::now().to_rfc3339(),
-        )
+        .record_push_success(&config.name, export.export_cut, Utc::now())
         .await?;
 
     Ok(sync_result)
@@ -859,10 +848,12 @@ async fn validate_hstry_database(path: &Path) -> Result<()> {
 
 /// Legacy push: fetch hub, merge locally, SCP the whole file back.
 pub async fn sync_to_remote_full(
+    local_db: &Database,
     local_db_path: &Path,
     config: &RemoteConfig,
     device_namespace: &str,
 ) -> Result<SyncResult> {
+    let cut_cursor = local_db.get_max_local_change().await?.unwrap_or(0);
     let transport = SshTransport::from_config(config);
     transport.test_connection()?;
 
@@ -904,6 +895,10 @@ pub async fn sync_to_remote_full(
         shell_quote(&incoming),
         shell_quote(&expanded_path)
     ))?;
+
+    local_db
+        .record_push_success(&config.name, cut_cursor, Utc::now())
+        .await?;
 
     Ok(SyncResult {
         remote_name: config.name.clone(),
@@ -1456,6 +1451,8 @@ mod tests {
         .await
         .unwrap();
 
+        let old_cursor = src.get_max_local_change().await.unwrap().unwrap();
+
         let new_ts = Utc::now();
         let new_conv = Conversation {
             id: Uuid::new_v4(),
@@ -1501,13 +1498,12 @@ mod tests {
         .await
         .unwrap();
 
-        let watermark = Utc::now() - chrono::Duration::hours(1);
         let delta_path = dir.path().join("delta.db");
-        let export = export_delta(&src, &delta_path, Some(watermark))
+        let export = export_delta(&src, &delta_path, Some(old_cursor))
             .await
             .unwrap();
         assert_eq!(export.conversations, 1);
-        assert!(export.export_cut <= Utc::now());
+        assert!(export.export_cut > old_cursor);
         src.close().await;
 
         let delta = Database::open(&delta_path).await.unwrap();
@@ -1518,6 +1514,191 @@ mod tests {
         assert_eq!(convs.len(), 1);
         assert_eq!(convs[0].external_id.as_deref(), Some("new"));
         delta.close().await;
+    }
+
+    #[tokio::test]
+    async fn export_delta_includes_historical_import_after_confirmed_push() {
+        use crate::models::Source;
+
+        let dir = tempfile::tempdir().unwrap();
+        let src_path = dir.path().join("src.db");
+        let src = Database::open(&src_path).await.unwrap();
+        let source = Source {
+            id: "src-hist".to_string(),
+            adapter: "cursor".to_string(),
+            path: None,
+            last_sync_at: None,
+            config: serde_json::json!({}),
+        };
+        src.upsert_source(&source).await.unwrap();
+
+        // 1. Initial conversation
+        let now = Utc::now();
+        let c1 = Conversation {
+            id: Uuid::new_v4(),
+            source_id: source.id.clone(),
+            external_id: Some("c1".to_string()),
+            readable_id: None,
+            platform_id: None,
+            title: Some("c1".to_string()),
+            created_at: now,
+            updated_at: Some(now),
+            model: None,
+            provider: None,
+            workspace: None,
+            tokens_in: None,
+            tokens_out: None,
+            cost_usd: None,
+            metadata: serde_json::json!({}),
+            harness: None,
+            version: 0,
+            message_count: 0,
+            parent_conversation_id: None,
+            parent_message_idx: None,
+            fork_type: None,
+        };
+        src.upsert_conversation(&c1).await.unwrap();
+
+        let delta1_path = dir.path().join("delta1.db");
+        let export1 = export_delta(&src, &delta1_path, None).await.unwrap();
+        assert_eq!(export1.conversations, 1);
+        src.record_push_success("hub", export1.export_cut, Utc::now())
+            .await
+            .unwrap();
+
+        // 2. Import a conversation with created_at/updated_at years in the past
+        let ancient = Utc::now() - chrono::Duration::days(5 * 365);
+        let c_hist = Conversation {
+            id: Uuid::new_v4(),
+            source_id: source.id.clone(),
+            external_id: Some("ancient".to_string()),
+            readable_id: None,
+            platform_id: None,
+            title: Some("ancient".to_string()),
+            created_at: ancient,
+            updated_at: Some(ancient),
+            model: None,
+            provider: None,
+            workspace: None,
+            tokens_in: None,
+            tokens_out: None,
+            cost_usd: None,
+            metadata: serde_json::json!({}),
+            harness: None,
+            version: 0,
+            message_count: 0,
+            parent_conversation_id: None,
+            parent_message_idx: None,
+            fork_type: None,
+        };
+        src.upsert_conversation(&c_hist).await.unwrap();
+
+        // 3. Next export delta with confirmed watermark export1.export_cut MUST include c_hist!
+        let delta2_path = dir.path().join("delta2.db");
+        let export2 = export_delta(&src, &delta2_path, Some(export1.export_cut))
+            .await
+            .unwrap();
+        assert_eq!(export2.conversations, 1);
+
+        let delta2 = Database::open(&delta2_path).await.unwrap();
+        let exported_convs = delta2
+            .list_conversations(crate::db::ListConversationsOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(exported_convs.len(), 1);
+        assert_eq!(exported_convs[0].external_id.as_deref(), Some("ancient"));
+        delta2.close().await;
+        src.close().await;
+    }
+
+    #[tokio::test]
+    async fn conversation_written_after_snapshot_cut_stays_pending() {
+        use crate::models::Source;
+
+        let dir = tempfile::tempdir().unwrap();
+        let src_path = dir.path().join("src.db");
+        let src = Database::open(&src_path).await.unwrap();
+        let source = Source {
+            id: "src-pending".to_string(),
+            adapter: "cursor".to_string(),
+            path: None,
+            last_sync_at: None,
+            config: serde_json::json!({}),
+        };
+        src.upsert_source(&source).await.unwrap();
+
+        let now = Utc::now();
+        let c1 = Conversation {
+            id: Uuid::new_v4(),
+            source_id: source.id.clone(),
+            external_id: Some("c1".to_string()),
+            readable_id: None,
+            platform_id: None,
+            title: Some("c1".to_string()),
+            created_at: now,
+            updated_at: Some(now),
+            model: None,
+            provider: None,
+            workspace: None,
+            tokens_in: None,
+            tokens_out: None,
+            cost_usd: None,
+            metadata: serde_json::json!({}),
+            harness: None,
+            version: 0,
+            message_count: 0,
+            parent_conversation_id: None,
+            parent_message_idx: None,
+            fork_type: None,
+        };
+        src.upsert_conversation(&c1).await.unwrap();
+
+        // Snapshot cut happens during export
+        let delta_path = dir.path().join("delta.db");
+        let export = export_delta(&src, &delta_path, None).await.unwrap();
+
+        // While upload is in flight, write c2
+        let c2 = Conversation {
+            id: Uuid::new_v4(),
+            source_id: source.id.clone(),
+            external_id: Some("c2".to_string()),
+            readable_id: None,
+            platform_id: None,
+            title: Some("c2".to_string()),
+            created_at: now,
+            updated_at: Some(now),
+            model: None,
+            provider: None,
+            workspace: None,
+            tokens_in: None,
+            tokens_out: None,
+            cost_usd: None,
+            metadata: serde_json::json!({}),
+            harness: None,
+            version: 0,
+            message_count: 0,
+            parent_conversation_id: None,
+            parent_message_idx: None,
+            fork_type: None,
+        };
+        src.upsert_conversation(&c2).await.unwrap();
+
+        // Upload completes for export.export_cut only
+        src.record_push_success("hub", export.export_cut, Utc::now())
+            .await
+            .unwrap();
+
+        // Source must stay pending!
+        let updated_source = src.get_source("src-pending").await.unwrap().unwrap();
+        let cfg = &updated_source.config;
+        assert_eq!(
+            cfg.get("last_confirmed_cursor").and_then(|v| v.as_i64()),
+            Some(export.export_cut)
+        );
+        let local_cursor = cfg.get("local_cursor").and_then(|v| v.as_i64()).unwrap();
+        assert!(local_cursor > export.export_cut);
+        assert_eq!(cfg.get("pending").and_then(|v| v.as_bool()), Some(true));
+        src.close().await;
     }
 
     #[tokio::test]
@@ -1825,13 +2006,10 @@ mod tests {
     async fn empty_export_records_cut_without_requiring_remote_push() {
         let dir = tempfile::tempdir().unwrap();
         let src = Database::open(&dir.path().join("src.db")).await.unwrap();
-        let watermark = Utc::now();
         let delta_path = dir.path().join("delta.db");
-        let export = export_delta(&src, &delta_path, Some(watermark))
-            .await
-            .unwrap();
+        let export = export_delta(&src, &delta_path, Some(0)).await.unwrap();
         assert!(export.empty);
-        assert!(export.export_cut >= watermark);
+        assert_eq!(export.export_cut, 0);
         src.close().await;
     }
 

@@ -93,7 +93,17 @@ impl Provenance {
                 .or_else(|| source.config.get("last_ingest_error"))
                 .and_then(Value::as_str)
                 .map(str::to_owned),
-            pending: source.config.get("pending").and_then(Value::as_bool),
+            pending: if let (Some(local), Some(confirmed)) = (
+                source.config.get("local_cursor").and_then(Value::as_i64),
+                source
+                    .config
+                    .get("last_confirmed_cursor")
+                    .and_then(Value::as_i64),
+            ) {
+                Some(local > confirmed)
+            } else {
+                source.config.get("pending").and_then(Value::as_bool)
+            },
         }
     }
 }

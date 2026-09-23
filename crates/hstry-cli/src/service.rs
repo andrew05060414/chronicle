@@ -1232,7 +1232,8 @@ struct ServiceState {
     auto_sync_by_id: HashMap<String, bool>,
     watcher: RecommendedWatcher,
     event_rx: mpsc::Receiver<PathBuf>,
-    last_remote_sync: Instant,
+    last_remote_sync: Option<Instant>,
+    last_remote_sync_failed: bool,
     /// Run expensive workspace discovery infrequently to avoid idle CPU spikes.
     last_workspace_discovery: Instant,
     /// Track when the last event-triggered sync completed to enforce a cooldown.
@@ -1307,7 +1308,8 @@ impl ServiceState {
             auto_sync_by_id,
             watcher,
             event_rx,
-            last_remote_sync: Instant::now(),
+            last_remote_sync: None,
+            last_remote_sync_failed: false,
             last_workspace_discovery: instant_ago(3600),
             last_event_sync: instant_ago(300), // allow immediate first sync when uptime allows
             source_backoff: HashMap::new(),
@@ -1536,11 +1538,17 @@ impl ServiceState {
             return Ok(());
         }
 
-        let interval_secs = self.config.sync.auto_sync_interval_secs.max(60);
-        if self.last_remote_sync.elapsed() < Duration::from_secs(interval_secs) {
+        let interval_secs = if self.last_remote_sync_failed {
+            300 // 5-minute fallback on remote sync error
+        } else {
+            self.config.sync.auto_sync_interval_secs.max(60)
+        };
+        if let Some(last) = self.last_remote_sync
+            && last.elapsed() < Duration::from_secs(interval_secs)
+        {
             return Ok(());
         }
-        self.last_remote_sync = Instant::now();
+        self.last_remote_sync = Some(Instant::now());
 
         let direction = match self.config.sync.mode {
             hstry_core::config::SyncMode::Hub => hstry_core::remote::SyncDirection::Pull,
@@ -1558,8 +1566,9 @@ impl ServiceState {
             self.config.remotes.iter().filter(|r| r.enabled).collect()
         };
 
+        let mut any_error = false;
         for remote_config in remotes {
-            let _ = match direction {
+            let res = match direction {
                 hstry_core::remote::SyncDirection::Pull => {
                     hstry_core::remote::sync_from_remote(&self.db, remote_config)
                         .await
@@ -1576,7 +1585,21 @@ impl ServiceState {
                 .map(|_| ()),
                 hstry_core::remote::SyncDirection::Bidirectional => Ok(()),
             };
+
+            if let Err(err) = res {
+                any_error = true;
+                tracing::warn!(remote = %remote_config.name, error = %err, "remote sync failed");
+                let error_msg = err.to_string();
+                if let Err(e) = self
+                    .db
+                    .record_push_error(&remote_config.name, chrono::Utc::now(), &error_msg)
+                    .await
+                {
+                    tracing::error!(error = %e, "failed to record push error in db");
+                }
+            }
         }
+        self.last_remote_sync_failed = any_error;
 
         Ok(())
     }
@@ -2468,6 +2491,103 @@ mod tests {
         let body: serde_json::Value = resp.json().await?;
         assert_eq!(body["status"], "ok");
         handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sync_remotes_first_run_immediate_and_fallback_on_error() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let db_path = dir.path().join("service_remote_sync.db");
+        let db = Arc::new(Database::open(&db_path).await?);
+        let source = hstry_core::models::Source {
+            id: "src1".into(),
+            adapter: "pi".into(),
+            path: None,
+            last_sync_at: None,
+            config: serde_json::json!({}),
+        };
+        db.upsert_source(&source).await?;
+
+        let mut config = Config {
+            database: db_path.clone(),
+            ..Default::default()
+        };
+        config.sync.mode = hstry_core::config::SyncMode::Satellite;
+        config.sync.auto_sync = true;
+        config.sync.hub_remote = Some("hub".into());
+        config.remotes.push(hstry_core::config::RemoteConfig {
+            name: "hub".into(),
+            host: "127.0.0.1".into(),
+            port: Some(1), // will fail connection immediately
+            identity_file: None,
+            database_path: None,
+            enabled: true,
+        });
+
+        let (event_tx, event_rx) = mpsc::channel(64);
+        let watcher = build_watcher(event_tx)?;
+        let mut state = ServiceState {
+            config_path: dir.path().join("config.toml"),
+            config,
+            config_mtime: None,
+            db: db.clone(),
+            runner: AdapterRunner::new(
+                Runtime::from_kind(hstry_runtime::RuntimeKind::Node),
+                vec![],
+            ),
+            enabled_adapters: HashSet::new(),
+            auto_sync_by_id: HashMap::new(),
+            watcher,
+            event_rx,
+            last_remote_sync: None,
+            last_remote_sync_failed: false,
+            last_workspace_discovery: instant_ago(3600),
+            last_event_sync: instant_ago(300),
+            source_backoff: HashMap::new(),
+            source_quiet_until: HashMap::new(),
+            source_schedule: HashMap::new(),
+            sync_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
+            metrics: Arc::new(tokio::sync::Mutex::new(ServiceMetrics::default())),
+            last_events_compaction: instant_ago(86400),
+        };
+
+        // 1. Initial state: last_remote_sync is None (first run must be immediate)
+        assert!(state.last_remote_sync.is_none());
+        assert!(!state.last_remote_sync_failed);
+
+        // 2. Run sync_remotes_if_due. Because port 1 is unreachable, sync will fail.
+        let res = state.sync_remotes_if_due().await;
+        assert!(
+            res.is_ok(),
+            "sync_remotes_if_due handles remote errors internally without crashing"
+        );
+
+        // 3. Verify error is persisted and fallback engaged
+        assert!(
+            state.last_remote_sync.is_some(),
+            "last_remote_sync was recorded"
+        );
+        assert!(
+            state.last_remote_sync_failed,
+            "last_remote_sync_failed was flagged on error"
+        );
+
+        // Error persisted in database search state
+        let last_err = db.get_search_state("push_last_error:hub").await?;
+        assert!(last_err.is_some(), "error persisted in search_state");
+
+        // Error persisted in source config
+        let updated_src = db.get_source("src1").await?.unwrap();
+        assert!(updated_src.config.get("last_error").is_some());
+
+        // 4. Second immediate call must be skipped because of 5-minute fallback
+        let prev_sync_time = state.last_remote_sync;
+        state.sync_remotes_if_due().await?;
+        assert_eq!(
+            state.last_remote_sync, prev_sync_time,
+            "remote sync skipped during 5-minute fallback period"
+        );
+
         Ok(())
     }
 }

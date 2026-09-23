@@ -5,7 +5,7 @@ use crate::models::{
     Conversation, ConversationSnapshot, Message, MessageEvent, MessageRole, SearchHit, Source,
 };
 use crate::schema::SCHEMA;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{Row, SqlitePool};
 use std::fmt::Write;
@@ -283,6 +283,10 @@ impl Database {
             (
                 "013_indexer_outbox_and_events_retention.sql",
                 include_str!("../migrations/013_indexer_outbox_and_events_retention.sql"),
+            ),
+            (
+                "014_add_local_changes.sql",
+                include_str!("../migrations/014_add_local_changes.sql"),
             ),
         ];
 
@@ -1179,6 +1183,207 @@ impl Database {
             .fetch_one(&self.pool)
             .await?;
         Ok(count.0)
+    }
+
+    /// Get the maximum local change cursor.
+    pub async fn get_max_local_change(&self) -> Result<Option<i64>> {
+        let row: Option<(Option<i64>,)> =
+            sqlx::query_as("SELECT MAX(change_id) FROM local_changes")
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(row.and_then(|r| r.0))
+    }
+
+    /// Get the maximum local change cursor for a specific source.
+    pub async fn get_max_local_change_for_source(&self, source_id: &str) -> Result<Option<i64>> {
+        let row: Option<(Option<i64>,)> =
+            sqlx::query_as("SELECT MAX(change_id) FROM local_changes WHERE source_id = ?")
+                .bind(source_id)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(row.and_then(|r| r.0))
+    }
+
+    /// Get distinct conversation IDs changed strictly between `since_change_id` and `up_to_change_id`.
+    pub async fn get_changed_conversation_ids(
+        &self,
+        since_change_id: i64,
+        up_to_change_id: i64,
+    ) -> Result<Vec<String>> {
+        let rows = sqlx::query(
+            "SELECT DISTINCT conversation_id FROM local_changes WHERE change_id > ? AND change_id <= ? ORDER BY change_id ASC",
+        )
+        .bind(since_change_id)
+        .bind(up_to_change_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(|r| r.get("conversation_id")).collect())
+    }
+
+    /// Get conversations by their string UUIDs.
+    pub async fn get_conversations_by_ids(&self, ids: &[String]) -> Result<Vec<Conversation>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut convs = Vec::with_capacity(ids.len());
+        for chunk in ids.chunks(500) {
+            let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let sql = format!("SELECT * FROM conversations WHERE id IN ({placeholders})");
+            let mut query = sqlx::query(&sql);
+            for id in chunk {
+                query = query.bind(id);
+            }
+            let rows = query.fetch_all(&self.pool).await?;
+            for row in rows {
+                convs.push(conversation_from_row(&row));
+            }
+        }
+        Ok(convs)
+    }
+
+    /// Record successful remote push for local sources and advance confirmation.
+    pub async fn record_push_success(
+        &self,
+        remote_name: &str,
+        confirmed_cursor: i64,
+        confirmed_at: DateTime<Utc>,
+    ) -> Result<()> {
+        let confirmed_rfc = confirmed_at.to_rfc3339();
+        self.set_search_state(
+            &crate::remote::push_watermark_key(remote_name),
+            &confirmed_cursor.to_string(),
+        )
+        .await?;
+        self.set_search_state(
+            &format!("push_last_confirmed:{remote_name}"),
+            &confirmed_rfc,
+        )
+        .await?;
+        self.set_search_state(&format!("push_last_contact:{remote_name}"), &confirmed_rfc)
+            .await?;
+        self.delete_search_state(&format!("push_last_error:{remote_name}"))
+            .await?;
+
+        let sources = self.list_sources().await?;
+        for mut source in sources {
+            if source.id.contains(':') {
+                continue;
+            }
+            let mut config = match source.config {
+                serde_json::Value::Object(map) => map,
+                _ => serde_json::Map::default(),
+            };
+            config.insert(
+                "last_confirmed_remote_at".into(),
+                confirmed_rfc.clone().into(),
+            );
+            config.insert("last_contact_at".into(), confirmed_rfc.clone().into());
+            config.insert("last_error".into(), serde_json::Value::Null);
+            config.insert("last_confirmed_cursor".into(), confirmed_cursor.into());
+
+            let local_max = self
+                .get_max_local_change_for_source(&source.id)
+                .await?
+                .unwrap_or(0);
+            config.insert("local_cursor".into(), local_max.into());
+            config.insert("pending".into(), (local_max > confirmed_cursor).into());
+
+            source.config = serde_json::Value::Object(config);
+            self.upsert_source(&source).await?;
+        }
+        Ok(())
+    }
+
+    /// Record remote push error: record per-source last_error + last_contact and keep pending.
+    /// Confirmation is unchanged.
+    pub async fn record_push_error(
+        &self,
+        remote_name: &str,
+        contact_at: DateTime<Utc>,
+        error_msg: &str,
+    ) -> Result<()> {
+        let contact_rfc = contact_at.to_rfc3339();
+        let _ = self
+            .set_search_state(&format!("push_last_error:{remote_name}"), error_msg)
+            .await;
+        let _ = self
+            .set_search_state(&format!("push_last_contact:{remote_name}"), &contact_rfc)
+            .await;
+
+        let sources = self.list_sources().await?;
+        for mut source in sources {
+            if source.id.contains(':') {
+                continue;
+            }
+            let mut config = match source.config {
+                serde_json::Value::Object(map) => map,
+                _ => serde_json::Map::default(),
+            };
+            config.insert("last_contact_at".into(), contact_rfc.clone().into());
+            config.insert("last_error".into(), error_msg.to_string().into());
+
+            // Confirmation remains UNCHANGED!
+            let confirmed_cursor = config
+                .get("last_confirmed_cursor")
+                .and_then(serde_json::Value::as_i64);
+            let local_max = self
+                .get_max_local_change_for_source(&source.id)
+                .await?
+                .unwrap_or(0);
+            config.insert("local_cursor".into(), local_max.into());
+            if let Some(confirmed) = confirmed_cursor {
+                config.insert("pending".into(), (local_max > confirmed).into());
+            } else {
+                config.insert("pending".into(), true.into());
+            }
+
+            source.config = serde_json::Value::Object(config);
+            self.upsert_source(&source).await?;
+        }
+        Ok(())
+    }
+
+    /// Record remote push contact when delta export is empty (no changes).
+    pub async fn record_push_contact(
+        &self,
+        remote_name: &str,
+        contact_at: DateTime<Utc>,
+    ) -> Result<()> {
+        let contact_rfc = contact_at.to_rfc3339();
+        let _ = self
+            .set_search_state(&format!("push_last_contact:{remote_name}"), &contact_rfc)
+            .await;
+        let _ = self
+            .delete_search_state(&format!("push_last_error:{remote_name}"))
+            .await;
+        let sources = self.list_sources().await?;
+        for mut source in sources {
+            if source.id.contains(':') {
+                continue;
+            }
+            let mut config = match source.config {
+                serde_json::Value::Object(map) => map,
+                _ => serde_json::Map::default(),
+            };
+            config.insert("last_contact_at".into(), contact_rfc.clone().into());
+            config.insert("last_error".into(), serde_json::Value::Null);
+
+            let confirmed_cursor = config
+                .get("last_confirmed_cursor")
+                .and_then(serde_json::Value::as_i64);
+            let local_max = self
+                .get_max_local_change_for_source(&source.id)
+                .await?
+                .unwrap_or(0);
+            config.insert("local_cursor".into(), local_max.into());
+            if let Some(confirmed) = confirmed_cursor {
+                config.insert("pending".into(), (local_max > confirmed).into());
+            }
+
+            source.config = serde_json::Value::Object(config);
+            self.upsert_source(&source).await?;
+        }
+        Ok(())
     }
 
     /// Count conversations and messages for a specific source.
@@ -2267,6 +2472,14 @@ impl Database {
         .bind(value)
         .execute(&self.pool)
         .await?;
+        Ok(())
+    }
+
+    pub async fn delete_search_state(&self, key: &str) -> Result<()> {
+        sqlx::query("DELETE FROM search_state WHERE key = ?")
+            .bind(key)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 

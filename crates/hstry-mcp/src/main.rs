@@ -16,6 +16,40 @@ use hstry_core::Config;
 #[cfg(test)]
 mod recall_tests;
 
+async fn refresh_local_via_cli(config_path: Option<&PathBuf>) -> anyhow::Result<()> {
+    use std::process::Stdio;
+    use tokio::process::Command;
+    let mut cmd = Command::new("hstry");
+    cmd.arg("sync")
+        .arg("--json")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    if let Some(path) = config_path_hint(config_path) {
+        cmd.arg("--config").arg(path);
+    }
+    let child = cmd.spawn()?;
+    match tokio::time::timeout(std::time::Duration::from_secs(5), child.wait_with_output()).await {
+        Ok(Ok(output)) if output.status.success() => Ok(()),
+        Ok(Ok(output)) => Err(anyhow::anyhow!(
+            "hstry sync failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )),
+        Ok(Err(err)) => Err(err.into()),
+        Err(_) => Err(anyhow::anyhow!("local refresh timed out after 5s")),
+    }
+}
+
+fn config_path_hint(explicit: Option<&PathBuf>) -> Option<std::path::PathBuf> {
+    // Best-effort: if the process was started with an explicit config path via
+    // HSTRY_CONFIG, reuse it for the child sync. Otherwise let hstry resolve defaults.
+    if let Some(path) = explicit {
+        return Some(path.clone());
+    }
+    std::env::var_os("HSTRY_CONFIG").map(PathBuf::from)
+}
+
 fn main() {
     if let Err(err) = try_main() {
         let _ = writeln!(io::stderr(), "{err:?}");
@@ -33,7 +67,7 @@ async fn try_main() -> Result<()> {
     let config = Config::ensure_at(&config_path)?;
 
     let db = hstry_core::Database::open(&config.database).await?;
-    let server = McpServer::new(config, db);
+    let server = McpServer::new(config, db, Some(config_path));
     let transport = stdio();
 
     server
@@ -76,6 +110,10 @@ struct SearchRequest {
     after: Option<String>,
     before: Option<String>,
     remote: Option<String>,
+    /// local, remote, or all. Default: local+configured hub when hub is set.
+    scope: Option<String>,
+    /// Refresh local collection before search (local only, <=5s, never remote push).
+    refresh_local: Option<bool>,
     limit: Option<i64>,
     offset: Option<i64>,
     max_chars: Option<usize>,
@@ -107,14 +145,16 @@ struct McpServer {
     config: Config,
     db: std::sync::Arc<hstry_core::Database>,
     tool_router: ToolRouter<Self>,
+    config_path: Option<PathBuf>,
 }
 
 impl McpServer {
-    fn new(config: Config, db: hstry_core::Database) -> Self {
+    fn new(config: Config, db: hstry_core::Database, config_path: Option<PathBuf>) -> Self {
         Self {
             config,
             db: std::sync::Arc::new(db),
             tool_router: Self::tool_router(),
+            config_path,
         }
     }
 }
@@ -153,17 +193,81 @@ impl McpServer {
                 after: req.after.map(|s| s.parse()).transpose()?,
                 before: req.before.map(|s| s.parse()).transpose()?,
             };
-            let mut report = if let Some(name) = req.remote {
-                let remote = self
-                    .config
-                    .remotes
-                    .iter()
-                    .find(|r| r.name == name && r.enabled)
-                    .ok_or_else(|| anyhow::anyhow!("Unknown or disabled remote"))?;
-                hstry_core::remote::search_remote(remote, &req.query, &opts).await?
+            let mut refresh_warnings = Vec::new();
+            if req.refresh_local.unwrap_or(false) {
+                match refresh_local_via_cli(self.config_path.as_ref()).await {
+                    Ok(()) => {}
+                    Err(err) => refresh_warnings.push(format!(
+                        "refresh-local warning: {err}; continuing with existing local snapshot"
+                    )),
+                }
+            }
+
+            let explicit_remote = req.remote.clone();
+            let remotes = if let Some(name) = &explicit_remote {
+                vec![name.clone()]
             } else {
-                self.db.search_report(&req.query, opts).await?
+                Vec::new()
             };
+            let scope = if explicit_remote.is_some() {
+                hstry_core::config::SearchScope::Remote
+            } else {
+                let explicit = match req.scope.as_deref() {
+                    Some("local") => Some(hstry_core::config::SearchScope::Local),
+                    Some("remote") => Some(hstry_core::config::SearchScope::Remote),
+                    Some("all") => Some(hstry_core::config::SearchScope::All),
+                    Some(_) => anyhow::bail!("Invalid search scope"),
+                    None => None,
+                };
+                self.config.resolve_search_scope(explicit)
+            };
+
+            if let Some(offset) = req.offset
+                && offset > 0
+                && !matches!(scope, hstry_core::config::SearchScope::Local)
+                && !(matches!(scope, hstry_core::config::SearchScope::Remote) && remotes.len() == 1)
+            {
+                anyhow::bail!(
+                    "Pagination requires a local search or one named remote; page each store separately"
+                );
+            }
+
+            let need_local = !matches!(scope, hstry_core::config::SearchScope::Remote);
+            let need_remote = !matches!(scope, hstry_core::config::SearchScope::Local);
+            let remote_list = if need_remote {
+                Some(self.config.remotes_for_search(&remotes)?)
+            } else {
+                None
+            };
+
+            let local_fut = async {
+                if need_local {
+                    Some(self.db.search_report(&req.query, opts.clone()).await)
+                } else {
+                    None
+                }
+            };
+            let remote_fut = async {
+                if let Some(list) = remote_list.as_ref() {
+                    if list.is_empty() || !list.iter().any(|r| r.enabled) {
+                        Some(Err(hstry_core::Error::Other(
+                            "No enabled remotes to search".into(),
+                        )))
+                    } else {
+                        Some(hstry_core::remote::search_remotes(list, &req.query, &opts).await)
+                    }
+                } else {
+                    None
+                }
+            };
+            let (local, remote) = tokio::join!(local_fut, remote_fut);
+            let mut report = hstry_core::recall::combine_scoped_reports(
+                scope,
+                &remotes,
+                local,
+                remote,
+            )?;
+            report.warnings.splice(0..0, refresh_warnings);
             report.available_remotes = self
                 .config
                 .remotes

@@ -12,3 +12,6 @@ node_modules/
 dry-run*.txt
 parse-limit*.json
 
+# Native backup experiments may contain private restored conversations.
+/tmp/
+

@@ -54,13 +54,16 @@ echo "== pre-pr: cargo test --workspace --all-targets --no-fail-fast"
 cargo test --workspace --all-targets --no-fail-fast
 
 echo "== pre-pr: memory-integrity gate (explicit)"
-cargo test -p hstry-core --test memory_integrity --no-fail-fast
+cargo test -p hstry-core --test memory_integrity --no-fail-fast -- --test-threads=1
 
 if command -v bun >/dev/null 2>&1; then
   echo "== pre-pr: adapter fixtures (bun)"
   bun run adapters/cursor/test.js
+  test "$?" -eq 0 || { echo "pre-pr: cursor adapter fixture failed" >&2; exit 1; }
   bun run adapters/gemini-cli/test.js
+  test "$?" -eq 0 || { echo "pre-pr: gemini-cli adapter fixture failed" >&2; exit 1; }
   bun run adapters/workbuddy/test.js
+  test "$?" -eq 0 || { echo "pre-pr: workbuddy adapter fixture failed" >&2; exit 1; }
 else
   echo "pre-pr: bun not installed; skipping bun adapter fixtures (CI runs them)"
 fi
@@ -68,6 +71,7 @@ fi
 if command -v node >/dev/null 2>&1; then
   echo "== pre-pr: adapter regressions (node)"
   bash ./scripts/ci/run-adapter-regressions.sh
+  test "$?" -eq 0 || { echo "pre-pr: adapter regressions failed" >&2; exit 1; }
 else
   echo "pre-pr: node not installed; cannot run *.regression.mjs gate" >&2
   exit 1

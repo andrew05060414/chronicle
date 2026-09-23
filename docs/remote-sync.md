@@ -22,7 +22,7 @@ If the hub binary is older than this change (`hstry hub` missing), the satellite
 
 Pull is unchanged: fetch hub → merge into local staging with the remote name as namespace.
 
-Conflict resolution inside a namespace uses `updated_at` (newer wins).
+Conflict resolution inside a namespace uses `updated_at` (newer wins) for metadata. Message provenance and source identity remain explicit; exact duplicate hits are folded only when source, machine, message anchor and content match. The push watermark advances only after the hub commits the exported cut.
 
 ---
 

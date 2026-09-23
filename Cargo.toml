@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
   "crates/hstry-core",
+  "crates/chronicle-backup",
   "crates/hstry-runtime",
   "crates/hstry-cli",
   "crates/hstry-tui",
@@ -80,6 +81,7 @@ rmcp = { version = "0.14", features = ["server", "transport-io"] }
 # Internal crates
 hstry-core = { path = "crates/hstry-core" }
 hstry-runtime = { path = "crates/hstry-runtime" }
+hstry-api = { path = "crates/hstry-api" }
 
 # ============================================
 # STANDARD PRESET - rust-magic-linter

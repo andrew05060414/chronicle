@@ -456,13 +456,14 @@ impl Config {
         self.sync.mode == SyncMode::Satellite && self.sync.hub_remote.is_some()
     }
 
-    /// Explicit scope wins; satellite + `hub_remote` defaults to remote; otherwise local.
+    /// Explicit scope wins; satellite + `hub_remote` defaults to local+hub; otherwise local.
     pub fn resolve_search_scope(&self, explicit: Option<SearchScope>) -> SearchScope {
         if let Some(scope) = explicit {
             return scope;
         }
         if self.prefers_hub_search() {
-            SearchScope::Remote
+            // Ordinary satellite search covers local plus the configured hub in parallel.
+            SearchScope::All
         } else {
             SearchScope::Local
         }
@@ -553,7 +554,7 @@ impl Default for SyncConfig {
             device_id: None,
             hub_remote: None,
             auto_sync: false,
-            auto_sync_interval_secs: 300,
+            auto_sync_interval_secs: 60,
         }
     }
 }
@@ -861,6 +862,18 @@ pub struct ServiceConfig {
     #[serde(default)]
     pub transport: ServiceTransport,
 
+    /// Expose local HTTP API (for ingest and browser extensions).
+    #[serde(default = "default_true")]
+    pub http_api: bool,
+
+    /// Optional port for HTTP API (defaults to 3000 if unset).
+    #[serde(default = "default_http_port")]
+    pub http_port: Option<u16>,
+
+    /// Optional auth token for HTTP API /ingest.
+    #[serde(default)]
+    pub http_token: Option<String>,
+
     /// Per-source adaptive scheduling parameters (trx-z42c.1).
     #[serde(default)]
     pub scheduler: SchedulerConfig,
@@ -934,14 +947,21 @@ impl Default for ServiceConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            poll_interval_secs: 1_200,
+            poll_interval_secs: 300,
             search_api: true,
             search_port: None,
             transport: ServiceTransport::Tcp,
+            http_api: true,
+            http_port: Some(3000),
+            http_token: None,
             scheduler: SchedulerConfig::default(),
             resources: ResourceConfig::default(),
         }
     }
+}
+
+fn default_http_port() -> Option<u16> {
+    Some(3000)
 }
 
 fn default_true() -> bool {

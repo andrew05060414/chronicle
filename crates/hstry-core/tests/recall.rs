@@ -97,7 +97,8 @@ async fn literal_tool_evidence_is_anchored_and_budgeted() -> anyhow::Result<()> 
                 completeness: "partial".into(),
                 last_sync_at: None,
                 snapshot_at: None,
-                basis: None
+                basis: None,
+                ..Default::default()
             }
         );
     }

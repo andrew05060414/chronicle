@@ -4908,6 +4908,75 @@ mod tests {
     use super::*;
     use std::io::Write;
 
+    fn checkpoint_health_config(dir: &Path, enabled: bool) -> Config {
+        let mut config = Config::default();
+        config.checkpoint.dir = Some(dir.to_path_buf());
+        config.checkpoint.enabled = enabled;
+        config.checkpoint.interval_secs = 60;
+        config
+    }
+
+    fn write_checkpoint_health_fixture(
+        dir: &Path,
+        stem: &str,
+        created_at: chrono::DateTime<chrono::Utc>,
+    ) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join(format!("{stem}.db.zst")), b"synthetic checkpoint").unwrap();
+        let manifest = hstry_core::checkpoint::CheckpointManifest {
+            version: 1,
+            created_at,
+            stem: stem.to_string(),
+            weekly: false,
+            conversations: 1,
+            messages: 1,
+            sources: 1,
+            uncompressed_bytes: 1,
+            compressed_bytes: 1,
+            integrity: "ok".to_string(),
+            live_database: "synthetic".to_string(),
+        };
+        std::fs::write(
+            dir.join(format!("{stem}.json")),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn checkpoint_health_reports_disabled_missing_fresh_and_stale_states() {
+        let temp = tempfile::tempdir().unwrap();
+
+        let disabled_dir = temp.path().join("disabled");
+        let disabled = checkpoint_health(&checkpoint_health_config(&disabled_dir, false)).unwrap();
+        assert!(!disabled.enabled);
+        assert_eq!(disabled.count, 0);
+        assert!(!disabled.stale);
+
+        let empty_dir = temp.path().join("empty");
+        let empty = checkpoint_health(&checkpoint_health_config(&empty_dir, true)).unwrap();
+        assert!(empty.enabled);
+        assert_eq!(empty.count, 0);
+        assert!(empty.newest_at.is_none());
+        assert!(empty.stale);
+
+        let fresh_dir = temp.path().join("fresh");
+        write_checkpoint_health_fixture(&fresh_dir, "fresh", chrono::Utc::now());
+        let fresh = checkpoint_health(&checkpoint_health_config(&fresh_dir, true)).unwrap();
+        assert_eq!(fresh.count, 1);
+        assert!(!fresh.stale);
+
+        let stale_dir = temp.path().join("stale");
+        write_checkpoint_health_fixture(
+            &stale_dir,
+            "stale",
+            chrono::Utc::now() - chrono::Duration::seconds(1_000),
+        );
+        let stale = checkpoint_health(&checkpoint_health_config(&stale_dir, true)).unwrap();
+        assert_eq!(stale.count, 1);
+        assert!(stale.stale);
+    }
+
     #[test]
     fn default_log_filter_suppresses_sqlx_slow_query_warnings_without_verbose() {
         assert_eq!(

@@ -625,6 +625,10 @@ enum Command {
         /// NAS remote name for `remote sync -d push`
         #[arg(long, default_value = "nas-lan")]
         nas_remote: String,
+
+        /// Number of recent remote snapshots to keep per offsite target (default: 14, min: 1).
+        #[arg(long, default_value_t = backup::DEFAULT_REMOTE_KEEP)]
+        remote_keep: usize,
     },
 
     /// Proxy to Andrew-Skill / ASM (not a memory store)
@@ -1551,7 +1555,13 @@ async fn main() -> Result<()> {
             target,
             encrypt,
             nas_remote,
+            remote_keep,
         } => {
+            if remote_keep == 0 {
+                anyhow::bail!(
+                    "--remote-keep must be at least 1 (refusing 0 to protect remote backups)"
+                );
+            }
             let db = Database::open(&config.database).await?;
             apply_storage_config(&db, &config);
             backup::run(
@@ -1563,6 +1573,7 @@ async fn main() -> Result<()> {
                     encrypt,
                     targets: target,
                     nas_remote,
+                    remote_keep,
                 },
                 cli.json,
             )

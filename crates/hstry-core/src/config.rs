@@ -643,7 +643,7 @@ impl SyncConfig {
             .unwrap_or_else(|error| panic!("{error}"))
     }
 
-    fn device_namespace_at(&self, path: &Path) -> Result<String> {
+    pub(crate) fn device_namespace_at(&self, path: &Path) -> Result<String> {
         if let Some(configured) = self.device_id.as_deref() {
             return parse_device_namespace(configured).ok_or_else(|| {
                 Error::Config("sync.device_id must contain a letter or number".to_string())

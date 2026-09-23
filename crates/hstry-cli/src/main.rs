@@ -1489,7 +1489,7 @@ async fn main() -> Result<()> {
             .await
         }
         Command::Stats => {
-            let db = Database::open(&config.database).await?;
+            let db = Database::open_read_only(&config.database).await?;
             apply_storage_config(&db, &config);
             cmd_stats(&db, &config, cli.json).await
         }

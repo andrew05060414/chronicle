@@ -1103,14 +1103,29 @@ fn default_log_filter(verbose: u8) -> &'static str {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    if std::env::args().nth(1).as_deref() == Some("native") {
-        use clap::Parser as _;
-        let mut args: Vec<_> = std::env::args_os().collect();
-        args.remove(1);
-        return chronicle_backup::run(chronicle_backup::NativeArgs::parse_from(args));
-    }
+const MAIN_STACK_SIZE: usize = 8 * 1024 * 1024;
+
+fn main() -> Result<()> {
+    let is_native = std::env::args().nth(1).as_deref() == Some("native");
+
+    std::thread::Builder::new()
+        .name("cli-main".into())
+        .stack_size(MAIN_STACK_SIZE)
+        .spawn(move || {
+            if is_native {
+                use clap::Parser as _;
+                let mut args: Vec<_> = std::env::args_os().collect();
+                args.remove(1);
+                chronicle_backup::run(chronicle_backup::NativeArgs::parse_from(args))
+            } else {
+                real_main()
+            }
+        })?
+        .join()
+        .unwrap_or_else(|e| std::panic::resume_unwind(e))
+}
+
+fn real_main() -> Result<()> {
     let cli = Cli::parse();
 
     // Initialize logging
@@ -1123,9 +1138,19 @@ async fn main() -> Result<()> {
         .init();
 
     // Load config
-    let config_path = cli.config.unwrap_or_else(Config::default_config_path);
+    let config_path = cli
+        .config
+        .clone()
+        .unwrap_or_else(Config::default_config_path);
     let config = Config::ensure_at(&config_path)?;
 
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    rt.block_on(Box::pin(run(cli, config, config_path)))
+}
+
+async fn run(cli: Cli, config: Config, config_path: PathBuf) -> Result<()> {
     match cli.command {
         Command::Search {
             query,

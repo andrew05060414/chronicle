@@ -72,9 +72,10 @@ semantics differ (open SQLite files lock on Windows). No step uses
    after ingest, verifying titles and sentinel content.
 3. `PRAGMA quick_check` must return `ok` at every stage.
 4. Checkpoint create -> restore to scratch -> mutate scratch (extra
-   conversation lands) -> restore over scratch again -> `quick_check` plus
-   sentinel and row-count preservation; a planted stale `-wal` sidecar must
-   be cleared by restore so it can never replay over the restored file.
+   conversation lands) -> restore the immutable checkpoint into a fresh
+   scratch slot -> `quick_check` plus sentinel and row-count preservation.
+   The separate WAL/SHM lifecycle test covers replacing an existing closed
+   slot with stale sidecars.
 5. WAL/SHM-sensitive lifecycle on the real product pattern: restores
    target a scratch/sibling slot (as `default_restore_path` does), never an
    open live database. The test reuses one slot across two incarnations

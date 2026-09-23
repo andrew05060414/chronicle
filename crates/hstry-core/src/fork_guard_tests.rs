@@ -17,7 +17,8 @@ fn remote_path_expansion_never_evaluates_command_substitution() {
     assert!(!command.contains("eval"));
     assert!(command.contains("printf"));
     assert!(
-        command.contains("'$(touch fork-guard-pwned).db'"),
+        // Only `~` expands; the rest of the path, substitution included, is one single-quoted literal.
+        command.contains("'/archive/$(touch fork-guard-pwned).db'"),
         "command substitution must remain literal: {command}"
     );
 }

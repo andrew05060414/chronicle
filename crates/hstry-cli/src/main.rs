@@ -2295,10 +2295,10 @@ async fn search_local_report(
         && config.service.enabled
         && config.service.search_api;
 
-    if service_expected {
-        if let Some(results) = hstry_core::service::try_service_search_report(query, &opts).await? {
-            return Ok(results);
-        }
+    if service_expected
+        && let Some(results) = hstry_core::service::try_service_search_report(query, &opts).await?
+    {
+        return Ok(results);
     }
     if let Some(results) = try_api_search(query, &opts, mode).await? {
         return Ok(results);

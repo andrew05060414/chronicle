@@ -57,6 +57,9 @@ async fn refresh_local_never_uploads_or_modifies_remote_watermarks() -> anyhow::
         database: db_path.clone(),
         ..Default::default()
     };
+    config.adapter_paths.clear();
+    config.adapter_repos.clear();
+    config.sources.clear();
     config.sync.mode = hstry_core::config::SyncMode::Satellite;
     config.sync.auto_sync = true;
     config.sync.hub_remote = Some("hub".into());
@@ -69,7 +72,9 @@ async fn refresh_local_never_uploads_or_modifies_remote_watermarks() -> anyhow::
         enabled: true,
     });
 
-    let server = McpServer::new(config, db, None);
+    let config_path = dir.path().join("mcp-test-config.toml");
+    std::fs::write(&config_path, toml::to_string(&config)?)?;
+    let server = McpServer::new(config, db, Some(config_path));
 
     // Call search with refresh_local: true
     let request = serde_json::from_value(serde_json::json!({

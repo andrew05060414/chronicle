@@ -24,7 +24,8 @@ async fn refresh_local_via_cli(config_path: Option<&PathBuf>) -> anyhow::Result<
         .arg("--json")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::piped());
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
     if let Some(path) = config_path_hint(config_path) {
         cmd.arg("--config").arg(path);
     }

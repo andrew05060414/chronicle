@@ -88,7 +88,7 @@ globalThis.chrome = {
 
 await import(`../options.js?options-init-test=${Date.now()}`);
 
-for (const provider of ['chatgpt', 'claude', 'gemini', 'perplexity']) {
+for (const provider of ['chatgpt', 'claude', 'gemini', 'perplexity', 'grok']) {
   const checkbox = elements.get(`provider-${provider}`);
   assert.ok(checkbox, `${provider} checkbox was created`);
   assert.ok(checkbox.listeners.has('change'), `${provider} change listener was registered`);

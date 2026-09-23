@@ -1,4 +1,5 @@
 import { syncGemini } from '../providers/gemini.js';
+import { syncGrok } from '../providers/grok.js';
 import { syncPerplexity } from '../providers/perplexity.js';
 
 let failures = 0;
@@ -93,5 +94,76 @@ check('perplexity source and adapter', [perplexityPushes[0]?.source, perplexityP
 check('perplexity messages', perplexityPushes[0]?.conversations[0]?.messages.map(message => message.content), ['hello perplexity', 'perplexity response']);
 check('perplexity reports processed sessions', perplexityProgress.at(-1), { phase: 'complete', processed: 1 });
 check('perplexity registers source', perplexityRegistrations, [['perplexity-web', 'perplexity']]);
+
+// Grok Provider Verification
+globalThis.fetch = async (url, init = {}) => {
+  const parsed = new URL(url);
+  if (parsed.pathname === '/rest/app-chat/conversations') {
+    return new Response(JSON.stringify({
+      conversations: [{
+        conversationId: 'grok-fixture-conv',
+        title: 'Grok fixture chat',
+        createTime: new Date(nowSec * 1000).toISOString(),
+        modifyTime: new Date(nowSec * 1000).toISOString(),
+      }],
+    }), { headers: { 'Content-Type': 'application/json' } });
+  }
+  if (parsed.pathname === '/rest/app-chat/conversations/grok-fixture-conv/responses') {
+    return new Response(JSON.stringify({
+      responses: [
+        {
+          responseId: 'resp-user-1',
+          sender: 'human',
+          message: 'hello grok',
+          createTime: new Date(nowSec * 1000).toISOString(),
+        },
+        {
+          responseId: 'resp-asst-1',
+          sender: 'assistant',
+          message: '', // empty to test load-responses hydration
+          createTime: new Date(nowSec * 1000 + 1000).toISOString(),
+          model: 'grok-3',
+          parentResponseId: 'resp-user-1',
+        },
+      ],
+    }), { headers: { 'Content-Type': 'application/json' } });
+  }
+  if (parsed.pathname === '/rest/app-chat/conversations/grok-fixture-conv/load-responses') {
+    return new Response(JSON.stringify({
+      responses: [
+        {
+          responseId: 'resp-asst-1',
+          sender: 'assistant',
+          message: 'grok response',
+          thinkingTrace: 'grok thinking',
+          createTime: new Date(nowSec * 1000 + 1000).toISOString(),
+          model: 'grok-3',
+          parentResponseId: 'resp-user-1',
+        },
+      ],
+    }), { headers: { 'Content-Type': 'application/json' } });
+  }
+  throw new Error(`unexpected Grok request: ${url} ${init.method ?? 'GET'}`);
+};
+
+const grokPushes = [];
+const grokProgress = [];
+const grokRegistrations = [];
+const grok = await syncGrok({
+  state: {},
+  push: async (source, adapter, conversations) => {
+    grokPushes.push({ source, adapter, conversations });
+    return conversations.length;
+  },
+  report: async progress => grokProgress.push(progress),
+  register: async (source, adapter) => grokRegistrations.push([source, adapter]),
+  log: () => {},
+});
+check('grok sync count', grok.conversations, 1);
+check('grok source and adapter', [grokPushes[0]?.source, grokPushes[0]?.adapter], ['grok-web', 'grok']);
+check('grok messages', grokPushes[0]?.conversations[0]?.messages.map(message => message.content), ['hello grok', 'grok response']);
+check('grok thinking part', grokPushes[0]?.conversations[0]?.messages[1]?.parts.find(p => p.type === 'thinking')?.text, 'grok thinking');
+check('grok reports processed sessions', grokProgress.at(-1), { phase: 'complete', detected: 1, processed: 1 });
+check('grok registers source', grokRegistrations, [['grok-web', 'grok']]);
 
 process.exit(failures ? 1 : 0);

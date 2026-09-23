@@ -76,3 +76,15 @@ jobs:
         # executable bit is ever lost in a checkout; the mode is also
         # committed as 755 in git.
         run: bash ./scripts/ci/run-adapter-regressions.sh
+      - name: Extension provider regressions
+        run: |
+          bun run extension/test/backoff.js
+          bun run extension/test/chatgpt-completeness.js
+          bun run extension/test/claude-organizations.js
+          bun run extension/test/full-resync.js
+          bun run extension/test/gemini-resume.js
+          bun run extension/test/grok.js
+          bun run extension/test/new-providers.js
+          bun run extension/test/options-init.js
+          bun run extension/test/provider-parallel.js
+          bun run extension/test/ui.js

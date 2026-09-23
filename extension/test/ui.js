@@ -12,6 +12,7 @@ check('new providers are opt-in', DEFAULT_PROVIDER_SETTINGS, {
   chatgpt: true,
   claude: true,
   gemini: false,
+  grok: false,
   perplexity: false,
 });
 check('never synced time', formatTime(null, now), 'Never');
@@ -54,7 +55,7 @@ check('visible settings normalize before sync', normalizeSettings({
   port: 3434,
   token: 'hello',
   intervalMinutes: 15,
-  providers: { chatgpt: true, claude: true, gemini: false, perplexity: false },
+  providers: { chatgpt: true, claude: true, gemini: false, grok: false, perplexity: false },
 });
 check('invalid port cannot escape form constraints', normalizeSettings({
   port: '70000',
@@ -65,7 +66,7 @@ check('invalid port cannot escape form constraints', normalizeSettings({
   port: 3000,
   token: '',
   intervalMinutes: 15,
-  providers: { chatgpt: false, claude: false, gemini: false, perplexity: false },
+  providers: { chatgpt: false, claude: false, gemini: false, grok: false, perplexity: false },
 });
 
 process.exit(failures ? 1 : 0);

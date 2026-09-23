@@ -1,9 +1,9 @@
-# Chronicle 档案层模型（通用部署）
+# hstry 档案层模型（通用部署）
 
-把多台机器上的 AI 对话收成一份统一搜索档案；原始文件由独立的 `chronicle-backup` 模块保护。
+把多台机器上的 AI 对话收成一份能搜、能按设备分开、坏了能在目标电脑恢复的档案。
 不是聊天 App，不是记忆系统。记忆（Agent Memory）是这份档案的客户。
 
-本页描述通用部署合同。搜索采集优先，原始数据恢复说明见 [`restore.md`](./restore.md)。项目为什么变成这样、对话里拍过的板，见 [`project-thread.md`](./project-thread.md)。
+本页描述通用部署合同。采集优先，恢复说明见 [`restore.md`](./restore.md)。项目为什么变成这样、对话里拍过的板，见 [`project-thread.md`](./project-thread.md)。
 
 ---
 
@@ -25,8 +25,8 @@
 |----|------|----------|-----|
 | 采集 | 各工具对话 → 规范化会话 | Cursor/Codex/… + **Antigravity 三根** + **dsh** + **zcode** | 本机没有数据的工具不预做 |
 | 档案 | 一台机一份 staging，NAS 一份合并 hub | `device_id` 命名空间 merge | 保持 dumb：不抽取记忆 |
-| 原生备份/恢复 | 原生日志、数据库及恢复依赖的版本副本 | `chronicle-backup` + Restic | 见 [`restore.md`](./restore.md) |
-| 检索 | 跨工具、跨设备搜 | 本机＋配置 hub 的 CLI FTS + Search API | 失败时报告覆盖范围 |
+| 备份/恢复 | hub 库的时间点副本；在目标电脑恢复后能搜 | push 是 merge，不是备份 | 见 [`restore.md`](./restore.md) |
+| 检索 | 跨工具、跨设备搜 | CLI FTS + Search API | **satellite 默认问 hub** |
 
 ---
 

@@ -251,17 +251,14 @@ impl SshTransport {
 
     /// Check if a file exists on the remote.
     pub fn file_exists(&self, remote_path: &str) -> Result<bool> {
-        let cmd = format!(
-            "test -f {} && echo yes || echo no",
-            shell_quote(remote_path)
-        );
+        let cmd = file_exists_command(remote_path);
         let output = self.exec(&cmd)?;
         Ok(output.trim() == "yes")
     }
 
     /// Get the expanded path on the remote (resolves ~ and env vars).
     pub fn expand_remote_path(&self, path: &str) -> Result<String> {
-        let cmd = format!("eval echo {}", shell_quote(path));
+        let cmd = expand_remote_path_command(path);
         let output = self.exec(&cmd)?;
         Ok(output.trim().to_string())
     }
@@ -273,6 +270,91 @@ fn shell_quote(value: &str) -> String {
         return "''".to_string();
     }
     format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+/// Build one shell word that expands leading `~`, `$VAR`, and `${VAR}` while
+/// keeping every other character literal. Variable names are restricted to
+/// portable shell identifiers, so operators and command substitutions can
+/// never become executable syntax.
+fn remote_path_expression(path: &str) -> String {
+    let bytes = path.as_bytes();
+    let mut expression = String::new();
+    let mut index = 0;
+
+    if path == "~" || path.starts_with("~/") {
+        expression.push_str("\"${HOME}\"");
+        index = 1;
+    }
+
+    let mut literal_start = index;
+    while index < bytes.len() {
+        if bytes[index] != b'$' {
+            index += 1;
+            continue;
+        }
+
+        let (name_start, name_end, token_end) = if bytes.get(index + 1) == Some(&b'{') {
+            let name_start = index + 2;
+            let Some(relative_end) = bytes[name_start..].iter().position(|byte| *byte == b'}')
+            else {
+                index += 1;
+                continue;
+            };
+            let name_end = name_start + relative_end;
+            (name_start, name_end, name_end + 1)
+        } else {
+            let name_start = index + 1;
+            let mut name_end = name_start;
+            while bytes
+                .get(name_end)
+                .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+            {
+                name_end += 1;
+            }
+            (name_start, name_end, name_end)
+        };
+
+        let name = &bytes[name_start..name_end];
+        let valid_name = name
+            .first()
+            .is_some_and(|byte| byte.is_ascii_alphabetic() || *byte == b'_')
+            && name
+                .iter()
+                .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'_');
+        if !valid_name {
+            index += 1;
+            continue;
+        }
+
+        if literal_start < index {
+            expression.push_str(&shell_quote(&path[literal_start..index]));
+        }
+        expression.push('"');
+        expression.push_str(&path[index..token_end]);
+        expression.push('"');
+        index = token_end;
+        literal_start = index;
+    }
+
+    if literal_start < path.len() {
+        expression.push_str(&shell_quote(&path[literal_start..]));
+    }
+    if expression.is_empty() {
+        expression.push_str("''");
+    }
+
+    expression
+}
+
+fn expand_remote_path_command(path: &str) -> String {
+    format!("printf '%s\\n' {}", remote_path_expression(path))
+}
+
+fn file_exists_command(path: &str) -> String {
+    format!(
+        "test -f {} && printf 'yes\\n' || printf 'no\\n'",
+        shell_quote(path)
+    )
 }
 
 /// Build an SCP remote target (`user@host:/path with spaces/file`).
@@ -369,12 +451,46 @@ fn source_metadata_changed(before: &Source, after: &Source) -> bool {
         || before.adapter != after.adapter
 }
 
+/// Whether `source_id` is already namespaced to `namespace`.
+///
+/// Hub rows are stored as `"<device>:<source>"`, so a satellite's own rows
+/// come back as `arknights:cursor-abc` when it pulls the hub.
+fn belongs_to_namespace(source_id: &str, namespace: &str) -> bool {
+    match source_id.strip_prefix(namespace) {
+        Some("") => true,
+        Some(rest) => rest.starts_with(':'),
+        None => false,
+    }
+}
+
 /// Merge conversations from a source database into a target database.
 /// Uses updated_at for conflict resolution (newer wins).
 pub async fn merge_databases(
     target: &Database,
     source_path: &Path,
     remote_name: &str,
+) -> Result<SyncResult> {
+    merge_databases_excluding(target, source_path, remote_name, None).await
+}
+
+/// Merge like [`merge_databases`], skipping rows that already belong to
+/// `own_namespace`.
+///
+/// A satellite pushes its archive to the hub under its own device namespace,
+/// so the hub holds `arknights:cursor-abc`. Merging the hub back in prefixes
+/// every id a second time (`nas-lan:arknights:cursor-abc`) and mints fresh
+/// conversation and message ids, so no later deduplication can match: the
+/// satellite ends up storing a full second copy of itself, and every search
+/// spends half its result window on that echo.
+///
+/// Pull passes its own device namespace here, which leaves those rows on the
+/// hub they came from; rows from other devices still merge normally. Push
+/// passes `None` -- namespacing local data into the hub is what it is for.
+pub async fn merge_databases_excluding(
+    target: &Database,
+    source_path: &Path,
+    remote_name: &str,
+    own_namespace: Option<&str>,
 ) -> Result<SyncResult> {
     // Open the source database
     let source = Database::open(source_path).await?;
@@ -387,7 +503,14 @@ pub async fn merge_databases(
 
     // Merge sources (prefixed with remote name to avoid conflicts)
     let remote_sources = source.list_sources().await?;
+    let mut sources_skipped = 0usize;
     for mut remote_source in remote_sources {
+        if let Some(own) = own_namespace
+            && belongs_to_namespace(&remote_source.id, own)
+        {
+            sources_skipped += 1;
+            continue;
+        }
         // Prefix source ID with remote name to namespace it
         let namespaced_id = format!("{}:{}", remote_name, remote_source.id);
         remote_source.id = namespaced_id;
@@ -421,7 +544,14 @@ pub async fn merge_databases(
     let mut batch_msgs: Vec<Message> = Vec::new();
     let mut affected_ids: Vec<Uuid> = Vec::new();
 
+    let mut conversations_skipped = 0usize;
     for conv in source_conversations {
+        if let Some(own) = own_namespace
+            && belongs_to_namespace(&conv.source_id, own)
+        {
+            conversations_skipped += 1;
+            continue;
+        }
         // Namespace the source_id
         let namespaced_source_id = format!("{}:{}", remote_name, conv.source_id);
 
@@ -551,6 +681,16 @@ pub async fn merge_databases(
     }
 
     source.close().await;
+
+    if sources_skipped > 0 || conversations_skipped > 0 {
+        tracing::info!(
+            remote = remote_name,
+            namespace = own_namespace.unwrap_or_default(),
+            sources_skipped,
+            conversations_skipped,
+            "skipped rows already namespaced to this device"
+        );
+    }
 
     Ok(SyncResult {
         remote_name: remote_name.to_string(),
@@ -688,13 +828,20 @@ fn remote_inbox_dir(remote_db_path: &str) -> String {
 pub async fn sync_from_remote(
     local_db: &Database,
     config: &RemoteConfig,
+    device_namespace: &str,
 ) -> Result<(FetchResult, SyncResult)> {
     // Fetch the remote database
     let fetch_result = fetch_remote(config)?;
 
-    // Merge into local
-    let sync_result =
-        merge_databases(local_db, &fetch_result.local_cache_path, &config.name).await?;
+    // Merge into local, leaving this device's own rows on the hub.
+    let namespace = crate::config::sanitize_device_namespace(device_namespace);
+    let sync_result = merge_databases_excluding(
+        local_db,
+        &fetch_result.local_cache_path,
+        &config.name,
+        Some(&namespace),
+    )
+    .await?;
 
     Ok((fetch_result, sync_result))
 }
@@ -1197,6 +1344,125 @@ mod tests {
         assert_eq!(
             scp_remote_target("admin@nas", "/vol1/1000/Code/hstry backup/hstry.db"),
             "admin@nas:/vol1/1000/Code/hstry backup/hstry.db"
+        );
+    }
+
+    #[test]
+    fn expand_remote_path_command_uses_printf_not_eval() {
+        let command = expand_remote_path_command("~/db/$HSTRY_DIR/${HOME}/$(touch injected).db");
+        assert!(command.starts_with("printf '%s\\n' "));
+        assert!(!command.contains("eval"));
+        assert!(command.contains("\"${HOME}\""));
+        assert!(command.contains("\"$HSTRY_DIR\""));
+        assert!(command.contains(&shell_quote("/$(touch injected).db")));
+    }
+
+    #[test]
+    fn remote_path_expression_quotes_metacharacters_pipes_globs_and_newlines() {
+        let path =
+            "~/history/$HSTRY_TEST_DIR/it's; touch injected | rm -rf /; $(touch injected)\n*.db";
+        let expression = remote_path_expression(path);
+        assert!(!expression.contains("eval"));
+        assert!(expression.starts_with("\"${HOME}\""));
+        assert!(expression.contains("\"$HSTRY_TEST_DIR\""));
+        assert!(expression.contains(&shell_quote(
+            "/it's; touch injected | rm -rf /; $(touch injected)\n*.db"
+        )));
+        assert_eq!(
+            expand_remote_path_command("/vol1/1000/Code/hstry backup/*.db"),
+            format!(
+                "printf '%s\\n' {}",
+                shell_quote("/vol1/1000/Code/hstry backup/*.db")
+            )
+        );
+    }
+
+    #[test]
+    fn remote_file_check_uses_one_shell_argument() {
+        let malicious_path = "/missing; touch injected\nsecond | cat";
+        let command = file_exists_command(malicious_path);
+        assert_eq!(
+            command,
+            format!(
+                "test -f {} && printf 'yes\\n' || printf 'no\\n'",
+                shell_quote(malicious_path)
+            )
+        );
+        assert!(!command.contains("eval"));
+    }
+
+    #[cfg(unix)]
+    fn run_posix_shell(
+        command: &str,
+        env: &[(&str, &str)],
+        cwd: Option<&Path>,
+    ) -> std::process::Output {
+        let mut child = Command::new("sh");
+        child.arg("-c").arg(command);
+        for (key, value) in env {
+            child.env(key, value);
+        }
+        if let Some(dir) = cwd {
+            child.current_dir(dir);
+        }
+        child.output().expect("run POSIX shell command")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_path_expansion_treats_shell_metacharacters_as_data() {
+        let temp = tempfile::tempdir().expect("temp directory");
+        let marker = "injected";
+        let path =
+            format!("~/history/$HSTRY_TEST_DIR/it's; touch {marker}; $(touch {marker})\n.db");
+        let command = expand_remote_path_command(&path);
+
+        let output = run_posix_shell(
+            &command,
+            &[
+                ("HOME", "/remote/home"),
+                ("HSTRY_TEST_DIR", "folder with spaces"),
+            ],
+            Some(temp.path()),
+        );
+
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8(output.stdout).expect("UTF-8 output"),
+            format!(
+                "/remote/home/history/folder with spaces/it's; touch {marker}; $(touch {marker})\n.db\n",
+            )
+        );
+        assert!(!temp.path().join(marker).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_file_check_treats_expanded_path_as_one_shell_word() {
+        let temp = tempfile::tempdir().expect("temp directory");
+        let marker = "injected";
+        let malicious_path = format!("/missing; touch {marker}\nsecond");
+        let command = file_exists_command(&malicious_path);
+
+        let output = run_posix_shell(&command, &[], Some(temp.path()));
+
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"no\n");
+        assert!(!temp.path().join(marker).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_path_expansion_keeps_spaces_and_globs_literal() {
+        let path = "/vol1/1000/Code/hstry backup/*.db";
+        let command = expand_remote_path_command(path);
+
+        let output = run_posix_shell(&command, &[], None);
+
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8(output.stdout).expect("UTF-8 output"),
+            "/vol1/1000/Code/hstry backup/*.db\n"
         );
     }
 

@@ -33,13 +33,14 @@ use hstry_runtime::{AdapterRunner, Runtime};
 
 const DETECT_THRESHOLD: f32 = 0.5;
 
-/// `Instant::now() - duration` panics on Windows when uptime is shorter than
-/// `duration` (monotonic clock origin is boot). Fresh boots then crash-loop the
-/// service. Fall back to "now" so the first interval simply waits.
-fn instant_ago(secs: u64) -> Instant {
-    Instant::now()
-        .checked_sub(Duration::from_secs(secs))
-        .unwrap_or_else(Instant::now)
+/// Subtract `ago` from `Instant::now()` without panicking on Windows.
+///
+/// `tokio::time::Instant` is backed by `std::time::Instant`. On Windows that
+/// clock starts at boot, so `now - 1 day` overflows and panics if uptime is
+/// shorter than `ago` (common after a reboot). Fall back to `now` so the
+/// first cycle is delayed rather than crashing the service.
+fn instant_ago(ago: Duration) -> Instant {
+    Instant::now().checked_sub(ago).unwrap_or_else(Instant::now)
 }
 
 #[derive(Clone)]
@@ -1310,14 +1311,14 @@ impl ServiceState {
             event_rx,
             last_remote_sync: None,
             last_remote_sync_failed: false,
-            last_workspace_discovery: instant_ago(3600),
-            last_event_sync: instant_ago(300), // allow immediate first sync when uptime allows
+            last_workspace_discovery: instant_ago(Duration::from_secs(3600)),
+            last_event_sync: instant_ago(Duration::from_secs(300)), // allow immediate first sync when uptime allows
             source_backoff: HashMap::new(),
             source_quiet_until: HashMap::new(),
             source_schedule: HashMap::new(),
             sync_semaphore,
             metrics: Arc::new(tokio::sync::Mutex::new(ServiceMetrics::default())),
-            last_events_compaction: instant_ago(86_400),
+            last_events_compaction: instant_ago(Duration::from_secs(86_400)),
         };
 
         // NOTE: refresh_watches() is called separately by the caller after
@@ -1569,11 +1570,13 @@ impl ServiceState {
         let mut any_error = false;
         for remote_config in remotes {
             let res = match direction {
-                hstry_core::remote::SyncDirection::Pull => {
-                    hstry_core::remote::sync_from_remote(&self.db, remote_config)
-                        .await
-                        .map(|_| ())
-                }
+                hstry_core::remote::SyncDirection::Pull => hstry_core::remote::sync_from_remote(
+                    &self.db,
+                    remote_config,
+                    &self.config.sync.device_namespace(),
+                )
+                .await
+                .map(|_| ()),
                 hstry_core::remote::SyncDirection::Push => hstry_core::remote::sync_to_remote(
                     &self.db,
                     &self.config.database,
@@ -2310,6 +2313,14 @@ fn is_candidate_file(path: &Path) -> bool {
 mod tests {
     use super::*;
 
+    #[test]
+    fn instant_ago_survives_offsets_longer_than_windows_uptime() {
+        let _ = instant_ago(Duration::from_secs(300));
+        let _ = instant_ago(Duration::from_secs(3600));
+        let _ = instant_ago(Duration::from_secs(86_400));
+        let _ = instant_ago(Duration::from_secs(365 * 86_400));
+    }
+
     #[tokio::test]
     async fn search_service_defaults_to_bounded_evidence_not_raw_content() -> anyhow::Result<()> {
         use hstry_core::service::proto;
@@ -2541,14 +2552,14 @@ mod tests {
             event_rx,
             last_remote_sync: None,
             last_remote_sync_failed: false,
-            last_workspace_discovery: instant_ago(3600),
-            last_event_sync: instant_ago(300),
+            last_workspace_discovery: instant_ago(Duration::from_secs(3600)),
+            last_event_sync: instant_ago(Duration::from_secs(300)),
             source_backoff: HashMap::new(),
             source_quiet_until: HashMap::new(),
             source_schedule: HashMap::new(),
             sync_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
             metrics: Arc::new(tokio::sync::Mutex::new(ServiceMetrics::default())),
-            last_events_compaction: instant_ago(86400),
+            last_events_compaction: instant_ago(Duration::from_secs(86400)),
         };
 
         // 1. Initial state: last_remote_sync is None (first run must be immediate)

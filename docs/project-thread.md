@@ -2,7 +2,7 @@
 
 给后续 AI 的可携带简报。口语叫 **Chronicle**；CLI 是 `chronicle`（兼容名 `hstry`）。
 
-- 仓库事实写到 **2026-09-18**。
+- 仓库事实写到 **2026-09-20**（`main` = `c3dd891` / #44；Arknights 另装 #45 Instant 启动修复）。
 - 本机对话档案补遗来自同日对 live archive 的只读检索，不是云端会话。
 - 部署合同以 [`archive-model.md`](./archive-model.md) 为准；恢复以 [`restore.md`](./restore.md) 为准。本页补的是「为什么会变成这样」和「Andrew 在对话里拍过什么板」。
 
@@ -18,7 +18,7 @@ Chronicle 是 Andrew 的 **AI 对话原文档案**，不是聊天 App，也不�
 
 本机卫星：`sync.mode = satellite`，`device_id` 见本地 `config.toml`，`hub_remote = nas-lan`。禁止把带设备前缀的 hub 全库覆盖回 staging 再 push。搜索在 Windows 上用 `HSTRY_NO_SERVICE=1` 加 `--scope local`。未授权不要 `sync` / `backup` / `remote sync`。
 
-当前工程焦点：合入上游 v0.5.25 之后的回归（#16）和 pre-PR 记忆完整性门禁（#33 / #34）。装在 PATH 上的二进制仍是产品名 1.0.0；v0.5.25 的代码在 git 里，不代表已经 `cargo install`。
+当前工程焦点：轴二还开着（#17 / #19 / #23–#27 / #33 分支保护）。轴一回归代码已在 `main`（#16 当总账）。Arknights 已从 `c3dd891` 安装 CLI，并打了服务 `Instant` 启动补丁；NAS hub 上的 `hstry` 仍是旧 CLI（没有 `--raw` / `--input`），卫星默认搜 hub 会失败并回落到本地。
 
 ---
 
@@ -29,7 +29,7 @@ Chronicle 是 Andrew 的 **AI 对话原文档案**，不是聊天 App，也不�
 | 判断该不该改 Chronicle | 本文「是什么 / 不是什么」+「已定决策」 |
 | 改采集、同步、备份 | [`archive-model.md`](./archive-model.md)、[`remote-sync.md`](./remote-sync.md)、[`restore.md`](./restore.md) |
 | 查「Andrew 当时怎么说的」 | 本文「本机对话补遗」里的短 ID，本地 `chronicle peek <id>` |
-| 查仓库时间线、issue、PR | 本文「怎么走到今天」；细节以 GitHub 为准 |
+| 查仓库时间线、issue、PR | 本文「怎么走到今天」；提交级时间线见 [`fork-timeline.md`](./fork-timeline.md)，issue↔PR 登记见 [`merge-review-register.md`](./merge-review-register.md)；细节以 GitHub 为准 |
 | 本机路径、remote host、device_id | `%APPDATA%\hstry\config.toml`。不要把里面的 host / 绝对路径写进公开 PR 或测试 |
 
 **来源分层（不要混）：**

@@ -78,7 +78,11 @@ async fn try_main() -> Result<()> {
 }
 
 #[derive(Debug, Parser)]
-#[command(author, version, about = "MCP server for rust-workspace")]
+#[command(
+    author,
+    version,
+    about = "Chronicle MCP server - retrieval over the local conversation archive"
+)]
 struct Cli {
     #[command(flatten)]
     common: CommonOpts,
@@ -89,12 +93,6 @@ struct CommonOpts {
     /// Override the config file path
     #[arg(long, value_name = "PATH")]
     config: Option<PathBuf>,
-}
-
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-struct EchoRequest {
-    #[schemars(description = "The message to echo back")]
-    message: String,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -339,20 +337,6 @@ impl McpServer {
         }
     }
 
-    /// Get the current configuration profile
-    #[tool(description = "Returns the active configuration profile name")]
-    async fn get_profile(&self) -> String {
-        tokio::task::yield_now().await;
-        "default".to_string()
-    }
-
-    /// Echo a message back
-    #[tool(description = "Echoes the provided message back")]
-    async fn echo(&self, Parameters(req): Parameters<EchoRequest>) -> String {
-        tokio::task::yield_now().await;
-        format!("Echo: {}", req.message)
-    }
-
     /// Get service configuration
     #[tool(description = "Returns the service configuration (enabled and poll interval)")]
     async fn get_runtime_config(&self) -> String {
@@ -366,7 +350,17 @@ impl ServerHandler for McpServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo {
             capabilities: ServerCapabilities::builder().enable_tools().build(),
-            instructions: Some("MCP server for hstry - Universal AI chat history".to_string()),
+            instructions: Some(
+                "Chronicle is a conversation archive over AI chat sessions already recorded \
+                 on this machine and on its configured remotes. This MCP server exposes a \
+                 retrieval-only tool surface: use `search` to locate evidence and `expand` \
+                 to read a bounded window around a match, and no archive-mutating MCP tools \
+                 are exposed; both return a snapshot of what was stored, never proof that \
+                 something does not exist. Chronicle is not a task board and dispatches no \
+                 work - it answers what was said, and nothing here assigns, schedules, or \
+                 tracks tasks."
+                    .to_string(),
+            ),
             ..Default::default()
         }
     }

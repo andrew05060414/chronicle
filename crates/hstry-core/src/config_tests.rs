@@ -385,7 +385,9 @@ mod sync_config_tests {
         assert_eq!(sanitize_device_namespace("Arknight"), "arknight");
         assert_eq!(sanitize_device_namespace("win-pc"), "win-pc");
         assert_eq!(sanitize_device_namespace("MacBook Pro"), "macbook-pro");
+        // Public sanitize keeps the String fallback for existing call sites.
         assert_eq!(sanitize_device_namespace("---"), "unknown");
+        assert_eq!(sanitize_device_namespace("   "), "unknown");
     }
 
     #[test]
@@ -394,6 +396,85 @@ mod sync_config_tests {
             device_id: Some("arknights".to_string()),
             ..SyncConfig::default()
         };
-        assert_eq!(config.device_namespace(), "arknights");
+        let temp = tempfile::tempdir().expect("temp directory");
+        assert_eq!(
+            config
+                .device_namespace_at(&temp.path().join("device-id"))
+                .expect("configured namespace"),
+            "arknights"
+        );
+    }
+
+    #[test]
+    fn configured_device_namespace_is_normalized() {
+        let config = SyncConfig {
+            device_id: Some("MacBook Pro".to_string()),
+            ..SyncConfig::default()
+        };
+        let temp = tempfile::tempdir().expect("temp directory");
+        assert_eq!(
+            config
+                .device_namespace_at(&temp.path().join("device-id"))
+                .expect("configured namespace"),
+            "macbook-pro"
+        );
+    }
+
+    #[test]
+    fn empty_device_id_is_an_error_not_unknown() {
+        let config = SyncConfig {
+            device_id: Some(" --- ".to_string()),
+            ..SyncConfig::default()
+        };
+        let temp = tempfile::tempdir().expect("temp directory");
+        let error = config
+            .device_namespace_at(&temp.path().join("device-id"))
+            .expect_err("blank device_id must fail");
+        assert!(error.to_string().contains("letter or number"));
+    }
+
+    #[test]
+    fn generated_device_namespace_is_persisted() {
+        let config = SyncConfig::default();
+        let temp = tempfile::tempdir().expect("temp directory");
+        let path = temp.path().join("state").join("device-id");
+
+        let first = config
+            .device_namespace_at(&path)
+            .expect("generate namespace");
+        let second = config.device_namespace_at(&path).expect("read namespace");
+
+        assert!(first.starts_with("device-"));
+        assert_ne!(first, "unknown");
+        assert_eq!(first, second);
+        assert_eq!(std::fs::read_to_string(&path).expect("stored ID"), first);
+        let uuid = first.strip_prefix("device-").expect("device- prefix");
+        uuid::Uuid::parse_str(uuid).expect("persisted id is a UUID");
+        if let Ok(hostname) = std::env::var("COMPUTERNAME") {
+            assert_ne!(first, sanitize_device_namespace(&hostname));
+        }
+        if let Ok(hostname) = std::env::var("HOSTNAME") {
+            assert_ne!(first, sanitize_device_namespace(&hostname));
+        }
+    }
+
+    #[test]
+    fn device_namespace_ignores_hostname_environment() {
+        let temp = tempfile::tempdir().expect("temp directory");
+        let state_home = temp.path().to_string_lossy().into_owned();
+        temp_env::with_vars(
+            [
+                ("XDG_STATE_HOME", Some(state_home.as_str())),
+                ("COMPUTERNAME", Some("ArkNightsHost")),
+                ("HOSTNAME", Some("ArkNightsHost")),
+            ],
+            || {
+                let namespace = SyncConfig::default().device_namespace();
+                assert!(namespace.starts_with("device-"));
+                assert_ne!(namespace, "unknown");
+                assert_ne!(namespace, "arknightshost");
+                assert_ne!(namespace, sanitize_device_namespace("ArkNightsHost"));
+            },
+        );
     }
 }

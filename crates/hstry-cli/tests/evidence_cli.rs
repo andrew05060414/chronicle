@@ -1,4 +1,4 @@
-use hstry_core::{Config, Database, ingest::ingest_batch, models::Source};
+use hstry_core::{Config, Database, config::SyncMode, ingest::ingest_batch, models::Source};
 use serde_json::{Value, json};
 use std::{
     fs,
@@ -260,6 +260,203 @@ async fn checkpoint_restore_refuses_staging_db() -> anyhow::Result<()> {
     assert!(
         stderr.contains("refusing to restore a checkpoint onto staging.db"),
         "stderr was: {stderr}"
+    );
+    Ok(())
+}
+
+/// Scope-all must still surface local results when no remote is enabled; only `--scope remote` has nothing left to return.
+#[tokio::test]
+async fn scope_all_keeps_local_hits_when_no_remote_is_enabled() -> anyhow::Result<()> {
+    let (dir, config, _id) = fixture().await?;
+    let mut parsed: Config = toml::from_str(&fs::read_to_string(&config)?)?;
+    for remote in &mut parsed.remotes {
+        remote.enabled = false;
+    }
+    assert!(!parsed.remotes.is_empty());
+    let disabled = dir.path().join("config-no-enabled-remotes.toml");
+    fs::write(&disabled, toml::to_string(&parsed)?)?;
+
+    let mut c = cmd(&disabled);
+    c.args(["search", "fixture request", "--scope", "all", "--json"]);
+    let page = output(c)?;
+    assert_eq!(page["result"]["scope"], "local_snapshot_and_remote");
+    assert!(!page["result"]["hits"].as_array().unwrap().is_empty());
+    assert!(
+        page["result"]["available_remotes"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+
+    let mut c = cmd(&disabled);
+    c.args(["search", "fixture request", "--scope", "remote", "--json"]);
+    let remote_only = c.output()?;
+    assert!(!remote_only.status.success());
+    assert!(String::from_utf8_lossy(&remote_only.stderr).contains("No enabled remotes to search"));
+    Ok(())
+}
+
+/// Scripts that pass the restored global `--no-color` must not die on clap.
+#[test]
+fn global_no_color_is_accepted() {
+    let help = Command::new(env!("CARGO_BIN_EXE_hstry"))
+        .args(["--no-color", "--help"])
+        .output()
+        .expect("spawn hstry --no-color --help");
+    assert!(
+        help.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&help.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&help.stderr);
+    let stdout = String::from_utf8_lossy(&help.stdout);
+    assert!(
+        !stderr.contains("unexpected argument") && !stdout.contains("unexpected argument"),
+        "clap rejected --no-color: stdout={stdout} stderr={stderr}"
+    );
+}
+
+#[tokio::test]
+async fn global_no_color_search_does_not_die() -> anyhow::Result<()> {
+    let (_dir, config, _id) = fixture().await?;
+    let mut c = cmd(&config);
+    c.args(["--no-color", "search", "fixture request", "--json"]);
+    let page = output(c)?;
+    assert!(!page["result"]["hits"].as_array().unwrap().is_empty());
+    Ok(())
+}
+
+fn write_satellite_config(
+    dir: &tempfile::TempDir,
+    mut parsed: Config,
+    host: &str,
+    port: Option<u16>,
+    enabled: bool,
+) -> anyhow::Result<PathBuf> {
+    parsed.sync.mode = SyncMode::Satellite;
+    parsed.sync.hub_remote = Some("peer".into());
+    for remote in &mut parsed.remotes {
+        if remote.name == "peer" {
+            remote.host = host.into();
+            remote.port = port;
+            remote.enabled = enabled;
+        }
+    }
+    let path = dir.path().join("config-satellite.toml");
+    fs::write(&path, toml::to_string(&parsed)?)?;
+    Ok(path)
+}
+
+/// Satellite default search (no `--scope`) must read the local DB when the hub is disabled.
+/// Explicit `--scope remote` on the same config still fails loudly (PR #28).
+#[tokio::test]
+async fn satellite_default_search_reads_local_when_hub_disabled() -> anyhow::Result<()> {
+    let (dir, config, _id) = fixture().await?;
+    let parsed: Config = toml::from_str(&fs::read_to_string(&config)?)?;
+    let satellite = write_satellite_config(&dir, parsed, "fixture-peer", None, false)?;
+
+    let mut c = cmd(&satellite);
+    c.args(["search", "fixture request", "--json"]);
+    let page = output(c)?;
+    assert_eq!(page["result"]["scope"], "local_snapshot");
+    assert!(!page["result"]["hits"].as_array().unwrap().is_empty());
+    let warnings = page["result"]["warnings"].as_array().unwrap();
+    assert!(
+        warnings.iter().any(|w| w
+            .as_str()
+            .is_some_and(|s| s.contains("No enabled remotes to search"))),
+        "expected a local-fallback warning, got {warnings:?}"
+    );
+    assert!(
+        warnings.iter().all(|w| w
+            .as_str()
+            .is_none_or(|s| !s.contains("Multi-store discovery"))),
+        "local-only fallback must not keep remote multi-store warnings, got {warnings:?}"
+    );
+
+    let mut c = cmd(&satellite);
+    c.args(["search", "fixture request", "--scope", "remote", "--json"]);
+    let remote_only = c.output()?;
+    assert!(!remote_only.status.success());
+    assert!(String::from_utf8_lossy(&remote_only.stderr).contains("No enabled remotes to search"));
+
+    let mut c = cmd(&satellite);
+    c.args(["search", "fixture request", "--remote", "peer", "--json"]);
+    let named_remote = c.output()?;
+    assert!(!named_remote.status.success());
+    let named_err = String::from_utf8_lossy(&named_remote.stderr);
+    assert!(
+        named_err.contains("Unknown or disabled remote")
+            || named_err.contains("No enabled remotes to search"),
+        "named --remote must fail loudly, got {named_err}"
+    );
+    Ok(())
+}
+
+/// Hub unreachable must not discard local hits on satellite default search.
+#[cfg(unix)]
+#[tokio::test]
+async fn satellite_default_search_keeps_local_when_hub_unreachable() -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let (dir, config, _id) = fixture().await?;
+    let parsed: Config = toml::from_str(&fs::read_to_string(&config)?)?;
+    let satellite = write_satellite_config(&dir, parsed, "127.0.0.1", Some(1), true)?;
+
+    let bin = dir.path().join("bin");
+    fs::create_dir(&bin)?;
+    let ssh = bin.join("ssh");
+    fs::write(
+        &ssh,
+        "#!/bin/sh\necho 'ssh: connection refused' >&2\nexit 255\n",
+    )?;
+    fs::set_permissions(&ssh, fs::Permissions::from_mode(0o755))?;
+    let paths = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    )))?;
+
+    let mut c = cmd(&satellite);
+    c.args([
+        "search",
+        "fixture request",
+        "--json",
+        "--max-chars",
+        "100000",
+    ])
+    .env("PATH", &paths);
+    let page = output(c)?;
+    assert_eq!(page["result"]["scope"], "local_snapshot");
+    assert!(!page["result"]["hits"].as_array().unwrap().is_empty());
+    let warnings = page["result"]["warnings"].as_array().unwrap();
+    assert!(
+        warnings.iter().any(|w| w
+            .as_str()
+            .is_some_and(|s| s.contains("Remote search failed"))),
+        "expected a remote-failure warning, got {warnings:?}"
+    );
+    assert!(
+        warnings.iter().all(|w| w
+            .as_str()
+            .is_none_or(|s| !s.contains("Multi-store discovery"))),
+        "local-only fallback must not keep remote multi-store warnings, got {warnings:?}"
+    );
+
+    let mut c = cmd(&satellite);
+    c.args([
+        "search",
+        "fixture request",
+        "--scope",
+        "all",
+        "--json",
+        "--max-chars",
+        "100000",
+    ])
+    .env("PATH", &paths);
+    let all_scope = c.output()?;
+    assert!(
+        !all_scope.status.success(),
+        "explicit --scope all must not swallow remote errors: stdout={} stderr={}",
+        String::from_utf8_lossy(&all_scope.stdout),
+        String::from_utf8_lossy(&all_scope.stderr)
     );
     Ok(())
 }

@@ -33,6 +33,7 @@ Upstream last consumed here is `v0.5.25` (`a4be7c9`). Keep fork version at `1.0.
 - Default remote search (CLI and TUI) uses `sync.hub_remote` and errors if that name is missing, instead of silently querying every remote. Explicit `--remote` is unchanged.
 - Windows MSVC debug builds reserve an 8MB stack so `hstry --help` no longer hits `STATUS_STACK_OVERFLOW`.
 - TUI compilation with remote search reports and OpenCode conversion layout/session IDs.
+- Restore global `--no-color` (`console::set_colors_enabled(false)`). Satellite default search still resolves to Remote (PR #28) but falls back to the local archive when the hub is disabled or unreachable, instead of skipping the local DB and hard-failing.
 
 ## [1.0.0] - 2026-08-21
 

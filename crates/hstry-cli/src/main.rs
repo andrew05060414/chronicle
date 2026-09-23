@@ -149,6 +149,10 @@ struct Cli {
     #[arg(long, global = true)]
     json: bool,
 
+    /// Disable colored output (also honors NO_COLOR)
+    #[arg(long, global = true)]
+    no_color: bool,
+
     /// Increase verbosity
     #[arg(short, long, action = clap::ArgAction::Count, global = true)]
     verbose: u8,
@@ -1128,6 +1132,11 @@ fn main() -> Result<()> {
 fn real_main() -> Result<()> {
     let cli = Cli::parse();
 
+    if cli.no_color {
+        console::set_colors_enabled(false);
+        console::set_colors_enabled_stderr(false);
+    }
+
     // Initialize logging
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_log_filter(cli.verbose)));
@@ -1188,19 +1197,19 @@ async fn run(cli: Cli, config: Config, config_path: PathBuf) -> Result<()> {
                 .and_then(|v| v.workspace.clone())
                 .or(workspace);
             let mode = input.as_ref().and_then(|v| v.mode).unwrap_or(mode);
-            let scope = SearchScopeArg::from(
-                config.resolve_search_scope(
-                    input
-                        .as_ref()
-                        .and_then(|v| v.scope)
-                        .or(scope)
-                        .map(Into::into),
-                ),
-            );
+            let requested_scope = input.as_ref().and_then(|v| v.scope).or(scope);
             let remotes = input
                 .as_ref()
                 .and_then(|v| v.remotes.clone())
                 .unwrap_or(remote);
+            let scope =
+                SearchScopeArg::from(config.resolve_search_scope(requested_scope.map(Into::into)));
+            // Bare satellite search defaults to Remote (trx-1xsa / #28). Fall back
+            // to the local archive instead of clap-dying the whole command when
+            // the hub is disabled or unreachable. Explicit `--scope remote` and
+            // named `--remote` keep the loud failure.
+            let allow_local_fallback =
+                requested_scope.is_none() && remotes.is_empty() && config.prefers_hub_search();
             let offset = input.as_ref().and_then(|v| v.offset).unwrap_or(offset);
             let after = input.as_ref().and_then(|v| v.after.clone()).or(after);
             let before = input.as_ref().and_then(|v| v.before.clone()).or(before);
@@ -1223,6 +1232,7 @@ async fn run(cli: Cli, config: Config, config_path: PathBuf) -> Result<()> {
                 workspace,
                 mode,
                 scope,
+                allow_local_fallback,
                 remotes,
                 role,
                 no_tools,
@@ -2331,6 +2341,32 @@ async fn cmd_import(
     Ok(())
 }
 
+async fn search_local_report(
+    config: &Config,
+    query: &str,
+    opts: hstry_core::db::SearchOptions,
+    mode: SearchModeArg,
+) -> Result<hstry_core::recall::SearchReport> {
+    let service_expected = std::env::var("HSTRY_NO_SERVICE").is_err()
+        && config.service.enabled
+        && config.service.search_api;
+
+    if service_expected {
+        if let Some(results) = hstry_core::service::try_service_search_report(query, &opts).await? {
+            return Ok(results);
+        }
+        anyhow::bail!(
+            "Search service unavailable. Run `hstry service start` or set HSTRY_NO_SERVICE=1 to use local search."
+        );
+    }
+    if let Some(results) = try_api_search(query, &opts, mode).await? {
+        return Ok(results);
+    }
+    let db = Database::open(&config.database).await?;
+    apply_storage_config(&db, config);
+    Ok(db.search_report(query, opts).await?)
+}
+
 async fn cmd_search_fast(
     config: &Config,
     query: &str,
@@ -2339,6 +2375,7 @@ async fn cmd_search_fast(
     workspace: Option<String>,
     mode: SearchModeArg,
     scope: SearchScopeArg,
+    allow_local_fallback: bool,
     remotes: Vec<String>,
     roles: Vec<SearchRoleArg>,
     no_tools: bool,
@@ -2432,74 +2469,75 @@ async fn cmd_search_fast(
         }
     }
 
-    let need_local = scope != SearchScopeArg::Remote;
-    let need_remote = scope != SearchScopeArg::Local;
-    let remote_list = if need_remote {
-        let list = config.remotes_for_search(&remotes)?;
+    let mut report = hstry_core::recall::SearchReport::default();
+    let mut used_local_fallback = false;
+
+    if scope != SearchScopeArg::Remote {
+        report = search_local_report(config, query, opts.clone(), mode).await?;
+    }
+
+    if scope != SearchScopeArg::Local {
+        let remote_list = config.remotes_for_search(&remotes)?;
         for name in &remotes {
-            if !list.iter().any(|r| r.enabled && r.name == *name) {
+            if !remote_list.iter().any(|r| r.enabled && r.name == *name) {
                 anyhow::bail!("Unknown or disabled remote: {name}");
             }
         }
-        if !list.iter().any(|r| r.enabled) {
-            anyhow::bail!("No enabled remotes to search");
-        }
-        Some(list)
-    } else {
-        None
-    };
-
-    let local_fut = async {
-        if !need_local {
-            return None;
-        }
-        let service_expected = std::env::var("HSTRY_NO_SERVICE").is_err()
-            && config.service.enabled
-            && config.service.search_api;
-        let result: Result<hstry_core::recall::SearchReport, hstry_core::Error> = async {
-            if service_expected {
-                match hstry_core::service::try_service_search_report(query, &opts).await {
-                    Ok(Some(results)) => Ok(results),
-                    Ok(None) => Err(hstry_core::Error::Other(
-                        "Search service unavailable. Run `hstry service start` or set HSTRY_NO_SERVICE=1 to use local search.".into(),
-                    )),
-                    Err(err) => Err(err),
-                }
+        // Only a remote-only search has nothing left to report when no remote is
+        // enabled. `--scope all` must still return the local report computed above.
+        // Satellite default (implicit Remote) falls back to local instead of
+        // hard-failing (#14); explicit `--scope remote` still fails loudly (#28).
+        if scope == SearchScopeArg::Remote && !remote_list.iter().any(|r| r.enabled) {
+            if allow_local_fallback {
+                report = search_local_report(config, query, opts.clone(), mode).await?;
+                report
+                    .warnings
+                    .push("No enabled remotes to search; using local archive".into());
+                used_local_fallback = true;
             } else {
-                match try_api_search(query, &opts, mode).await {
-                    Ok(Some(results)) => Ok(results),
-                    Ok(None) => {
-                        let db = Database::open(&config.database).await.map_err(|e| {
-                            hstry_core::Error::Other(e.to_string())
-                        })?;
-                        apply_storage_config(&db, config);
-                        db.search_report(query, opts.clone()).await
+                anyhow::bail!("No enabled remotes to search");
+            }
+        } else {
+            match hstry_core::remote::search_remotes(&remote_list, query, &opts).await {
+                Ok(remote) => {
+                    if scope == SearchScopeArg::Remote {
+                        report.filters = remote.filters;
                     }
-                    Err(err) => Err(hstry_core::Error::Other(err.to_string())),
+                    report.hits.extend(remote.hits);
+                    report.stores.extend(remote.stores);
+                    report.attempts.extend(remote.attempts);
+                    report.warnings.extend(remote.warnings);
+                    report.has_more |= remote.has_more;
                 }
+                Err(err) if allow_local_fallback => {
+                    report = search_local_report(config, query, opts.clone(), mode).await?;
+                    report.warnings.push(format!("Remote search failed: {err}"));
+                    used_local_fallback = true;
+                }
+                Err(err) => return Err(err.into()),
             }
         }
-        .await;
-        Some(result)
-    };
-
-    let remote_fut = async {
-        if let Some(list) = remote_list.as_ref() {
-            Some(
-                hstry_core::remote::search_remotes(list, query, &opts)
-                    .await
-                    .map_err(|e| hstry_core::Error::Other(e.to_string())),
-            )
-        } else {
-            None
+    }
+    report.scope = if used_local_fallback {
+        "local_snapshot".into()
+    } else {
+        match scope {
+            SearchScopeArg::Local => "local_snapshot".into(),
+            SearchScopeArg::Remote if remotes.len() == 1 => format!("remote:{}", remotes[0]),
+            SearchScopeArg::Remote => "remote".into(),
+            SearchScopeArg::All => "local_snapshot_and_remote".into(),
         }
     };
-
-    let (local, remote) = tokio::join!(local_fut, remote_fut);
-    let mut report =
-        hstry_core::recall::combine_scoped_reports(scope.into(), &remotes, local, remote)?;
     report.offset = offset;
     report.warnings.splice(0..0, refresh_warnings);
+    if !used_local_fallback
+        && scope != SearchScopeArg::Local
+        && !(scope == SearchScopeArg::Remote && remotes.len() == 1)
+    {
+        report
+            .warnings
+            .push("Multi-store discovery: narrow to local or one named remote to paginate".into());
+    }
     report.available_remotes = config
         .remotes
         .iter()
@@ -7375,7 +7413,7 @@ async fn cmd_remote(
 
                 let result = match direction {
                     hstry_core::remote::SyncDirection::Pull => {
-                        remote::sync_from_remote(db, remote_config)
+                        remote::sync_from_remote(db, remote_config, &config.sync.device_namespace())
                             .await
                             .map(|(_, sync)| sync)
                     }
@@ -7391,7 +7429,12 @@ async fn cmd_remote(
                     }
                     hstry_core::remote::SyncDirection::Bidirectional => {
                         // Pull first, then push
-                        let pull_result = remote::sync_from_remote(db, remote_config).await;
+                        let pull_result = remote::sync_from_remote(
+                            db,
+                            remote_config,
+                            &config.sync.device_namespace(),
+                        )
+                        .await;
                         match pull_result {
                             Ok((_, mut sync)) => {
                                 if let Ok(push_sync) = remote::sync_to_remote(

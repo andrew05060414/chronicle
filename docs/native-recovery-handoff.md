@@ -26,12 +26,9 @@
 
 自动检查（最终树 = 提交后树 `eb63c9b`）：`scripts/pre-pr.ps1` 退出码 0，384 测试通过（`tmp/round3-pre-pr-2.log`）；`just check-all` 退出码 0。中间提交各自通过 `cargo check --workspace --all-targets`。`evidence_cli` 在干净基线上同样栈溢出，由 `188232c` 修复。
 
-## 私有运行数据位置（不得加入 Git）
+## 私有运行数据（不得加入 Git）
 
-- 数据与配置：Windows 独立 D 盘 `Data/chronicle-native`。配置已引用用户给定的外部密码文件；不要重建密钥、初始化覆盖仓库或输出密码。
-- 本工作区 `tmp/cursor-nas-restore-0afca009`：真实 Cursor NAS 恢复副本，含私人聊天；不可发布。
-- `tmp/native-tools`：测试用 Restic；`tmp/native-restic-gate.json`：合成 Restic 验收结果。
-- 所有 `tmp/`、`target/`、原始 DB/JSONL/快照和真实运行配置均排除于提交。
+本机数据根、密码文件引用和含私人聊天的恢复副本位置，记录在本机 native 数据根下的 `PRIVATE-NOTES.md`，不在仓库中。所有 `tmp/`、`target/`、原始 DB/JSONL/快照和真实运行配置均排除于提交。
 
 ## 下一步
 

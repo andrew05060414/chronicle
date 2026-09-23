@@ -20,8 +20,13 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 use walkdir::WalkDir;
 
+pub mod capture;
 mod codex;
 mod cursor;
+mod filehosts;
+pub use capture::*;
+pub mod components;
+pub use components::*;
 
 const VERSION: u32 = 1;
 
@@ -123,38 +128,103 @@ pub struct NativeConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SourceConfig {
     pub app: String,
+    #[serde(default = "default_component")]
     pub component: ComponentKind,
     pub slot: String,
     pub path: PathBuf,
     #[serde(default)]
     pub host_version: Option<String>,
+    #[serde(default)]
+    pub host_instance: Option<String>,
+    #[serde(default)]
+    pub source_kind: SourceKind,
+    #[serde(default)]
+    pub relative_paths: BTreeMap<String, String>,
+    #[serde(default)]
+    pub dependencies: Vec<String>,
+    #[serde(default)]
+    pub version_provenance: VersionProvenance,
+    #[serde(default)]
+    pub capture_status: CaptureStatus,
+}
+
+impl Default for SourceConfig {
+    fn default() -> Self {
+        Self {
+            app: String::new(),
+            component: ComponentKind::Sessions,
+            slot: String::new(),
+            path: PathBuf::new(),
+            host_version: None,
+            host_instance: None,
+            source_kind: SourceKind::Unknown,
+            relative_paths: BTreeMap::new(),
+            dependencies: Vec::new(),
+            version_provenance: VersionProvenance::Unknown,
+            capture_status: CaptureStatus::Unknown,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct FileEntry {
-    relative: String,
-    source: String,
-    bytes: u64,
-    sha256: String,
-    consistency: String,
+pub struct FileEntry {
+    pub relative: String,
+    pub source: String,
+    pub bytes: u64,
+    pub sha256: String,
+    pub consistency: String,
+    #[serde(default)]
+    pub role: FileRole,
+    #[serde(default)]
+    pub dependencies: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct Manifest {
-    version: u32,
-    snapshot_id: String,
-    device: String,
-    app_instance: String,
-    captured_at: DateTime<Utc>,
-    finished_at: DateTime<Utc>,
-    sources: Vec<SourceConfig>,
-    files: Vec<FileEntry>,
-    exclusions: Vec<String>,
-    unsupported: Vec<String>,
-    incremental: bool,
-    local_restic_snapshot: Option<String>,
-    remote_restic_snapshot: Option<String>,
-    remote_confirmed_at: Option<DateTime<Utc>>,
+pub struct Manifest {
+    pub version: u32,
+    pub snapshot_id: String,
+    pub device: String,
+    pub app_instance: String,
+    pub captured_at: DateTime<Utc>,
+    pub finished_at: DateTime<Utc>,
+    pub sources: Vec<SourceConfig>,
+    pub files: Vec<FileEntry>,
+    pub exclusions: Vec<String>,
+    pub unsupported: Vec<String>,
+    pub incremental: bool,
+    pub local_restic_snapshot: Option<String>,
+    pub remote_restic_snapshot: Option<String>,
+    pub remote_confirmed_at: Option<DateTime<Utc>>,
+}
+
+impl Manifest {
+    pub fn source_for_file(&self, relative_path: &str) -> Option<&SourceConfig> {
+        for source in &self.sources {
+            let prefix = format!("{}/{}/", source.app, source.slot);
+            if relative_path.starts_with(&prefix) {
+                return Some(source);
+            }
+        }
+        None
+    }
+
+    pub fn files_for_source<'a>(
+        &'a self,
+        source: &SourceConfig,
+    ) -> impl Iterator<Item = &'a FileEntry> {
+        let prefix = format!("{}/{}/", source.app, source.slot);
+        self.files
+            .iter()
+            .filter(move |f| f.relative.starts_with(&prefix))
+    }
+
+    pub fn source_by_app_and_slot(&self, app: &str, slot: &str) -> Option<&SourceConfig> {
+        self.sources.iter().find(|s| s.app == app && s.slot == slot)
+    }
+
+    pub fn sources_for_app<'a>(&'a self, app: &'a str) -> impl Iterator<Item = &'a SourceConfig> {
+        self.sources.iter().filter(move |s| s.app == app)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -209,10 +279,31 @@ enum InstallActionKind {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+struct JournalActionRecord {
+    index: usize,
+    #[serde(rename = "kind")]
+    action_kind: InstallActionKind,
+    target: PathBuf,
+    target_existed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    backup_file: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cursor_mutations: Option<cursor::CursorMutations>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct InstallJournal {
     snapshot_id: String,
+    #[serde(default)]
+    app: String,
     phase: String,
+    #[serde(default)]
+    target_fingerprint_before: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_fingerprint_after: Option<String>,
     completed: Vec<String>,
+    #[serde(default)]
+    mutations: Vec<JournalActionRecord>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -293,6 +384,7 @@ fn selected_sources(
             && args.app.as_ref().is_none_or(|app| app == &source.app)
     });
     for source in &sources {
+        ensure_component_supported(&source.app, source.component)?;
         ensure!(
             safe_relative(&source.app) && !source.app.contains('/'),
             "invalid app name"
@@ -319,7 +411,7 @@ fn default_sources(home: Option<&Path>) -> Vec<SourceConfig> {
             component,
             slot: slot.into(),
             path,
-            host_version: None,
+            ..Default::default()
         })
     };
     push(
@@ -415,6 +507,13 @@ fn default_sources(home: Option<&Path>) -> Vec<SourceConfig> {
     );
     push(
         &mut output,
+        "antigravity",
+        ComponentKind::Sessions,
+        "tmp",
+        home.join(".gemini/tmp"),
+    );
+    push(
+        &mut output,
         "grok",
         ComponentKind::Sessions,
         "sessions",
@@ -436,17 +535,18 @@ fn cursor_global_storage(home: &Path) -> PathBuf {
     config.join("Cursor/User/globalStorage")
 }
 
-fn detect_host_version(app: &str, source: &Path, _home: Option<&Path>) -> Option<String> {
+fn detect_host_version(
+    app: &str,
+    source: &Path,
+    home: Option<&Path>,
+) -> (Option<String>, VersionProvenance) {
     if app == "cursor" {
-        if let Some(version) = command_version("cursor") {
-            return Some(format!("cursor {version}"));
-        }
         let candidates = [
             source
                 .parent()
                 .and_then(Path::parent)
                 .map(Path::to_path_buf),
-            dirs::home_dir().map(|home| home.join("AppData/Local/Programs/cursor")),
+            home.map(|h| h.join("AppData/Local/Programs/cursor")),
         ];
         for config in candidates.into_iter().flatten() {
             for relative in ["resources/app/product.json", "resources/app/package.json"] {
@@ -457,36 +557,53 @@ fn detect_host_version(app: &str, source: &Path, _home: Option<&Path>) -> Option
                     continue;
                 };
                 if let Some(version) = json.get("version").and_then(serde_json::Value::as_str) {
-                    return Some(format!("cursor {version}"));
+                    return (Some(format!("cursor {version}")), VersionProvenance::Probed);
                 }
             }
         }
+        if home.is_none() {
+            if let Some(version) = command_version("cursor") {
+                return (Some(format!("cursor {version}")), VersionProvenance::Probed);
+            }
+            if let Some(h) = dirs::home_dir() {
+                let config = h.join("AppData/Local/Programs/cursor");
+                for relative in ["resources/app/product.json", "resources/app/package.json"] {
+                    if let Ok(value) = fs::read_to_string(config.join(relative))
+                        && let Ok(json) = serde_json::from_str::<serde_json::Value>(&value)
+                        && let Some(version) =
+                            json.get("version").and_then(serde_json::Value::as_str)
+                    {
+                        return (Some(format!("cursor {version}")), VersionProvenance::Probed);
+                    }
+                }
+            }
+        }
+        return (None, VersionProvenance::Unknown);
+    }
+    // If home is explicitly injected (e.g. tests or isolated runs),
+    // never execute real host binaries from system PATH!
+    if home.is_some() {
+        return (None, VersionProvenance::Unknown);
     }
     let command = match app {
         "codex" => "codex",
         "claude-code" => "claude",
         "grok" => "grok",
         "antigravity" => "agy",
-        _ => return None,
+        _ => return (None, VersionProvenance::Unknown),
     };
-    command_version(command).map(|version| format!("{command} {version}"))
+    if let Some(version) = command_version(command) {
+        (
+            Some(format!("{command} {version}")),
+            VersionProvenance::Probed,
+        )
+    } else {
+        (None, VersionProvenance::Unknown)
+    }
 }
 
 fn command_version(command: &str) -> Option<String> {
-    let output = Command::new(command).arg("--version").output().ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let text = format!(
-        "{} {}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let line = text.lines().find(|line| !line.trim().is_empty())?.trim();
-    if line.len() > 160 {
-        return None;
-    }
-    Some(line.to_string())
+    command_version_timeout(command, Duration::from_secs(2))
 }
 
 fn capture_sources(
@@ -496,11 +613,21 @@ fn capture_sources(
     home: Option<&Path>,
 ) -> Result<serde_json::Value> {
     let _lock = exclusive_lock(&root.join("capture.lock"))?;
-    let sources = selected_sources(config, args, home)?
+    let mut sources = selected_sources(config, args, home)?
         .into_iter()
         .map(|mut source| {
             if source.host_version.is_none() {
-                source.host_version = detect_host_version(&source.app, &source.path, home);
+                let (version, prov) = detect_host_version(&source.app, &source.path, home);
+                source.host_version = version;
+                source.version_provenance = prov;
+            } else if source.version_provenance == VersionProvenance::Unknown {
+                source.version_provenance = VersionProvenance::Configured;
+            }
+            if source.source_kind == SourceKind::Unknown {
+                source.source_kind = detect_source_kind(&source.path, &source.app);
+            }
+            if source.host_instance.is_none() {
+                source.host_instance = Some(format!("{}:{}", source.app, source.slot));
             }
             source
         })
@@ -522,9 +649,10 @@ fn capture_sources(
     let mut exclusions = Vec::new();
     let mut unsupported = Vec::new();
     let result = (|| -> Result<()> {
-        for source in &sources {
+        for source in &mut sources {
             if !source.path.exists() {
                 exclusions.push(format!("{} missing", source.path.display()));
+                source.capture_status = CaptureStatus::Failed;
                 continue;
             }
             if source
@@ -535,6 +663,7 @@ fn capture_sources(
                 unsupported.push(format!("{} unknown version", source.app));
             }
             copy_source(source, &staging, &mut files, &mut exclusions)?;
+            source.capture_status = CaptureStatus::Captured;
         }
         Ok(())
     })();
@@ -607,13 +736,39 @@ fn watch_sources(
         let mut last_capture = Instant::now();
         let mut first_event = Some(last_capture);
         let mut last_event = last_capture;
+        let mut watch_queue = load_watch_queue(root).unwrap_or_default();
         // Startup reconciliation happens before waiting for filesystem events.
         match capture_sources(config, root, args, home) {
             Ok(_) => {
                 first_event = None;
+                watch_queue.pending.clear();
+                let _ = save_watch_queue(root, &watch_queue);
                 let _ = replication_sender.send(());
             }
-            Err(error) => eprintln!("native startup capture pending: {error:#}"),
+            Err(error) => {
+                eprintln!("native startup capture pending: {error:#}");
+                let now = Utc::now();
+                for s in &sources {
+                    let key = format!("{}/{}", s.app, s.slot);
+                    let entry = watch_queue
+                        .pending
+                        .entry(key)
+                        .or_insert_with(|| WatchQueueEntry {
+                            app: s.app.clone(),
+                            slot: s.slot.clone(),
+                            source_path: s.path.clone(),
+                            reasons: vec!["startup reconciliation failed".into()],
+                            first_event_at: now,
+                            last_event_at: now,
+                            attempts: 0,
+                            last_error: None,
+                        });
+                    entry.attempts += 1;
+                    entry.last_error = Some(error.to_string());
+                    entry.last_event_at = now;
+                }
+                let _ = save_watch_queue(root, &watch_queue);
+            }
         }
         loop {
             match receiver.recv_timeout(Duration::from_secs(1)) {
@@ -626,6 +781,32 @@ fn watch_sources(
                     let now = Instant::now();
                     first_event.get_or_insert(now);
                     last_event = now;
+                    let now_utc = Utc::now();
+                    for path in &event.paths {
+                        for s in &sources {
+                            if path.starts_with(&s.path) {
+                                let key = format!("{}/{}", s.app, s.slot);
+                                let entry = watch_queue.pending.entry(key).or_insert_with(|| {
+                                    WatchQueueEntry {
+                                        app: s.app.clone(),
+                                        slot: s.slot.clone(),
+                                        source_path: s.path.clone(),
+                                        reasons: Vec::new(),
+                                        first_event_at: now_utc,
+                                        last_event_at: now_utc,
+                                        attempts: 0,
+                                        last_error: None,
+                                    }
+                                });
+                                let reason = format!("{:?}: {}", event.kind, path.display());
+                                if !entry.reasons.contains(&reason) {
+                                    entry.reasons.push(reason);
+                                }
+                                entry.last_event_at = now_utc;
+                            }
+                        }
+                    }
+                    let _ = save_watch_queue(root, &watch_queue);
                 }
                 Ok(Err(error)) => {
                     eprintln!("native watch error; reconciliation remains active: {error}");
@@ -634,20 +815,40 @@ fn watch_sources(
                 Err(RecvTimeoutError::Disconnected) => bail!("watch channel disconnected"),
                 _ => {}
             }
-            if capture_due(
-                last_capture.elapsed(),
-                first_event.map(|time| time.elapsed()),
-                last_event.elapsed(),
-            ) {
+            if capture_due_at(Instant::now(), last_capture, first_event, last_event) {
                 match capture_sources(config, root, args, home) {
                     Ok(_) => {
                         first_event = None;
+                        watch_queue.pending.clear();
+                        let _ = save_watch_queue(root, &watch_queue);
                         let _ = replication_sender.send(());
                     }
                     Err(error) => {
                         eprintln!("native capture pending: {error:#}");
                         first_event = Some(Instant::now());
                         last_event = Instant::now();
+                        let now_utc = Utc::now();
+                        for s in &sources {
+                            let key = format!("{}/{}", s.app, s.slot);
+                            let entry =
+                                watch_queue
+                                    .pending
+                                    .entry(key)
+                                    .or_insert_with(|| WatchQueueEntry {
+                                        app: s.app.clone(),
+                                        slot: s.slot.clone(),
+                                        source_path: s.path.clone(),
+                                        reasons: vec!["capture failed".into()],
+                                        first_event_at: now_utc,
+                                        last_event_at: now_utc,
+                                        attempts: 0,
+                                        last_error: None,
+                                    });
+                            entry.attempts += 1;
+                            entry.last_error = Some(error.to_string());
+                            entry.last_event_at = now_utc;
+                        }
+                        let _ = save_watch_queue(root, &watch_queue);
                     }
                 }
                 last_capture = Instant::now();
@@ -656,7 +857,7 @@ fn watch_sources(
     })
 }
 
-fn capture_due(
+pub fn capture_due(
     since_capture: Duration,
     since_first: Option<Duration>,
     since_event: Duration,
@@ -676,28 +877,94 @@ fn replicate_pending(config: &NativeConfig, root: &Path, include_remote: bool) -
         local_config.remote_repository = None;
     }
     let mut failures = Vec::new();
+    let mut rep_state = load_replication_state(root).unwrap_or_default();
     for manifest in list_manifests(root)? {
-        if (manifest.local_restic_snapshot.is_none()
-            || (include_remote
-                && config.remote_repository.is_some()
-                && manifest.remote_restic_snapshot.is_none()))
-            && let Err(error) = replicate(&local_config, root, Some(&manifest.snapshot_id))
-        {
-            failures.push(format!("{}: {error:#}", manifest.snapshot_id));
+        let local_needed = manifest.local_restic_snapshot.is_none();
+        let remote_needed = include_remote
+            && config.remote_repository.is_some()
+            && manifest.remote_restic_snapshot.is_none();
+        if local_needed || remote_needed {
+            match replicate(&local_config, root, Some(&manifest.snapshot_id)) {
+                Ok(_) => {
+                    rep_state.failures.remove(&manifest.snapshot_id);
+                }
+                Err(error) => {
+                    let err_str = format!("{:#}", error);
+                    let now = Utc::now();
+                    let current_manifest =
+                        load_manifest(&root.join("snapshots").join(&manifest.snapshot_id))
+                            .unwrap_or(manifest);
+                    let target = if current_manifest.local_restic_snapshot.is_none() {
+                        "local"
+                    } else {
+                        "remote"
+                    };
+                    let entry = rep_state
+                        .failures
+                        .entry(current_manifest.snapshot_id.clone())
+                        .or_insert_with(|| ReplicationFailureEntry {
+                            target: target.into(),
+                            snapshot_id: current_manifest.snapshot_id.clone(),
+                            attempts: 0,
+                            last_error: err_str.clone(),
+                            last_error_at: now,
+                            last_success_at: None,
+                        });
+                    entry.target = target.into();
+                    entry.attempts += 1;
+                    entry.last_error = err_str.clone();
+                    entry.last_error_at = now;
+                    failures.push(format!("{}: {err_str}", current_manifest.snapshot_id));
+                }
+            }
         }
     }
+    let _ = save_replication_state(root, &rep_state);
     ensure!(failures.is_empty(), "{}", failures.join("; "));
     Ok(())
 }
 
+fn is_shm(path: &Path) -> bool {
+    let s = path.to_string_lossy();
+    s.ends_with("-shm") || s.ends_with(".shm")
+}
+
+fn is_wal(path: &Path) -> bool {
+    let s = path.to_string_lossy();
+    s.ends_with("-wal") || s.ends_with(".wal")
+}
+
 fn copy_source(
-    source: &SourceConfig,
+    source: &mut SourceConfig,
     snapshot_root: &Path,
     files: &mut Vec<FileEntry>,
     exclusions: &mut Vec<String>,
 ) -> Result<()> {
     let root = safe_existing(&source.path)?;
+    if is_shm(&root) {
+        exclusions.push(format!(
+            "{}/{}: shm-not-standalone-artifact",
+            source.app, source.slot
+        ));
+        return Ok(());
+    }
+    let wal = PathBuf::from(format!("{}-wal", root.display()));
+    if wal.is_file() && wal.metadata().is_ok_and(|m| m.len() > 0) {
+        let wal_name = wal.file_name().unwrap().to_string_lossy().to_string();
+        if !source.dependencies.contains(&wal_name) {
+            source.dependencies.push(wal_name);
+        }
+    }
     if root.is_file() {
+        if source.component == ComponentKind::Projects
+            && let Err(e) = validate_project_component_file(&root)
+        {
+            exclusions.push(format!(
+                "{}/{}: project-safety-violation: {}",
+                source.app, source.slot, e
+            ));
+            return Ok(());
+        }
         if source.component != ComponentKind::Sessions && credential_content(&root) {
             exclusions.push(format!(
                 "{}/{}: credential-content",
@@ -705,20 +972,33 @@ fn copy_source(
             ));
             return Ok(());
         }
+        let root_name = root.file_name().unwrap().to_string_lossy();
+        if let Some(reason) = filehosts::is_unsupported_path(&source.app, &root_name) {
+            exclusions.push(format!("{}/{}: {reason}", source.app, source.slot));
+            return Ok(());
+        }
+        let stored = format!(
+            "{}/{}/{}",
+            source.app,
+            source.slot,
+            root.file_name().unwrap().to_string_lossy()
+        );
+        source.relative_paths.insert(
+            stored.clone(),
+            root.file_name().unwrap().to_string_lossy().to_string(),
+        );
         return copy_one(
             &root,
             &snapshot_root
                 .join(&source.app)
                 .join(&source.slot)
                 .join(root.file_name().unwrap()),
-            &format!(
-                "{}/{}/{}",
-                source.app,
-                source.slot,
-                root.file_name().unwrap().to_string_lossy()
-            ),
+            &stored,
             files,
             exclusions,
+            source.dependencies.clone(),
+            &source.app,
+            &source.slot,
         );
     }
     for entry in WalkDir::new(&root).follow_links(false) {
@@ -728,12 +1008,25 @@ fn copy_source(
             .strip_prefix(&root)?
             .to_string_lossy()
             .replace('\\', "/");
+        if entry.file_type().is_dir() {
+            continue;
+        }
+        if source.component == ComponentKind::Projects
+            && let Err(e) = validate_project_component_file(entry.path())
+        {
+            exclusions.push(format!("{relative}: project-safety-violation: {}", e));
+            continue;
+        }
         if credential_path(entry.path()) {
             exclusions.push(format!("{relative}: credential"));
             continue;
         }
         if source.component != ComponentKind::Sessions && credential_content(entry.path()) {
             exclusions.push(format!("{relative}: credential-content"));
+            continue;
+        }
+        if is_shm(entry.path()) {
+            exclusions.push(format!("{relative}: shm-not-standalone-artifact"));
             continue;
         }
         if sqlite_sidecar(entry.path()) {
@@ -744,8 +1037,22 @@ fn copy_source(
             exclusions.push(format!("{relative}: symlink"));
             continue;
         }
-        if entry.file_type().is_dir() {
+        if let Some(reason) = filehosts::is_unsupported_path(&source.app, &relative) {
+            exclusions.push(format!("{relative}: {reason}"));
             continue;
+        }
+        let stored = format!("{}/{}/{relative}", source.app, source.slot);
+        source
+            .relative_paths
+            .insert(stored.clone(), relative.clone());
+        let mut deps = Vec::new();
+        let wal = PathBuf::from(format!("{}-wal", entry.path().display()));
+        if wal.is_file() && wal.metadata().is_ok_and(|m| m.len() > 0) {
+            let wal_name = wal.file_name().unwrap().to_string_lossy().to_string();
+            deps.push(wal_name.clone());
+            if !source.dependencies.contains(&wal_name) {
+                source.dependencies.push(wal_name);
+            }
         }
         copy_one(
             entry.path(),
@@ -753,9 +1060,12 @@ fn copy_source(
                 .join(&source.app)
                 .join(&source.slot)
                 .join(&relative),
-            &format!("{}/{}/{relative}", source.app, source.slot),
+            &stored,
             files,
             exclusions,
+            deps,
+            &source.app,
+            &source.slot,
         )?;
     }
     Ok(())
@@ -767,9 +1077,16 @@ fn copy_one(
     stored: &str,
     files: &mut Vec<FileEntry>,
     exclusions: &mut Vec<String>,
+    dependencies: Vec<String>,
+    app: &str,
+    slot: &str,
 ) -> Result<()> {
     if credential_path(source) {
         exclusions.push(format!("{stored}: credential"));
+        return Ok(());
+    }
+    if is_shm(source) {
+        exclusions.push(format!("{stored}: shm-not-standalone-artifact"));
         return Ok(());
     }
     if stored.starts_with("cursor/")
@@ -781,9 +1098,16 @@ fn copy_one(
     if let Some(parent) = destination.parent() {
         fs::create_dir_all(parent)?;
     }
+
+    // Mid-copy truncate/replace detection: take stamp before copying
+    let stamp_before = SourceFileStamp::of(source)?;
+
     let consistency = if stored.starts_with("cursor/") && sqlite_path(source) {
         let omitted = cursor::backup_sessions(source, destination)?;
         exclusions.push(format!("{stored}: {omitted} non-session rows excluded"));
+        if let Err(err) = cursor::audit_projection(destination) {
+            exclusions.push(format!("{stored}: integrity: {err:#}"));
+        }
         "sqlite-session-projection"
     } else if sqlite_path(source) {
         backup_sqlite(source, destination)?;
@@ -792,13 +1116,20 @@ fn copy_one(
         fs::copy(source, destination)?;
         "file-copy"
     };
+
+    // Assert file was not modified or replaced during copy
+    stamp_before.assert_unmodified(source)?;
+
     let (bytes, sha) = hash_file(destination)?;
+    let role = detect_file_role(stored, app, slot);
     files.push(FileEntry {
         relative: stored.replace('\\', "/"),
         source: source.display().to_string(),
         bytes,
         sha256: sha,
         consistency: consistency.into(),
+        role,
+        dependencies,
     });
     Ok(())
 }
@@ -982,6 +1313,10 @@ fn restore_snapshot(
     home: Option<&Path>,
 ) -> Result<serde_json::Value> {
     if let Some(plan_path) = args.apply_plan {
+        if args.dry_run {
+            let raw: serde_json::Value = serde_json::from_str(&fs::read_to_string(&plan_path)?)?;
+            return Ok(serde_json::json!({"mode": "apply-dry-run", "plan": raw}));
+        }
         return apply_saved_plan(root, &plan_path, args.force);
     }
     let id = args.snapshot_id.context("snapshot id required")?;
@@ -1019,6 +1354,19 @@ fn restore_snapshot(
     )
 }
 
+fn normalize_path_str(p: &str) -> String {
+    p.replace('\\', "/").trim_end_matches('/').to_lowercase()
+}
+
+fn may_contain_credentials(target: &Path, kind: InstallActionKind) -> bool {
+    kind == InstallActionKind::CursorSessionMerge
+        || credential_path(target)
+        || target
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|name| name == "state.vscdb" || name == "state.vscdb-wal")
+}
+
 fn build_install_plan(
     manifest: &Manifest,
     app: &str,
@@ -1031,8 +1379,19 @@ fn build_install_plan(
         "unknown host version: native installation is refused"
     );
     let defaults = default_sources(home.or(dirs::home_dir().as_deref()));
+    let snapshot_dir = root.join("snapshots").join(&manifest.snapshot_id);
+    ensure!(
+        snapshot_dir.is_dir(),
+        "snapshot directory missing: {}",
+        snapshot_dir.display()
+    );
     let mut actions = Vec::new();
     let mut path_map = BTreeMap::new();
+    for mapping in mappings {
+        if let Some((from, to)) = mapping.split_once('=') {
+            path_map.insert(from.to_string(), PathBuf::from(to));
+        }
+    }
     let mut host_version = None;
     for source in manifest
         .sources
@@ -1053,17 +1412,90 @@ fn build_install_plan(
             .iter()
             .filter(|file| file.relative.starts_with(&prefix))
         {
+            let snapshot_file = snapshot_dir.join(&file.relative);
+            ensure!(
+                snapshot_file.is_file(),
+                "snapshot file missing: {}",
+                file.relative
+            );
             let relative = &file.relative[prefix.len()..];
-            let source_path = if source.path.is_file() {
+            ensure!(
+                safe_relative(relative) || relative.is_empty(),
+                "unsafe relative path: {relative}"
+            );
+            ensure!(
+                filehosts::is_unsupported_path(app, relative).is_none(),
+                "unsupported item in snapshot: {relative}"
+            );
+            let source_path = if source.path.file_name().and_then(|n| n.to_str()) == Some(relative)
+            {
                 source.path.clone()
             } else {
                 source.path.join(relative)
             };
-            let target_path = if target_source.path.extension().is_some() {
+            let same_location = normalize_path_str(&target_source.path.to_string_lossy())
+                == normalize_path_str(&source.path.to_string_lossy());
+            let target_path = if let Some(cwd_seg) =
+                filehosts::encoded_cwd_segment(app, &source.slot, relative)
+            {
+                if same_location {
+                    if target_source.path.extension().is_some() {
+                        target_source.path.clone()
+                    } else {
+                        target_source.path.join(relative)
+                    }
+                } else {
+                    let mapped_seg = mappings
+                        .iter()
+                        .find_map(|m| {
+                            m.split_once('=').and_then(|(from, to)| {
+                                if from == cwd_seg {
+                                    Some(to)
+                                } else {
+                                    None
+                                }
+                            })
+                        })
+                        .with_context(|| {
+                            format!(
+                                "blind cross-device path copy refused: path contains encoded cwd segment '{cwd_seg}' without explicit mapping"
+                            )
+                        })?;
+                    let rest = &relative[cwd_seg.len()..];
+                    let rest_trimmed = rest.trim_start_matches(['/', '\\']);
+                    let mapped_rel = if rest_trimmed.is_empty() {
+                        PathBuf::from(mapped_seg)
+                    } else {
+                        Path::new(mapped_seg).join(rest_trimmed)
+                    };
+                    if target_source.path.extension().is_some() {
+                        target_source.path.clone()
+                    } else {
+                        target_source.path.join(mapped_rel)
+                    }
+                }
+            } else if target_source.path.extension().is_some() {
                 target_source.path.clone()
             } else {
                 target_source.path.join(relative)
             };
+            ensure!(
+                !target_path
+                    .components()
+                    .any(|c| matches!(c, Component::ParentDir)),
+                "target path contains directory traversal: {}",
+                target_path.display()
+            );
+            let target_base = if target_source.path.extension().is_some() {
+                target_source.path.parent().unwrap_or(&target_source.path)
+            } else {
+                &target_source.path
+            };
+            ensure!(
+                target_path.starts_with(target_base),
+                "target path escapes destination root: {}",
+                target_path.display()
+            );
             validate_store(&target_path)?;
             let name = target_path
                 .file_name()
@@ -1100,6 +1532,10 @@ fn build_install_plan(
         host_version != "unknown",
         "unknown host version: native installation is refused"
     );
+    ensure!(
+        verified_install_host(app, &host_version),
+        "native installation has not been verified for this host version; isolate files with --target and complete host acceptance first"
+    );
     Ok(InstallPlan {
         kind: InstallPlanKind::Install,
         version: VERSION,
@@ -1118,18 +1554,29 @@ fn install_target_source(
     defaults: &[SourceConfig],
     mappings: &[String],
 ) -> Result<SourceConfig> {
-    let source_path = source
-        .path
-        .canonicalize()
-        .unwrap_or_else(|_| source.path.clone());
+    let source_norm = normalize_path_str(&source.path.to_string_lossy());
     for mapping in mappings {
         let (from, to) = mapping
             .split_once('=')
             .context("mapping must be SOURCE=TARGET")?;
-        if Path::new(from)
-            .canonicalize()
-            .unwrap_or_else(|_| PathBuf::from(from))
-            == source_path
+        let from_norm = normalize_path_str(from);
+        if from_norm == source_norm
+            || from.eq_ignore_ascii_case(&source.slot)
+            || from_norm
+                == format!(
+                    "{}/{}",
+                    source.app.to_lowercase(),
+                    source.slot.to_lowercase()
+                )
+        {
+            return Ok(SourceConfig {
+                path: PathBuf::from(to),
+                ..source.clone()
+            });
+        }
+        if let (Ok(from_canon), Ok(source_canon)) =
+            (Path::new(from).canonicalize(), source.path.canonicalize())
+            && from_canon == source_canon
         {
             return Ok(SourceConfig {
                 path: PathBuf::from(to),
@@ -1147,14 +1594,19 @@ fn install_target_source(
 fn install_fingerprint(actions: &[InstallAction]) -> Result<String> {
     let mut files = BTreeMap::new();
     for action in actions {
+        validate_store(&action.target)?;
         if action.target.exists() {
-            validate_store(&action.target)?;
             files.insert(
                 action.target.display().to_string(),
                 Some(hash_file(&action.target)?),
             );
         } else {
             files.insert(action.target.display().to_string(), None);
+        }
+        let wal = PathBuf::from(format!("{}-wal", action.target.display()));
+        if wal.exists() {
+            validate_store(&wal)?;
+            files.insert(wal.display().to_string(), Some(hash_file(&wal)?));
         }
     }
     Ok(hex(&Sha256::digest(serde_json::to_vec(&files)?)))
@@ -1217,47 +1669,103 @@ fn apply_install_plan(root: &Path, plan: InstallPlan, force: bool) -> Result<ser
     let mut prepared = Vec::new();
     for (index, action) in plan.actions.iter().enumerate() {
         validate_store(&action.target)?;
-        let backup = plan.rollback_dir.join(format!("{index:04}.backup"));
         let existed = action.target.exists();
-        if existed {
-            if sqlite_path(&action.target) {
-                backup_sqlite(&action.target, &backup)?;
+        let backup = if existed {
+            if may_contain_credentials(&action.target, action.kind) {
+                None
+            } else if sqlite_path(&action.target) {
+                let backup_file = plan.rollback_dir.join(format!("{index:04}.backup"));
+                backup_sqlite(&action.target, &backup_file)?;
+                Some(backup_file)
             } else {
-                fs::copy(&action.target, &backup)?;
+                let backup_file = plan.rollback_dir.join(format!("{index:04}.backup"));
+                fs::copy(&action.target, &backup_file)?;
+                Some(backup_file)
             }
-        }
+        } else {
+            None
+        };
         prepared.push((action, existed, backup));
     }
     let journal_path = plan.rollback_dir.join("journal.json");
     let mut journal = InstallJournal {
         snapshot_id: plan.snapshot_id.clone(),
+        app: plan.app.clone(),
         phase: "applying".into(),
+        target_fingerprint_before: plan.target_fingerprint.clone(),
+        target_fingerprint_after: None,
         completed: Vec::new(),
+        mutations: Vec::new(),
     };
     atomic_json(&journal_path, &journal)?;
-    let mut completed = 0;
     let result = (|| -> Result<()> {
-        for action in &plan.actions {
-            apply_install_action(root, &plan, action)?;
-            completed += 1;
+        for (index, action) in plan.actions.iter().enumerate() {
+            let cursor_mutations = apply_install_action(root, &plan, action)?;
             journal.completed.push(action.target.display().to_string());
+            journal.mutations.push(JournalActionRecord {
+                index,
+                action_kind: action.kind,
+                target: action.target.clone(),
+                target_existed: prepared[index].1,
+                backup_file: prepared[index].2.clone(),
+                cursor_mutations,
+            });
             atomic_json(&journal_path, &journal)?;
         }
         Ok(())
     })();
     if let Err(error) = result {
-        for (action, existed, backup) in prepared.iter().take(completed + 1).rev() {
-            restore_install_target(&action.target, *existed, backup)?;
+        for rec in journal.mutations.iter().rev() {
+            if rec.action_kind == InstallActionKind::CursorSessionMerge {
+                if rec.target_existed {
+                    if let Some(cm) = &rec.cursor_mutations {
+                        cursor::rollback_cursor_mutations(&rec.target, cm)?;
+                    }
+                } else {
+                    let _ = fs::remove_file(&rec.target);
+                    for suffix in ["-wal", "-shm", "-journal"] {
+                        let _ = fs::remove_file(PathBuf::from(format!(
+                            "{}{suffix}",
+                            rec.target.display()
+                        )));
+                    }
+                }
+            } else if rec.target_existed {
+                if let Some(backup) = &rec.backup_file {
+                    for suffix in ["-wal", "-shm", "-journal"] {
+                        let _ = fs::remove_file(PathBuf::from(format!(
+                            "{}{suffix}",
+                            rec.target.display()
+                        )));
+                    }
+                    fs::copy(backup, &rec.target)?;
+                }
+            } else {
+                let _ = fs::remove_file(&rec.target);
+                for suffix in ["-wal", "-shm", "-journal"] {
+                    let _ =
+                        fs::remove_file(PathBuf::from(format!("{}{suffix}", rec.target.display())));
+                }
+            }
         }
         journal.phase = "rolled-back-after-error".into();
         atomic_json(&journal_path, &journal)?;
         return Err(error);
     }
     journal.phase = "completed".into();
+    journal.target_fingerprint_after = Some(install_fingerprint(&plan.actions)?);
     atomic_json(&journal_path, &journal)?;
-    Ok(
-        serde_json::json!({"mode":"installed-files-and-indexes","snapshot_id":plan.snapshot_id,"app":plan.app,"actions":plan.actions.len(),"rollback":plan.rollback_dir,"file_verification":"passed","client_open":"not-verified","client_restart":"not-verified","continuation":"not-verified"}),
-    )
+    Ok(serde_json::json!({
+        "mode": "installed-files-and-indexes",
+        "snapshot_id": plan.snapshot_id,
+        "app": plan.app,
+        "actions": plan.actions.len(),
+        "rollback": plan.rollback_dir,
+        "file_verification": "passed",
+        "client_open": "not-verified",
+        "client_restart": "not-verified",
+        "continuation": "not-verified"
+    }))
 }
 
 fn verified_install_host(app: &str, version: &str) -> bool {
@@ -1271,7 +1779,11 @@ fn verified_install_host(app: &str, version: &str) -> bool {
         )
 }
 
-fn apply_install_action(root: &Path, plan: &InstallPlan, action: &InstallAction) -> Result<()> {
+fn apply_install_action(
+    root: &Path,
+    plan: &InstallPlan,
+    action: &InstallAction,
+) -> Result<Option<cursor::CursorMutations>> {
     let source = root
         .join("snapshots")
         .join(&plan.snapshot_id)
@@ -1280,7 +1792,7 @@ fn apply_install_action(root: &Path, plan: &InstallPlan, action: &InstallAction)
         InstallActionKind::Copy | InstallActionKind::CopyIfMissing => {
             if action.target.exists() {
                 if action.kind == InstallActionKind::CopyIfMissing {
-                    return Ok(());
+                    return Ok(None);
                 }
                 let source_hash = hash_file(&source)?;
                 ensure!(
@@ -1288,7 +1800,7 @@ fn apply_install_action(root: &Path, plan: &InstallPlan, action: &InstallAction)
                     "restore conflict: {}",
                     action.target.display()
                 );
-                return Ok(());
+                return Ok(None);
             }
             if let Some(parent) = action.target.parent() {
                 fs::create_dir_all(parent)?;
@@ -1304,15 +1816,18 @@ fn apply_install_action(root: &Path, plan: &InstallPlan, action: &InstallAction)
                 hash_file(&source)? == hash_file(&action.target)?,
                 "installed file hash mismatch"
             );
+            Ok(None)
         }
         InstallActionKind::CursorSessionMerge => {
             if let Some(parent) = action.target.parent() {
                 fs::create_dir_all(parent)?;
             }
-            cursor::merge_sessions(&source, &action.target)?;
+            let (_copied, muts) = cursor::merge_sessions_strictly(&source, &action.target)?;
+            Ok(Some(muts))
         }
         InstallActionKind::CodexIndexMerge => {
-            codex::merge_index(&source, &action.target, &plan.path_map)?
+            codex::merge_index(&source, &action.target, &plan.path_map)?;
+            Ok(None)
         }
         InstallActionKind::SessionIndexMerge => {
             let registered = plan
@@ -1320,22 +1835,10 @@ fn apply_install_action(root: &Path, plan: &InstallPlan, action: &InstallAction)
                 .iter()
                 .find(|action| action.kind == InstallActionKind::CodexIndexMerge)
                 .map(|action| action.target.as_path());
-            merge_session_index(&source, &action.target, registered)?
+            merge_session_index(&source, &action.target, registered)?;
+            Ok(None)
         }
     }
-    Ok(())
-}
-
-fn restore_install_target(target: &Path, existed: bool, backup: &Path) -> Result<()> {
-    for suffix in ["-wal", "-shm", "-journal"] {
-        let _ = fs::remove_file(PathBuf::from(format!("{}{suffix}", target.display())));
-    }
-    if existed {
-        fs::copy(backup, target)?;
-    } else {
-        let _ = fs::remove_file(target);
-    }
-    Ok(())
 }
 
 fn ensure_host_stopped(app: &str, force: bool) -> Result<()> {
@@ -1526,9 +2029,22 @@ fn extract_snapshot(root: &Path, id: &str, destination: &Path) -> Result<()> {
 fn status(root: &Path) -> Result<serde_json::Value> {
     let manifests = list_manifests(root)?;
     let latest = manifests.first();
-    Ok(
-        serde_json::json!({"local_snapshot": latest.map(|m| &m.snapshot_id), "local_restic_snapshot": latest.and_then(|m| m.local_restic_snapshot.clone()), "remote_confirmed_at": latest.and_then(|m| m.remote_confirmed_at), "remote_unknown_when_absent": latest.is_some_and(|m| m.remote_confirmed_at.is_none())}),
-    )
+    let watch_queue = load_watch_queue(root).unwrap_or_default();
+    let rep_state = load_replication_state(root).unwrap_or_default();
+    Ok(serde_json::json!({
+        "local_snapshot": latest.map(|m| &m.snapshot_id),
+        "local_restic_snapshot": latest.and_then(|m| m.local_restic_snapshot.clone()),
+        "remote_confirmed_at": latest.and_then(|m| m.remote_confirmed_at),
+        "remote_unknown_when_absent": latest.is_some_and(|m| m.remote_confirmed_at.is_none()),
+        "watch_queue": {
+            "pending_count": watch_queue.pending.len(),
+            "pending": watch_queue.pending,
+        },
+        "replication_failures": {
+            "failure_count": rep_state.failures.len(),
+            "failures": rep_state.failures,
+        }
+    }))
 }
 
 fn list_manifests(root: &Path) -> Result<Vec<Manifest>> {
@@ -1586,6 +2102,9 @@ fn fingerprint_sources(sources: &[SourceConfig]) -> Result<Fingerprint> {
                         )
                         && !credential_path(entry.path())
                     {
+                        if is_wal(entry.path()) && entry.metadata().is_ok_and(|m| m.len() == 0) {
+                            continue;
+                        }
                         validate_store(entry.path())?;
                         let relative = if source.path.is_file() {
                             entry.file_name().to_string_lossy().to_string()
@@ -1604,7 +2123,7 @@ fn fingerprint_sources(sources: &[SourceConfig]) -> Result<Fingerprint> {
                 }
                 if source.path.is_file() {
                     let wal = PathBuf::from(format!("{}-wal", source.path.display()));
-                    if wal.exists() {
+                    if wal.is_file() && wal.metadata().is_ok_and(|m| m.len() > 0) {
                         collect_fingerprint(
                             &wal,
                             &format!("{}/{}", source.app, source.slot),
@@ -1619,9 +2138,9 @@ fn fingerprint_sources(sources: &[SourceConfig]) -> Result<Fingerprint> {
                 &format!("{}/{}", source.app, source.slot),
                 &mut files,
             )?;
-            if sqlite_path(&source.path) {
+            if source.path.is_file() {
                 let wal = PathBuf::from(format!("{}-wal", source.path.display()));
-                if wal.exists() {
+                if wal.is_file() && wal.metadata().is_ok_and(|m| m.len() > 0) {
                     collect_fingerprint(
                         &wal,
                         &format!("{}/{}", source.app, source.slot),
@@ -1639,6 +2158,9 @@ fn collect_fingerprint(
     output: &mut BTreeMap<String, (u64, String)>,
 ) -> Result<()> {
     if path.is_file() {
+        if is_wal(path) && path.metadata().is_ok_and(|m| m.len() == 0) {
+            return Ok(());
+        }
         output.insert(
             format!("{prefix}/{}", path.file_name().unwrap().to_string_lossy()),
             file_stamp(path)?,
@@ -1651,6 +2173,9 @@ fn collect_fingerprint(
             && !credential_path(entry.path())
             && !entry.path().to_string_lossy().ends_with("-shm")
         {
+            if is_wal(entry.path()) && entry.metadata().is_ok_and(|m| m.len() == 0) {
+                continue;
+            }
             let relative = entry
                 .path()
                 .strip_prefix(path)?
@@ -1723,7 +2248,7 @@ fn credential_content(path: &Path) -> bool {
         return true;
     };
     if bytes.contains(&0) {
-        return false;
+        return true;
     }
     let text = String::from_utf8_lossy(&bytes).to_ascii_lowercase();
     if path
@@ -1941,7 +2466,7 @@ mod tests {
                 component: ComponentKind::Sessions,
                 slot: "sessions".into(),
                 path: source,
-                host_version: None,
+                ..Default::default()
             }],
             ..Default::default()
         };
@@ -2002,6 +2527,7 @@ mod tests {
                 slot: "global-storage".into(),
                 path: source_db,
                 host_version: Some("fixture-v1".into()),
+                ..Default::default()
             }],
             ..Default::default()
         };
@@ -2021,7 +2547,7 @@ mod tests {
         stale.actions[0].target = temp.path().join("changed-after-plan");
         assert!(apply_install_plan(&root, stale, true).is_err());
         assert_eq!(
-            apply_install_plan(&root, plan, true).unwrap()["file_verification"],
+            apply_install_plan(&root, plan.clone(), true).unwrap()["file_verification"],
             "passed"
         );
         let target_db = Connection::open(&target).unwrap();
@@ -2045,6 +2571,220 @@ mod tests {
                 .unwrap(),
             "restored-message"
         );
+        drop(target_db);
+
+        // 1. Verify rollback directory NEVER backs up the whole target SQLite DB or leaks credentials
+        assert!(
+            !plan.rollback_dir.join("0000.backup").exists(),
+            "whole target SQLite DB must NOT be backed up"
+        );
+        for entry in fs::read_dir(&plan.rollback_dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_some_and(|ext| ext == "backup") {
+                let content = fs::read_to_string(&path).unwrap_or_default();
+                assert!(
+                    !content.contains("FAKE_TARGET_AUTH"),
+                    "credential leaked to rollback directory!"
+                );
+            }
+        }
+        let journal_content = fs::read_to_string(plan.rollback_dir.join("journal.json")).unwrap();
+        assert!(
+            !journal_content.contains("FAKE_TARGET_AUTH"),
+            "credential leaked to journal.json!"
+        );
+        let journal: InstallJournal = serde_json::from_str(&journal_content).unwrap();
+        assert_eq!(journal.phase, "completed");
+        assert_eq!(journal.mutations.len(), 1);
+        assert_eq!(
+            journal.mutations[0]
+                .cursor_mutations
+                .as_ref()
+                .unwrap()
+                .inserted_item_table,
+            vec!["composerData:session-1".to_string()]
+        );
+
+        // 2. Idempotent re-run with identical content allows successfully
+        let idempotent_plan =
+            build_install_plan(&manifest, "cursor", Some(&home), &[], &root).unwrap();
+        assert_eq!(
+            apply_install_plan(&root, idempotent_plan, true).unwrap()["file_verification"],
+            "passed"
+        );
+
+        // 3. Conflict rejection: same ID with different content strictly rejected
+        let target_db = Connection::open(&target).unwrap();
+        target_db
+            .execute(
+                "UPDATE ItemTable SET value='conflict-edit' WHERE key='composerData:session-1'",
+                [],
+            )
+            .unwrap();
+        drop(target_db);
+        let conflict_plan =
+            build_install_plan(&manifest, "cursor", Some(&home), &[], &root).unwrap();
+        let conflict_err = apply_install_plan(&root, conflict_plan, true).unwrap_err();
+        assert!(
+            conflict_err.to_string().contains("conflict"),
+            "expected conflict error, got: {conflict_err}"
+        );
+        // Verify conflicting value was untouched
+        let target_db = Connection::open(&target).unwrap();
+        assert_eq!(
+            target_db
+                .query_row(
+                    "SELECT value FROM ItemTable WHERE key='composerData:session-1'",
+                    [],
+                    |r| r.get::<_, String>(0)
+                )
+                .unwrap(),
+            "conflict-edit"
+        );
+        assert_eq!(
+            target_db
+                .query_row(
+                    "SELECT value FROM ItemTable WHERE key='cursor.accessToken'",
+                    [],
+                    |r| r.get::<_, String>(0)
+                )
+                .unwrap(),
+            "FAKE_TARGET_AUTH"
+        );
+        drop(target_db);
+
+        // 4. Rollback on subsequent failure: clean rollback of Cursor mutations while preserving auth
+        // Reset target to clean state with only auth
+        let target_db = Connection::open(&target).unwrap();
+        target_db
+            .execute(
+                "DELETE FROM ItemTable WHERE key='composerData:session-1'",
+                [],
+            )
+            .unwrap();
+        target_db
+            .execute(
+                "DELETE FROM composerHeaders WHERE composerId='session-1'",
+                [],
+            )
+            .unwrap();
+        drop(target_db);
+
+        let mut failing_plan =
+            build_install_plan(&manifest, "cursor", Some(&home), &[], &root).unwrap();
+        // Add a second action that is guaranteed to fail
+        failing_plan.actions.push(InstallAction {
+            kind: InstallActionKind::Copy,
+            source: "non_existent_source.json".into(),
+            target: home.join("failing_target.json"),
+        });
+        failing_plan.target_fingerprint = install_fingerprint(&failing_plan.actions).unwrap();
+        let fail_res = apply_install_plan(&root, failing_plan.clone(), true);
+        assert!(fail_res.is_err());
+        // Verify Cursor mutations were cleanly rolled back!
+        let target_db = Connection::open(&target).unwrap();
+        let session_key_exists: bool = target_db
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM ItemTable WHERE key='composerData:session-1')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            !session_key_exists,
+            "session key should have been rolled back"
+        );
+        assert_eq!(
+            target_db
+                .query_row(
+                    "SELECT value FROM ItemTable WHERE key='cursor.accessToken'",
+                    [],
+                    |r| r.get::<_, String>(0)
+                )
+                .unwrap(),
+            "FAKE_TARGET_AUTH"
+        );
+        let journal_after_fail: InstallJournal = serde_json::from_str(
+            &fs::read_to_string(failing_plan.rollback_dir.join("journal.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(journal_after_fail.phase, "rolled-back-after-error");
+    }
+
+    #[test]
+    fn cursor_capture_allows_orphan_bubble_and_install_refuses_preserving_target() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let source_root = home.join("source");
+        fs::create_dir_all(&source_root).unwrap();
+        let source_db = source_root.join("state.vscdb");
+        let source = Connection::open(&source_db).unwrap();
+        source
+            .execute_batch(
+                "CREATE TABLE ItemTable(key TEXT PRIMARY KEY,value BLOB);
+                 INSERT INTO ItemTable VALUES('bubbleId:orphan-comp:b1', '{\"text\":\"orphan\"}');",
+            )
+            .unwrap();
+        drop(source);
+
+        let root = temp.path().join("backup");
+        let config = NativeConfig {
+            sources: vec![SourceConfig {
+                app: "cursor".into(),
+                component: ComponentKind::Sessions,
+                slot: "global-storage".into(),
+                path: source_db,
+                host_version: Some("fixture-v1".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let captured = capture_sources(&config, &root, &AppArgs::default(), Some(&home)).unwrap();
+        assert_eq!(captured["status"], "captured");
+        let id = captured["snapshot_id"].as_str().unwrap();
+        let manifest = verify_local(&root, id).unwrap();
+
+        // Capture-level exclusions contain the integrity note for (a)
+        assert!(manifest.exclusions.iter().any(|e| {
+            e.contains("cursor/")
+                && e.contains("state.vscdb: integrity:")
+                && e.contains("missing dependency")
+                && e.contains("orphan bubble")
+        }));
+
+        let target = home.join("AppData/Roaming/Cursor/User/globalStorage/state.vscdb");
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        let target_db = Connection::open(&target).unwrap();
+        target_db
+            .execute_batch(
+                "CREATE TABLE ItemTable(key TEXT PRIMARY KEY,value BLOB);
+                 INSERT INTO ItemTable VALUES('cursor.accessToken','FAKE_TARGET_AUTH');",
+            )
+            .unwrap();
+        drop(target_db);
+
+        let target_bytes_before = fs::read(&target).unwrap();
+        let plan = build_install_plan(&manifest, "cursor", Some(&home), &[], &root).unwrap();
+        let err = apply_install_plan(&root, plan, true).unwrap_err();
+        assert!(
+            err.to_string().contains("missing dependency"),
+            "expected missing dependency error, got: {err}"
+        );
+
+        // Target DB is byte-identical afterwards (including the fake auth key)
+        let target_bytes_after = fs::read(&target).unwrap();
+        assert_eq!(target_bytes_before, target_bytes_after);
+
+        let target_db = Connection::open(&target).unwrap();
+        let auth: String = target_db
+            .query_row(
+                "SELECT value FROM ItemTable WHERE key='cursor.accessToken'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(auth, "FAKE_TARGET_AUTH");
     }
 
     #[test]
@@ -2086,6 +2826,7 @@ mod tests {
                 slot: "sessions".into(),
                 path: source_root.join("sessions"),
                 host_version: Some("fixture-v1".into()),
+                ..Default::default()
             },
             SourceConfig {
                 app: "codex".into(),
@@ -2093,6 +2834,7 @@ mod tests {
                 slot: "state".into(),
                 path: source_state,
                 host_version: Some("fixture-v1".into()),
+                ..Default::default()
             },
             SourceConfig {
                 app: "codex".into(),
@@ -2100,6 +2842,7 @@ mod tests {
                 slot: "thread-history".into(),
                 path: source_history,
                 host_version: Some("fixture-v1".into()),
+                ..Default::default()
             },
             SourceConfig {
                 app: "codex".into(),
@@ -2107,6 +2850,7 @@ mod tests {
                 slot: "index".into(),
                 path: source_index,
                 host_version: Some("fixture-v1".into()),
+                ..Default::default()
             },
         ];
         let root = temp.path().join("backup");
@@ -2190,6 +2934,7 @@ mod tests {
                     slot: slot.into(),
                     path: source,
                     host_version: Some("fixture-v1".into()),
+                    ..Default::default()
                 }],
                 ..Default::default()
             };
@@ -2210,6 +2955,123 @@ mod tests {
     }
 
     #[test]
+    fn default_config_selects_only_sessions() {
+        let home = tempfile::tempdir().unwrap();
+        let codex_sessions = home.path().join(".codex/sessions");
+        fs::create_dir_all(&codex_sessions).unwrap();
+        let sources = selected_sources(
+            &NativeConfig::default(),
+            &AppArgs::default(),
+            Some(home.path()),
+        )
+        .unwrap();
+        assert!(!sources.is_empty());
+        for source in sources {
+            assert_eq!(source.component, ComponentKind::Sessions);
+        }
+    }
+
+    #[test]
+    fn unsupported_host_component_fails_closed() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("backup");
+        let source_path = temp.path().join("plugins");
+        fs::create_dir_all(&source_path).unwrap();
+        fs::write(source_path.join("config.json"), b"{}").unwrap();
+        let config = NativeConfig {
+            sources: vec![SourceConfig {
+                app: "codex".into(),
+                component: ComponentKind::Plugins,
+                slot: "plugins".into(),
+                path: source_path,
+                host_version: Some("codex 1.0".into()),
+                ..Default::default()
+            }],
+            components: vec![ComponentKind::Plugins],
+            ..Default::default()
+        };
+        let err = capture_sources(&config, &root, &AppArgs::default(), None).unwrap_err();
+        assert!(err.to_string().contains("codex"));
+        assert!(err.to_string().contains("Plugins") || err.to_string().contains("plugins"));
+        assert!(!root.join("snapshots").exists());
+    }
+
+    #[test]
+    fn projects_component_captures_only_metadata_never_source_or_git() {
+        let temp = tempfile::tempdir().unwrap();
+        let proj_dir = temp.path().join("my-project");
+        fs::create_dir_all(proj_dir.join("src")).unwrap();
+        fs::create_dir_all(proj_dir.join(".git")).unwrap();
+        fs::write(
+            proj_dir.join("project.json"),
+            b"{\"id\":\"p1\",\"workspace_path\":\"/my/work\"}",
+        )
+        .unwrap();
+        fs::write(proj_dir.join("src/main.rs"), b"fn main() {}").unwrap();
+        fs::write(proj_dir.join(".git/config"), b"[core]").unwrap();
+
+        let root = temp.path().join("backup");
+        let config = NativeConfig {
+            sources: vec![SourceConfig {
+                app: "codex".into(),
+                component: ComponentKind::Projects,
+                slot: "projects".into(),
+                path: proj_dir,
+                host_version: Some("fixture-v1".into()),
+                ..Default::default()
+            }],
+            components: vec![ComponentKind::Projects],
+            ..Default::default()
+        };
+
+        let captured = capture_sources(&config, &root, &AppArgs::default(), None).unwrap();
+        assert_eq!(captured["files"], 1);
+        let snapshot = root
+            .join("snapshots")
+            .join(captured["snapshot_id"].as_str().unwrap());
+        assert!(snapshot.join("codex/projects/project.json").is_file());
+        assert!(!snapshot.join("codex/projects/src/main.rs").exists());
+        assert!(!snapshot.join("codex/projects/.git/config").exists());
+    }
+
+    #[test]
+    fn plugins_component_excluded_from_install_plan() {
+        let temp = tempfile::tempdir().unwrap();
+        let plugins_dir = temp.path().join("plugins");
+        fs::create_dir_all(&plugins_dir).unwrap();
+        fs::write(plugins_dir.join("plugin.json"), b"{\"enabled\":false}").unwrap();
+
+        let root = temp.path().join("backup");
+        let config = NativeConfig {
+            sources: vec![SourceConfig {
+                app: "claude-code".into(),
+                component: ComponentKind::Plugins,
+                slot: "plugins".into(),
+                path: plugins_dir,
+                host_version: Some("fixture-v1".into()),
+                ..Default::default()
+            }],
+            components: vec![ComponentKind::Plugins],
+            ..Default::default()
+        };
+
+        let captured = capture_sources(&config, &root, &AppArgs::default(), None).unwrap();
+        let manifest = verify_local(&root, captured["snapshot_id"].as_str().unwrap()).unwrap();
+        assert_eq!(manifest.files.len(), 1);
+
+        // build_install_plan only installs ComponentKind::Sessions, so plugins must produce no installable files
+        let home = temp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        let plan_err =
+            build_install_plan(&manifest, "claude-code", Some(&home), &[], &root).unwrap_err();
+        assert!(
+            plan_err
+                .to_string()
+                .contains("no installable files for claude-code")
+        );
+    }
+
+    #[test]
     fn optional_components_exclude_credential_values_even_with_safe_filenames() {
         let temp = tempfile::tempdir().unwrap();
         let source = temp.path().join("settings");
@@ -2220,15 +3082,33 @@ mod tests {
             b"{\"theme\":\"dark\",\"nested\":{\"apiKey\":\"FAKE_SECRET\"}}",
         )
         .unwrap();
+        fs::write(
+            source.join("auth-header.json"),
+            b"{\"theme\":\"dark\",\"headers\":{\"Authorization\":\"Bearer secret-token\"}}",
+        )
+        .unwrap();
+        fs::write(
+            source.join("cookie.json"),
+            b"{\"theme\":\"dark\",\"cookie\":\"session=xyz123\"}",
+        )
+        .unwrap();
         fs::write(source.join("plugin.js"), b"const password = 'FAKE_SECRET';").unwrap();
+
+        // Small SQLite db containing a token row
+        let mixed_db = source.join("mixed.sqlite");
+        let conn = Connection::open(&mixed_db).unwrap();
+        conn.execute_batch("CREATE TABLE credentials(service TEXT, token TEXT); INSERT INTO credentials VALUES ('auth', 'secret-val');").unwrap();
+        drop(conn);
+
         let root = temp.path().join("backup");
         let config = NativeConfig {
             sources: vec![SourceConfig {
-                app: "fixture".into(),
+                app: "claude-code".into(),
                 component: ComponentKind::Settings,
                 slot: "settings".into(),
                 path: source,
                 host_version: Some("fixture-v1".into()),
+                ..Default::default()
             }],
             components: vec![ComponentKind::Settings],
             ..Default::default()
@@ -2240,9 +3120,20 @@ mod tests {
         let snapshot = root
             .join("snapshots")
             .join(captured["snapshot_id"].as_str().unwrap());
-        assert!(snapshot.join("fixture/settings/safe.json").is_file());
-        assert!(!snapshot.join("fixture/settings/looks-safe.json").exists());
-        assert!(!snapshot.join("fixture/settings/plugin.js").exists());
+        assert!(snapshot.join("claude-code/settings/safe.json").is_file());
+        assert!(
+            !snapshot
+                .join("claude-code/settings/looks-safe.json")
+                .exists()
+        );
+        assert!(
+            !snapshot
+                .join("claude-code/settings/auth-header.json")
+                .exists()
+        );
+        assert!(!snapshot.join("claude-code/settings/cookie.json").exists());
+        assert!(!snapshot.join("claude-code/settings/plugin.js").exists());
+        assert!(!snapshot.join("claude-code/settings/mixed.sqlite").exists());
     }
 
     #[test]
@@ -2260,7 +3151,7 @@ mod tests {
                 component: ComponentKind::Sessions,
                 slot: "global-storage".into(),
                 path: source_root.clone(),
-                host_version: None,
+                ..Default::default()
             }],
             ..Default::default()
         };
@@ -2315,6 +3206,7 @@ mod tests {
                 slot: "sessions".into(),
                 path: temp.path().join("sessions"),
                 host_version: Some("fixture".into()),
+                ..Default::default()
             }],
             ..NativeConfig::default()
         };
@@ -2351,6 +3243,7 @@ mod tests {
             slot: "sessions".into(),
             path: source_root,
             host_version: Some("fixture".into()),
+            ..Default::default()
         };
         let password = temp.path().join("password");
         fs::write(&password, "synthetic-test-password").unwrap();
@@ -2426,6 +3319,827 @@ mod tests {
                 .query_row("SELECT count(*) FROM steps", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
             1
+        );
+    }
+
+    #[test]
+    fn install_plan_is_self_contained_after_source_deleted() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let source_dir = home.join("source/codex");
+        fs::create_dir_all(source_dir.join("sessions")).unwrap();
+        fs::write(
+            source_dir.join("sessions/test.jsonl"),
+            b"{\"type\":\"session\"}\n",
+        )
+        .unwrap();
+        let root = temp.path().join("backup");
+        let config = NativeConfig {
+            sources: vec![SourceConfig {
+                app: "codex".into(),
+                component: ComponentKind::Sessions,
+                slot: "sessions".into(),
+                path: source_dir.join("sessions"),
+                host_version: Some("fixture-v1".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let captured = capture_sources(&config, &root, &AppArgs::default(), Some(&home)).unwrap();
+        let id = captured["snapshot_id"].as_str().unwrap();
+
+        // DELETE the original source files completely
+        fs::remove_dir_all(&source_dir).unwrap();
+        assert!(!source_dir.exists());
+
+        // Verify build_install_plan works directly from snapshot directory
+        let manifest = verify_local(&root, id).unwrap();
+        let target_dir = home.join("target/codex/sessions");
+        let plan = build_install_plan(
+            &manifest,
+            "codex",
+            Some(&home),
+            &[format!("sessions={}", target_dir.display())],
+            &root,
+        )
+        .unwrap();
+        assert_eq!(plan.actions.len(), 1);
+        assert_eq!(plan.actions[0].target, target_dir.join("test.jsonl"));
+        let res = apply_install_plan(&root, plan, true).unwrap();
+        assert_eq!(res["file_verification"], "passed");
+        assert!(target_dir.join("test.jsonl").is_file());
+    }
+
+    #[test]
+    fn host_version_gate_fail_closed_even_with_force() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let source_file = home.join("source/test.jsonl");
+        fs::create_dir_all(source_file.parent().unwrap()).unwrap();
+        fs::write(&source_file, b"content").unwrap();
+        let root = temp.path().join("backup");
+        let config = NativeConfig {
+            sources: vec![SourceConfig {
+                app: "claude-code".into(),
+                component: ComponentKind::Sessions,
+                slot: "projects".into(),
+                path: source_file,
+                host_version: Some("fixture-v1".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let captured = capture_sources(&config, &root, &AppArgs::default(), Some(&home)).unwrap();
+        let id = captured["snapshot_id"].as_str().unwrap();
+        let manifest = verify_local(&root, id).unwrap();
+
+        // 1. Build plan fails if host_version is unverified
+        let mut unverified_manifest = manifest.clone();
+        unverified_manifest.sources[0].host_version = Some("unverified-future-v99".into());
+        let err = build_install_plan(&unverified_manifest, "claude-code", Some(&home), &[], &root)
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("native installation has not been verified")
+        );
+
+        // 2. Even if a forged plan bypasses build_install_plan, apply_install_plan MUST fail closed with force=true
+        let mut plan =
+            build_install_plan(&manifest, "claude-code", Some(&home), &[], &root).unwrap();
+        plan.host_version = "unverified-future-v99".into();
+        let apply_err = apply_install_plan(&root, plan, true).unwrap_err();
+        assert!(
+            apply_err
+                .to_string()
+                .contains("native installation has not been verified")
+        );
+    }
+
+    #[test]
+    fn dry_run_makes_zero_target_writes() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let source_file = home.join("source/session.jsonl");
+        fs::create_dir_all(source_file.parent().unwrap()).unwrap();
+        fs::write(&source_file, b"content").unwrap();
+        let root = temp.path().join("backup");
+        let config = NativeConfig {
+            sources: vec![SourceConfig {
+                app: "grok".into(),
+                component: ComponentKind::Sessions,
+                slot: "sessions".into(),
+                path: source_file,
+                host_version: Some("fixture-v1".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let captured = capture_sources(&config, &root, &AppArgs::default(), Some(&home)).unwrap();
+        let id = captured["snapshot_id"].as_str().unwrap();
+
+        let target_dir = home.join(".grok/sessions");
+        assert!(!target_dir.exists());
+
+        // Test restore with into + dry_run
+        let restore_args = RestoreArgs {
+            snapshot_id: Some(id.to_string()),
+            target: None,
+            into: Some("grok".to_string()),
+            dry_run: true,
+            apply_plan: None,
+            map: vec![],
+            force: false,
+        };
+        let res = restore_snapshot(&root, restore_args, Some(&home)).unwrap();
+        assert_eq!(res["mode"], "install-dry-run");
+        // Verify ZERO writes made to target_dir or plans
+        assert!(
+            !target_dir.exists(),
+            "dry run must make ZERO writes to target directory"
+        );
+        assert!(
+            !root.join("plans").exists(),
+            "dry run must not write plan files"
+        );
+
+        // Test extract with target + dry_run
+        let extract_args = RestoreArgs {
+            snapshot_id: Some(id.to_string()),
+            target: Some(target_dir.clone()),
+            into: None,
+            dry_run: true,
+            apply_plan: None,
+            map: vec![],
+            force: false,
+        };
+        let res2 = restore_snapshot(&root, extract_args, Some(&home)).unwrap();
+        assert_eq!(res2["mode"], "extract-dry-run");
+        assert!(
+            !target_dir.exists(),
+            "extract dry run must make ZERO writes"
+        );
+    }
+
+    #[test]
+    fn install_path_mapping_prevents_directory_traversal() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let source_file = home.join("source/session.jsonl");
+        fs::create_dir_all(source_file.parent().unwrap()).unwrap();
+        fs::write(&source_file, b"content").unwrap();
+        let root = temp.path().join("backup");
+        let config = NativeConfig {
+            sources: vec![SourceConfig {
+                app: "claude-code".into(),
+                component: ComponentKind::Sessions,
+                slot: "projects".into(),
+                path: source_file,
+                host_version: Some("fixture-v1".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let captured = capture_sources(&config, &root, &AppArgs::default(), Some(&home)).unwrap();
+        let id = captured["snapshot_id"].as_str().unwrap();
+        let manifest = verify_local(&root, id).unwrap();
+
+        // Attempt traversal mapping
+        let bad_mapping = format!("projects={}/../../escaped", home.display());
+        let err = build_install_plan(&manifest, "claude-code", Some(&home), &[bad_mapping], &root)
+            .unwrap_err();
+        assert!(err.to_string().contains("traversal") || err.to_string().contains("escapes"));
+    }
+
+    #[test]
+    fn explain_snapshot_after_deleting_synthetic_sources_from_snapshot_only() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let codex_dir = home.join("codex_sessions");
+        let cursor_dir = home.join("cursor_data");
+        let claude_dir = home.join("claude_projects");
+        fs::create_dir_all(&codex_dir).unwrap();
+        fs::create_dir_all(&cursor_dir).unwrap();
+        fs::create_dir_all(&claude_dir).unwrap();
+
+        // 1. Codex session rollout
+        fs::write(
+            codex_dir.join("session-1.jsonl"),
+            b"{\"type\":\"session_meta\"}\n",
+        )
+        .unwrap();
+        // 2. Cursor SQLite session database
+        let cursor_db = cursor_dir.join("state.vscdb");
+        let conn = Connection::open(&cursor_db).unwrap();
+        conn.execute_batch("CREATE TABLE ItemTable(key TEXT PRIMARY KEY, value TEXT); INSERT INTO ItemTable VALUES('composerData:c1', 'hello');").unwrap();
+        drop(conn);
+        // 3. Claude-code project session
+        fs::write(claude_dir.join("proj.jsonl"), b"{\"project\":\"test\"}\n").unwrap();
+
+        let root = temp.path().join("backup");
+        let config = NativeConfig {
+            data_root: Some(root.clone()),
+            sources: vec![
+                SourceConfig {
+                    app: "codex".into(),
+                    component: ComponentKind::Sessions,
+                    slot: "sessions".into(),
+                    path: codex_dir.clone(),
+                    host_version: Some("fixture-v1".into()),
+                    ..Default::default()
+                },
+                SourceConfig {
+                    app: "cursor".into(),
+                    component: ComponentKind::Sessions,
+                    slot: "global-storage".into(),
+                    path: cursor_db.clone(),
+                    host_version: Some("fixture-v1".into()),
+                    ..Default::default()
+                },
+                SourceConfig {
+                    app: "claude-code".into(),
+                    component: ComponentKind::Sessions,
+                    slot: "projects".into(),
+                    path: claude_dir.clone(),
+                    host_version: Some("fixture-v1".into()),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        let captured = capture_sources(&config, &root, &AppArgs::default(), Some(&home)).unwrap();
+        let snapshot_id = captured["snapshot_id"].as_str().unwrap();
+        let snapshot_dir = root.join("snapshots").join(snapshot_id);
+
+        // HARD REQUIREMENT: DELETE the synthetic sources!
+        fs::remove_dir_all(&home).unwrap();
+        assert!(!home.exists());
+        assert!(!codex_dir.exists());
+        assert!(!cursor_db.exists());
+        assert!(!claude_dir.exists());
+
+        // Explain snapshot entirely from snapshot_dir alone
+        let explanation = explain_snapshot(&snapshot_dir).unwrap();
+        assert_eq!(explanation.snapshot_id, snapshot_id);
+        assert_eq!(explanation.sources.len(), 3);
+
+        // Check codex source & file
+        let codex_src = explanation
+            .sources
+            .iter()
+            .find(|s| s.app == "codex")
+            .unwrap();
+        assert_eq!(codex_src.source_kind, SourceKind::FileTree);
+        assert_eq!(codex_src.component, ComponentKind::Sessions);
+        assert_eq!(codex_src.host_version.as_deref(), Some("fixture-v1"));
+        assert_eq!(codex_src.version_provenance, VersionProvenance::Configured);
+        assert_eq!(codex_src.capture_status, CaptureStatus::Captured);
+        let codex_file = explanation.files.iter().find(|f| f.app == "codex").unwrap();
+        assert_eq!(codex_file.role, FileRole::SessionRollout);
+        assert!(codex_file.relative_path.contains("session-1.jsonl"));
+
+        // Check cursor source & file
+        let cursor_src = explanation
+            .sources
+            .iter()
+            .find(|s| s.app == "cursor")
+            .unwrap();
+        assert_eq!(cursor_src.source_kind, SourceKind::SqliteSessionProjection);
+        assert_eq!(cursor_src.component, ComponentKind::Sessions);
+        let cursor_file = explanation
+            .files
+            .iter()
+            .find(|f| f.app == "cursor")
+            .unwrap();
+        assert_eq!(cursor_file.role, FileRole::SessionProjection);
+        assert!(cursor_file.relative_path.contains("state.vscdb"));
+
+        // Check claude-code source & file
+        let claude_src = explanation
+            .sources
+            .iter()
+            .find(|s| s.app == "claude-code")
+            .unwrap();
+        assert_eq!(claude_src.source_kind, SourceKind::FileTree);
+        let claude_file = explanation
+            .files
+            .iter()
+            .find(|f| f.app == "claude-code")
+            .unwrap();
+        assert_eq!(claude_file.role, FileRole::SessionRollout);
+
+        // Old manifests without new fields must still deserialize and report unknown
+        let old_manifest_json = serde_json::json!({
+            "version": 1,
+            "snapshot_id": "00000000-0000-0000-0000-000000000001",
+            "device": "old-device",
+            "app_instance": "chronicle-native",
+            "captured_at": "2026-09-22T00:00:00Z",
+            "finished_at": "2026-09-22T00:01:00Z",
+            "sources": [
+                {
+                    "app": "codex",
+                    "component": "sessions",
+                    "slot": "sessions",
+                    "path": "C:/lost/path",
+                    "host_version": "1.0.0"
+                }
+            ],
+            "files": [
+                {
+                    "relative": "codex/sessions/rollout.jsonl",
+                    "source": "C:/lost/path/rollout.jsonl",
+                    "bytes": codex_file.bytes,
+                    "sha256": codex_file.sha256,
+                    "consistency": "file-copy"
+                }
+            ],
+            "exclusions": [],
+            "unsupported": [],
+            "incremental": false
+        });
+        let old_manifest: Manifest = serde_json::from_value(old_manifest_json).unwrap();
+        assert_eq!(old_manifest.sources[0].source_kind, SourceKind::Unknown);
+        assert_eq!(
+            old_manifest.sources[0].version_provenance,
+            VersionProvenance::Unknown
+        );
+        assert_eq!(
+            old_manifest.sources[0].capture_status,
+            CaptureStatus::Unknown
+        );
+        assert_eq!(old_manifest.files[0].role, FileRole::Unknown);
+    }
+
+    #[test]
+    fn truncate_or_replace_during_capture_detects_change_and_cleans_up_staging() {
+        let temp = tempfile::tempdir().unwrap();
+        let file_path = temp.path().join("active_session.jsonl");
+        fs::write(&file_path, b"initial content").unwrap();
+
+        // SourceFileStamp detects truncation / size change
+        let stamp = SourceFileStamp::of(&file_path).unwrap();
+        assert!(stamp.assert_unmodified(&file_path).is_ok());
+
+        // Modify file size
+        fs::write(&file_path, b"new longer content here").unwrap();
+        assert!(stamp.assert_unmodified(&file_path).is_err());
+
+        // Verify staging is deleted on error and no incomplete snapshot is published
+        let root = temp.path().join("backup");
+        let config = NativeConfig {
+            data_root: Some(root.clone()),
+            sources: vec![SourceConfig {
+                app: "fixture".into(),
+                component: ComponentKind::Sessions,
+                slot: "sessions".into(),
+                path: file_path.clone(),
+                host_version: Some("fixture-v1".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        // Missing file during capture: tracked in exclusions, doesn't panic
+        fs::remove_file(&file_path).unwrap();
+        let res = capture_sources(&config, &root, &AppArgs::default(), None);
+        assert!(res.is_ok());
+        assert_eq!(res.unwrap()["files"], 0);
+
+        // Staging directory must be empty
+        if root.join("staging").exists() {
+            assert_eq!(fs::read_dir(root.join("staging")).unwrap().count(), 0);
+        }
+    }
+
+    #[test]
+    fn wal_only_change_triggers_new_capture_and_shm_never_captured() {
+        let temp = tempfile::tempdir().unwrap();
+        let source_root = temp.path().join("source");
+        fs::create_dir_all(&source_root).unwrap();
+
+        let db_path = source_root.join("test.db");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; CREATE TABLE t(v TEXT); INSERT INTO t VALUES('v1');").unwrap();
+        drop(conn);
+
+        // Put an -shm file in source
+        let shm_path = source_root.join("test.db-shm");
+        fs::write(&shm_path, b"dummy shm").unwrap();
+
+        let conn = Connection::open(&db_path).unwrap();
+
+        let root = temp.path().join("backup");
+        let config = NativeConfig {
+            data_root: Some(root.clone()),
+            sources: vec![SourceConfig {
+                app: "sqlite_app".into(),
+                component: ComponentKind::Sessions,
+                slot: "db".into(),
+                path: source_root.clone(),
+                host_version: Some("fixture-v1".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        // First capture
+        let first = capture_sources(&config, &root, &AppArgs::default(), None).unwrap();
+        assert_eq!(first["status"], "captured");
+        let id1 = first["snapshot_id"].as_str().unwrap();
+        let snap1 = root.join("snapshots").join(id1);
+
+        // SHM MUST NOT be captured as a recovery artifact!
+        assert!(!snap1.join("sqlite_app/db/test.db-shm").exists());
+        assert!(snap1.join("sqlite_app/db/test.db").exists());
+
+        // Unchanged capture
+        let second = capture_sources(&config, &root, &AppArgs::default(), None).unwrap();
+        assert_eq!(second["status"], "unchanged");
+
+        // Now modify ONLY the WAL (via SQL insert without checkpoint)
+        let before_db_hash = hash_file(&db_path).unwrap();
+        conn.execute("INSERT INTO t VALUES('v2')", []).unwrap();
+        conn.cache_flush().unwrap();
+        // The main DB file is untouched because WAL has not checkpointed
+        assert_eq!(hash_file(&db_path).unwrap(), before_db_hash);
+        assert!(source_root.join("test.db-wal").exists());
+
+        // WAL-only change MUST trigger a new capture!
+        let third = capture_sources(&config, &root, &AppArgs::default(), None).unwrap();
+        assert_eq!(third["status"], "captured");
+        let id3 = third["snapshot_id"].as_str().unwrap();
+        assert_ne!(id1, id3);
+
+        let snap3 = root.join("snapshots").join(id3);
+        assert!(!snap3.join("sqlite_app/db/test.db-shm").exists());
+
+        // Verify recovered database has 'v2'
+        let recovered_db = Connection::open(snap3.join("sqlite_app/db/test.db")).unwrap();
+        let count: i64 = recovered_db
+            .query_row("SELECT count(*) FROM t", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn watch_queue_and_replication_failure_state_persisted_and_surfaced_in_status() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("backup");
+        fs::create_dir_all(&root).unwrap();
+
+        // 1. Test watch queue persistence
+        let mut queue = load_watch_queue(&root).unwrap();
+        assert!(queue.pending.is_empty());
+        let now = Utc::now();
+        queue.pending.insert(
+            "codex/sessions".into(),
+            WatchQueueEntry {
+                app: "codex".into(),
+                slot: "sessions".into(),
+                source_path: PathBuf::from("C:/fake/path"),
+                reasons: vec!["file modified".into()],
+                first_event_at: now,
+                last_event_at: now,
+                attempts: 1,
+                last_error: Some("capture timeout".into()),
+            },
+        );
+        save_watch_queue(&root, &queue).unwrap();
+        let loaded_queue = load_watch_queue(&root).unwrap();
+        assert_eq!(loaded_queue, queue);
+
+        // 2. Test replication failure state persistence
+        let mut rep_state = load_replication_state(&root).unwrap();
+        assert!(rep_state.failures.is_empty());
+        rep_state.failures.insert(
+            "snap-1".into(),
+            ReplicationFailureEntry {
+                target: "remote".into(),
+                snapshot_id: "snap-1".into(),
+                attempts: 2,
+                last_error: "connection refused".into(),
+                last_error_at: now,
+                last_success_at: None,
+            },
+        );
+        save_replication_state(&root, &rep_state).unwrap();
+        let loaded_rep = load_replication_state(&root).unwrap();
+        assert_eq!(loaded_rep, rep_state);
+
+        // 3. Verify status() surfaces both watch_queue and replication_failures
+        let st = status(&root).unwrap();
+        assert_eq!(st["watch_queue"]["pending_count"], 1);
+        assert_eq!(
+            st["watch_queue"]["pending"]["codex/sessions"]["attempts"],
+            1
+        );
+        assert_eq!(st["replication_failures"]["failure_count"], 1);
+        assert_eq!(
+            st["replication_failures"]["failures"]["snap-1"]["attempts"],
+            2
+        );
+    }
+
+    #[test]
+    fn debounce_pure_timing_with_injected_instants() {
+        let base = Instant::now();
+        let last_capture = base;
+        let first_event = Some(base + Duration::from_secs(1));
+        let last_event = base + Duration::from_secs(1);
+
+        // Event arrived 1s in, now at 3s (only 2s quiet, 2s elapsed since first) -> NOT due
+        assert!(!capture_due_at(
+            base + Duration::from_secs(3),
+            last_capture,
+            first_event,
+            last_event
+        ));
+
+        // Now at 7s (6s quiet since last event at 1s) -> DUE (5s quiet merge)
+        assert!(capture_due_at(
+            base + Duration::from_secs(7),
+            last_capture,
+            first_event,
+            last_event
+        ));
+
+        // Continuous events every 2 seconds (never quiet for 5s)
+        let last_event_continuous = base + Duration::from_secs(59);
+        // At 59s: not 5s quiet, first_event was at 1s, elapsed 58s (<60s) -> NOT due
+        assert!(!capture_due_at(
+            base + Duration::from_secs(59),
+            last_capture,
+            first_event,
+            last_event_continuous
+        ));
+
+        // At 62s: first_event was at 1s, elapsed 61s (>=60s cap reached!) -> DUE (60s upper bound)
+        assert!(capture_due_at(
+            base + Duration::from_secs(62),
+            last_capture,
+            first_event,
+            last_event_continuous
+        ));
+
+        // 5-minute fallback without any events:
+        assert!(!capture_due_at(
+            base + Duration::from_secs(299),
+            last_capture,
+            None,
+            base
+        ));
+        assert!(capture_due_at(
+            base + Duration::from_secs(300),
+            last_capture,
+            None,
+            base
+        ));
+    }
+
+    #[test]
+    fn host_version_probe_has_hard_timeout_and_temp_home_never_reads_real_profile() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("isolated_home");
+        fs::create_dir_all(&home).unwrap();
+
+        // 1. With injected home, probing non-existent host never reads real profile and returns Unknown
+        let (version, prov) = detect_host_version("cursor", &home.join("state.vscdb"), Some(&home));
+        assert_eq!(version, None);
+        assert_eq!(prov, VersionProvenance::Unknown);
+
+        // 2. Put product.json inside isolated home
+        let cursor_app = home.join("AppData/Local/Programs/cursor/resources/app");
+        fs::create_dir_all(&cursor_app).unwrap();
+        fs::write(cursor_app.join("product.json"), b"{\"version\":\"0.45.6\"}").unwrap();
+
+        let (version, prov) = detect_host_version("cursor", &home.join("state.vscdb"), Some(&home));
+        assert_eq!(version.as_deref(), Some("cursor 0.45.6"));
+        assert_eq!(prov, VersionProvenance::Probed);
+
+        // 3. Test command_version_timeout returns None without hanging
+        let start = Instant::now();
+        let res = command_version_timeout("nonexistent_binary_xyz_123", Duration::from_millis(50));
+        assert_eq!(res, None);
+        assert!(start.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn failed_capture_preserves_existing_snapshots_byte_identical() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("backup");
+        let source_dir = temp.path().join("source");
+        fs::create_dir_all(&source_dir).unwrap();
+        fs::write(source_dir.join("history.jsonl"), b"original content\n").unwrap();
+
+        let config = NativeConfig {
+            sources: vec![SourceConfig {
+                app: "codex".into(),
+                component: ComponentKind::Sessions,
+                slot: "sessions".into(),
+                path: source_dir.clone(),
+                host_version: Some("fixture-v1".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        // 1. Successful initial capture
+        let first = capture_sources(&config, &root, &AppArgs::default(), None).unwrap();
+        assert_eq!(first["status"], "captured");
+        let snap_id = first["snapshot_id"].as_str().unwrap().to_string();
+        let snap_dir = root.join("snapshots").join(&snap_id);
+        let manifest_bytes = fs::read(snap_dir.join("manifest.json")).unwrap();
+        let file_bytes = fs::read(snap_dir.join("codex/sessions/history.jsonl")).unwrap();
+
+        // 2. Modify source to trigger next capture
+        fs::write(source_dir.join("history.jsonl"), b"modified content\n").unwrap();
+
+        // 3. Force write error during capture by blocking staging with a file
+        let staging_root = root.join("staging");
+        let _ = fs::remove_dir_all(&staging_root);
+        fs::write(&staging_root, b"blocking-staging-directory").unwrap();
+
+        // 4. Capture must fail and return an error (never "captured")
+        let failed = capture_sources(&config, &root, &AppArgs::default(), None);
+        assert!(
+            failed.is_err(),
+            "capture must return error on staging write failure"
+        );
+
+        // 5. Existing snapshots and manifests must remain 100% byte-identical
+        assert_eq!(
+            fs::read(snap_dir.join("manifest.json")).unwrap(),
+            manifest_bytes,
+            "manifest must remain byte-identical after failed capture"
+        );
+        assert_eq!(
+            fs::read(snap_dir.join("codex/sessions/history.jsonl")).unwrap(),
+            file_bytes,
+            "captured source files must remain byte-identical after failed capture"
+        );
+
+        // 6. Confirm no pruning / history deletion on failure
+        let manifests = list_manifests(&root).unwrap();
+        assert_eq!(manifests.len(), 1);
+        assert_eq!(manifests[0].snapshot_id, snap_id);
+    }
+
+    #[test]
+    fn remote_offline_catch_up_records_failure_and_clears_on_reconnection() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("backup");
+        let source_dir = temp.path().join("source");
+        fs::create_dir_all(&source_dir).unwrap();
+        fs::write(source_dir.join("test.jsonl"), b"session data\n").unwrap();
+
+        let password = temp.path().join("password");
+        fs::write(&password, "synthetic-test-password").unwrap();
+        let local_repo = temp.path().join("local-repo");
+        let remote_repo = temp.path().join("remote-repo");
+
+        let restic = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tmp/native-tools/restic_0.19.1_windows_amd64.exe");
+        if !restic.is_file() {
+            return;
+        }
+
+        // Initialize local repo only; remote_repo is deliberately left uninitialized (offline/unreachable)
+        let _ = Command::new(&restic)
+            .args(["-r"])
+            .arg(&local_repo)
+            .arg("init")
+            .env("RESTIC_PASSWORD_FILE", &password)
+            .status()
+            .unwrap();
+
+        let config = NativeConfig {
+            data_root: Some(root.clone()),
+            restic: Some(restic.clone()),
+            password_file: Some(password.clone()),
+            local_repository: Some(local_repo.display().to_string()),
+            remote_repository: Some(remote_repo.display().to_string()),
+            sources: vec![SourceConfig {
+                app: "codex".into(),
+                component: ComponentKind::Sessions,
+                slot: "sessions".into(),
+                path: source_dir,
+                host_version: Some("fixture-v1".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        // 1. Capture snapshot locally
+        let captured = capture_sources(&config, &root, &AppArgs::default(), None).unwrap();
+        let snap_id = captured["snapshot_id"].as_str().unwrap().to_string();
+
+        // 2. replicate_pending with remote unreachable: records failure in persisted state
+        let rep_res = replicate_pending(&config, &root, true);
+        assert!(
+            rep_res.is_err(),
+            "replication to uninitialized remote must return error"
+        );
+
+        let rep_state = load_replication_state(&root).unwrap();
+        assert_eq!(rep_state.failures.len(), 1);
+        let fail_entry = rep_state.failures.get(&snap_id).unwrap();
+        assert_eq!(fail_entry.target, "remote");
+        assert_eq!(fail_entry.attempts, 1);
+
+        // Local backup succeeded and is recorded in manifest, but remote is absent
+        let manifest = load_manifest(&root.join("snapshots").join(&snap_id)).unwrap();
+        assert!(manifest.local_restic_snapshot.is_some());
+        assert!(manifest.remote_restic_snapshot.is_none());
+
+        // Status surfaces replication failure
+        let st = status(&root).unwrap();
+        assert_eq!(st["replication_failures"]["failure_count"], 1);
+
+        // 3. Now remote becomes reachable: initialize remote repo
+        let _ = Command::new(&restic)
+            .args(["-r"])
+            .arg(&remote_repo)
+            .arg("init")
+            .env("RESTIC_PASSWORD_FILE", &password)
+            .status()
+            .unwrap();
+
+        // 4. Next replicate_pending catches up: uploads pending snapshot and clears failure
+        let catchup_res = replicate_pending(&config, &root, true);
+        assert!(
+            catchup_res.is_ok(),
+            "catchup replication must succeed when remote is reachable"
+        );
+
+        let rep_state_after = load_replication_state(&root).unwrap();
+        assert!(
+            rep_state_after.failures.is_empty(),
+            "failures must be cleared after catchup"
+        );
+
+        let manifest_after = load_manifest(&root.join("snapshots").join(&snap_id)).unwrap();
+        assert!(
+            manifest_after.remote_restic_snapshot.is_some(),
+            "remote snapshot must now be recorded"
+        );
+
+        let st_after = status(&root).unwrap();
+        assert_eq!(st_after["replication_failures"]["failure_count"], 0);
+    }
+
+    #[test]
+    fn watch_restart_with_pending_changes_reconciles_immediately_on_startup() {
+        // A. Timing decision: if pending change arrived before restart (>5s quiet or >60s elapsed),
+        // capture_due_at returns true immediately upon restart (now == last_capture)
+        let now = Instant::now();
+        let pending_event = now.checked_sub(Duration::from_secs(10)).unwrap();
+        assert!(capture_due_at(now, now, Some(pending_event), pending_event));
+
+        // B. Functional catch-up: startup reconciliation immediately captures pending changes
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("backup");
+        let source_dir = temp.path().join("source");
+        fs::create_dir_all(&source_dir).unwrap();
+        fs::write(
+            source_dir.join("session.jsonl"),
+            b"content before shutdown\n",
+        )
+        .unwrap();
+
+        let config = NativeConfig {
+            sources: vec![SourceConfig {
+                app: "codex".into(),
+                component: ComponentKind::Sessions,
+                slot: "sessions".into(),
+                path: source_dir.clone(),
+                host_version: Some("fixture-v1".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        // Initial capture before shutdown
+        let snap1 = capture_sources(&config, &root, &AppArgs::default(), None).unwrap();
+        let id1 = snap1["snapshot_id"].as_str().unwrap().to_string();
+
+        // Changes occur while watch process is stopped / restarting
+        fs::write(
+            source_dir.join("session.jsonl"),
+            b"offline change during restart\n",
+        )
+        .unwrap();
+
+        // Startup reconciliation (exact path executed in watch_sources on startup)
+        let restarted = capture_sources(&config, &root, &AppArgs::default(), None).unwrap();
+        assert_eq!(restarted["status"], "captured");
+        let id2 = restarted["snapshot_id"].as_str().unwrap();
+        assert_ne!(id1, id2);
+
+        let snap2_dir = root.join("snapshots").join(id2);
+        assert_eq!(
+            fs::read(snap2_dir.join("codex/sessions/session.jsonl")).unwrap(),
+            b"offline change during restart\n"
         );
     }
 }

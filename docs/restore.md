@@ -53,6 +53,24 @@ Off-site Drive copies remain optional and out of band (rclone / Feiniu Cloud Syn
 
 `chronicle native discover/capture/verify/replicate/restore` manages source snapshots and Restic repositories. `restore --target <directory>` extracts and verifies files in isolation. `restore --into <app> --dry-run` previews a native installation plan; omitting `--dry-run` saves a plan, and `--apply-plan` applies it. Production native installation currently fails closed for every host version; only synthetic tests enable the installation prototype. `--force` cannot bypass the host-version gate. Recovery is accepted only after file verification, client opening after restart, and a test continuation where the host supports it.
 
+### Per-host unsupported items
+
+During capture (recorded as manifest exclusions) and native install (enforced as plan refusal), unsupported files fail closed according to `is_unsupported_path`:
+
+- **Generic (all hosts)**:
+  - Process locks and sockets: files ending with `.lock`, `.sock`, or `.pid`.
+  - SQLite locks and journals: files ending with `-wal`, `-shm`, or `-journal`.
+- **claude-code**:
+  - Credential files: `.claude.json` and `credentials.json`.
+  - Transient runtime state: paths containing `cache`, `telemetry`, `tmp`, `mcp-daemons`, or `plugins` segments.
+- **antigravity**:
+  - Credentials and tokens: file names containing `credential`, `token`, or `auth` (case-insensitive).
+  - In-flight checkpoints: paths containing `checkpoints/in-flight`.
+- **grok**:
+  - Terminal buffers and compaction locks: paths containing `terminal` or `compaction` segments.
+  - Prompt history cache: `prompt_history.jsonl`.
+  - Authentication state: file names containing `cookie` or `auth` (case-insensitive).
+
 ### Implementation audit (2026-09-22)
 
 Restart handoff and dispatch instructions: [native-recovery-handoff.md](native-recovery-handoff.md). Task status and full worker envelopes live in `.trx/issues.jsonl`; the handoff is a reading guide, not a second task tracker.
@@ -75,3 +93,37 @@ Remaining scope from the accepted plan, requiring implementation or stronger evi
 4. Validate background deployment using a real user-level startup task, persistent failure reporting, restart/reconnection tests and baseline protection before replacing overlapping tasks. The new watch implementation is not yet deployed evidence.
 5. Cursor snapshot `0afca009-7911-4ed8-8121-4601a64aa5bd` includes 1,376 composerHeaders and 167,727 key/value session records; 1,992,683,520 bytes, SHA-256 `769bd4f18837fd10134c8c7a99a83b6a214fbb6e85186bc0409b411e8fcd9758`. Local Restic receipt `a804accc1dce8fb4bf7d2847a76d35bf9824d7ff5cb2fcbea537a83e7d22c117`; NAS receipt `c413ba3233506510061534d3b6af48c3af458b88a25a0c1241c15950c3a1792d`, confirmed 2026-09-22T21:43:20Z. Independent NAS restoration, Restic verification, SQLite integrity, key audit and hash comparison passed. Real native-client open/restart/continuation checks remain for all five hosts.
 6. Run the integrated required gate after remaining code stabilizes. No commit, publication or complete-plan claim follows from the focused checks alone.
+
+## Deployment (isolated harness)
+
+Background watch execution is managed via `scripts/native-service.ps1`:
+
+```powershell
+# Preview deployment without scheduler calls (always safe)
+pwsh -NoProfile -File scripts/native-service.ps1 -Action Install -NativeConfig 'C:/path/to/chronicle-native.toml' -DryRun
+
+# Explicit switch required to run against Windows Task Scheduler
+pwsh -NoProfile -File scripts/native-service.ps1 -Action Install -NativeConfig 'C:/path/to/chronicle-native.toml' -IReallyMeanIt
+
+# Check service status or uninstall
+pwsh -NoProfile -File scripts/native-service.ps1 -Action Status -DryRun
+pwsh -NoProfile -File scripts/native-service.ps1 -Action Uninstall -DryRun
+```
+
+### Safety and Idempotency Guarantees
+- **Safety gate**: Running `Install` or `Uninstall` without `-DryRun` is strictly refused unless the explicit `-IReallyMeanIt` switch is provided. `-DryRun` executes zero Task Scheduler or registry calls.
+- **Single-instance**: The scheduled task runs with `MultipleInstances = IgnoreNew` to ensure only one watch process executes at a time.
+- **Idempotent registration**: The task is registered at a fixed user-level path (`\Chronicle\NativeWatch`). Re-running `Install` updates the task in-place and never registers duplicate tasks. Overlapping tasks matching `(chronicle|hstry).*native.*watch` are reported without being modified or clobbered.
+- **Current user credentials**: Executes under the current user (`LogonType = Interactive`) without elevation and without stored credentials.
+
+### Known Issues
+- **Console window visibility**: `chronicle.exe` is a console application, so a logon task displays a console window for its entire lifetime. Hiding it (for example, via `conhost --headless`, a background launcher, or a windowless runner) is **NOT DONE** and is to be decided in the authorized drill.
+
+### Authorized drill checklist (NOT DONE)
+The following deployment drills require explicit production authorization and live host execution, and remain **NOT DONE**:
+- [ ] **Reboot catch-up**: Live machine restart drill verifying `\Chronicle\NativeWatch` starts at user logon and immediately catches up pending changes. (NOT DONE)
+- [ ] **NAS offline catch-up**: Live network drill verifying background watcher logs remote replication failure when NAS is unreachable and catches up once NAS reconnects. (NOT DONE)
+- [ ] **Disk-full drill**: Live drill verifying staging write failures refuse capture without deleting existing history or manifests. (NOT DONE)
+- [ ] **Overlapping task migration**: Inspecting the user's existing production scheduled tasks and safely replacing overlapping legacy watch tasks. (NOT DONE)
+- [ ] **Console window suppression**: Selecting and testing a windowless launcher or headless host strategy for the background watch task. (NOT DONE)
+

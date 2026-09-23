@@ -75,21 +75,11 @@ just update       # Update dependencies
 
 Always run `just check-all` before committing significant changes.
 
-## Issue Tracking (trx)
+## Issue Tracking (GitHub Issues)
 
-Use `trx` for all issue tracking. Do NOT use markdown TODOs or external trackers.
-
-```bash
-trx ready                              # Find unblocked work
-trx create "Title" -t task -p 2        # Create issue (types: bug/feature/task/epic/chore)
-trx update <id> --status in_progress   # Claim task
-trx close <id> -r "Done"               # Complete work
-trx sync                               # Commit .trx/ changes
-```
-
-Priorities: 0=critical, 1=high, 2=medium (default), 3=low, 4=backlog
-
-Always commit `.trx/` with code changes.
+- GitHub Issues in `andrew05060414/chronicle` are the primary record for task scope, ownership, and status. Link implementation PRs to the relevant issue when one exists; use a PR checklist for implementation substeps.
+- Do not create or update `trx` tasks for new work, and do not require `.trx/` changes with code commits.
+- `.trx/` is inherited, repository-local task history. Its JSONL files are not GitHub Issues; `trx sync` commits those local files rather than syncing issue records to GitHub. Leave existing entries as historical data while the fork gradually retires the workflow.
 
 ## Memory System (byt/mmry)
 

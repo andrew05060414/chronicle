@@ -1,30 +1,22 @@
 # Chronicle 原生容灾：交接（更新于 2026-09-23）
 
-有代码产物的 8 个任务已整合提交（5 个达到验收关闭，3 个仍有缺口）；真实客户端 UAT、部署演练和最终验收未做。这不是完整计划验收：未 push、未合并、未部署、未注册任何常驻任务。
+原生备份基础和恢复原型已进入 PR #51。真实客户端与部署验收仍有边界；不要把合成测试或一次客户端演练当成所有宿主均已验收。
 
 ## 从这里恢复
 
-- 工作分支：`codex/chronicle-native-recovery`；工作区：`chronicle-native-recovery`。提交链：`188232c`（CLI 大栈线程）→ `2074ba0`（sync）→ `871160b`（native 采集/安装/宿主）→ `e194db8`（deploy 脚本）→ `f89d708`（UAT 脚本）。
+- 工作分支：`codex/chronicle-native-recovery`；GitHub 交付入口：[PR #51](https://github.com/andrew05060414/chronicle/pull/51)。以 PR 的最新提交和 checks 为准。
 - 原计划：五类宿主原生保护、Restic 本机和 NAS 副本、本机加 hub 搜索、增量同步状态、原生安装恢复、可选非凭据组件、部署和客户端验收。不得把文件提取成功缩减为完整目标。
-- 先读本文件、`docs/restore.md`，再读 `.trx/issues.jsonl` 中 `trx-nr-*` 的任务信封。本机没有 `trx` CLI；该文件按 trx v2 格式追加整行记录，同一 ID 以最后一行为准，`.trx/events.jsonl` 记录每次状态变化和说明。
-- 执行者用 `ocx-gemini-3-8-flash`；Windows 上同一时间只允许一个跑 cargo 的执行者，并设 `CARGO_BUILD_JOBS=4`。Gemini 审查几乎总在首轮批准，主线程必须亲自读每个 diff。
+- GitHub Issues 是 fork 的任务主账本。#26（异地备份调度）和 #27（异地备份保留）仍 open，属于后续独立工作，不由 PR #51 自动关闭。
+- `.trx/` 是继承的本地 JSONL 任务历史；`trx sync` 提交这些文件，不会同步 GitHub Issues。本 fork 不再为新工作创建或更新 TRX 任务，也不把旧条目当作当前状态来源。
+- Windows 上同一时间只允许一个跑 Cargo 的执行者，并设 `CARGO_BUILD_JOBS=4`。主线程必须亲自检查每个 diff。
 
 ## 当前状态
 
-| 任务 | 状态 | 说明 |
-|---|---|---|
-| `trx-nr-manifest` | closed | 快照自描述；WAL 变化、截断/替换、5 秒合并 60 秒上界、监听/复制故障持久化、版本探测超时和临时 home 均有测试 |
-| `trx-nr-sync` | closed | 按变更序号确认推送；失败不推进确认；启动补传、失败 5 分钟重试；5 秒 refresh 不上传 |
-| `trx-nr-components` | closed | 允许列表优先；合成凭据陷阱不进快照；插件不安装；projects 只存元数据 |
-| `trx-nr-cursor` | closed | 孤儿 bubble/空 profile 记入清单不致采集失败；冲突拒绝、幂等；失败时认证和设置字节不变 |
-| `trx-nr-filehosts` | closed | 三宿主删源后恢复全文件哈希一致；未知版本只提取；编码 cwd 必须显式 `--map` |
-| `trx-nr-install` | in_progress | 缺：进程被杀后没有代码读取 `journal.json` 继续或回滚（进程内失败回滚已有） |
-| `trx-nr-codex` | in_progress | 缺：快照中缺 rollout 的线程被静默跳过，未报告 |
-| `trx-nr-uat-codex` / `-cursor` / `-filehosts` | in_progress | 脚本已写，未运行。阻塞：生产版本门禁拒绝所有真实宿主版本，需 Andrew 决定真实版本如何认定为已验证；Antigravity、Grok 无隔离 profile 方法，记为 unsupported-isolation |
-| `trx-nr-deploy` | in_progress | `scripts/native-service.ps1` 默认 dry-run，注册需 `-IReallyMeanIt`，从未注册。缺：重启、NAS 离线、磁盘满、替换重叠任务演练；登录任务常驻控制台窗口 |
-| `trx-nr-release` | open | 依赖以上全部 |
+本机 `just check-all` 在最新本地修复树通过；提交后必须查看 PR #51 的 Linux、macOS、Windows checks。PR 描述中的旧测试计数不能替代最新 checks。
 
-自动检查（最终树 = 提交后树 `eb63c9b`）：`scripts/pre-pr.ps1` 退出码 0，384 测试通过（`tmp/round3-pre-pr-2.log`）；`just check-all` 退出码 0。中间提交各自通过 `cargo check --workspace --all-targets`。`evidence_cli` 在干净基线上同样栈溢出，由 `188232c` 修复。
+仍需明确区分：一次 Codex CLI NAS 往返演练的报告、各宿主隔离 UAT、重启/断网/磁盘满部署演练，以及正式合并或常驻部署。未知版本继续 fail closed，不得用 `--force` 绕过。
+
+本机 Windows 最新修复树：`just check-all`、`cargo test -p chronicle-backup`（65 项）和 `cargo test -p hstry-cli`（80 项）通过。一次旧的 workspace gate 因 MCP 测试启动默认 `hstry sync` 超时而中断；测试现已隔离到临时配置，单测和后续完整 gate 均通过。以上不替代推送后 PR #51 的 Linux/macOS/Windows checks。
 
 ## 私有运行数据（不得加入 Git）
 
@@ -32,12 +24,9 @@
 
 ## 下一步
 
-1. Andrew 决定版本门禁的"已验证版本"认定方式，之后按 codex → cursor → filehosts 串行跑 UAT 脚本；共享桌面不得同时操纵同一客户端。
-2. 补 install 的崩溃恢复路径和 codex 缺失依赖报告，各自关闭任务。
-3. 授权环境下做部署演练，基线安全后再替换重叠任务。
-4. `trx-nr-release` 逐条对照原计划审计证据；commit/push/merge/deploy 分别授权。
-
-不要重复建 GitHub/Multica 台账。GitHub 上现存的 #19/#24/#25/#26/#27 针对旧 checkpoint/backup 链路，不由本计划关闭。
+1. 等待 PR #51 最新跨平台 CI；修复后再做独立验收。
+2. 在隔离 profile 中按宿主完成 UAT；共享桌面不得同时操纵同一客户端。
+3. 重启、NAS 离线、磁盘满等部署演练须使用隔离数据根；常驻任务注册与合并分别需要明确授权。
 
 ## 已知风险，不能因测试绿而忽略
 

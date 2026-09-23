@@ -110,6 +110,36 @@ impl Database {
         Ok(db)
     }
 
+    /// Open an existing database strictly read-only.
+    ///
+    /// This never creates parent directories or database files and never runs
+    /// schema initialization or migrations. Agent-facing readers should use
+    /// this instead of `open` so a bad path fails loudly rather than creating
+    /// an empty archive.
+    pub async fn open_read_only(path: &Path) -> Result<Self> {
+        crate::test_guard::check_path_for_open(path).map_err(Error::Other)?;
+
+        let options = SqliteConnectOptions::from_str(&format!("sqlite:{}", path.display()))?
+            .read_only(true)
+            .create_if_missing(false)
+            .busy_timeout(Duration::from_secs(30))
+            .foreign_keys(true);
+
+        let pool = SqlitePoolOptions::new()
+            .max_connections(5)
+            .connect_with(options)
+            .await?;
+
+        let db = Self {
+            pool,
+            message_events_enabled: AtomicBool::new(false),
+            indexer_outbox_enabled: AtomicBool::new(false),
+            ingest_writer: Mutex::new(()),
+        };
+        db.require_schema().await?;
+        Ok(db)
+    }
+
     /// Acquire the single-writer gate used by bulk ingestion transactions.
     pub(crate) async fn lock_ingest_writer(&self) -> MutexGuard<'_, ()> {
         self.ingest_writer.lock().await

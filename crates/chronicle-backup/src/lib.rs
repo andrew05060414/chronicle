@@ -2683,7 +2683,7 @@ fn validate_store(path: &Path) -> Result<()> {
         match fs::symlink_metadata(ancestor) {
             Ok(meta) => {
                 ensure!(
-                    !meta.is_symlink(),
+                    !meta.is_symlink() || is_macos_system_store_alias(ancestor),
                     "symlink rejected: {}",
                     ancestor.display()
                 );
@@ -2702,6 +2702,20 @@ fn validate_store(path: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+#[cfg(target_os = "macos")]
+fn is_macos_system_store_alias(path: &Path) -> bool {
+    let expected = match path {
+        p if p == Path::new("/var") => Some(Path::new("/private/var")),
+        p if p == Path::new("/tmp") => Some(Path::new("/private/tmp")),
+        _ => None,
+    };
+    expected
+        .is_some_and(|expected| fs::canonicalize(path).is_ok_and(|resolved| resolved == expected))
+}
+#[cfg(not(target_os = "macos"))]
+fn is_macos_system_store_alias(_path: &Path) -> bool {
+    false
 }
 fn safe_relative(value: &str) -> bool {
     !value.is_empty()
@@ -2859,7 +2873,7 @@ mod tests {
         let captured = capture_sources(&config, &root, &AppArgs::default(), Some(&home)).unwrap();
         let id = captured["snapshot_id"].as_str().unwrap();
         let manifest = verify_local(&root, id).unwrap();
-        let target = home.join("AppData/Roaming/Cursor/User/globalStorage/state.vscdb");
+        let target = cursor_global_storage(&home).join("state.vscdb");
         fs::create_dir_all(target.parent().unwrap()).unwrap();
         let target_db = Connection::open(&target).unwrap();
         target_db.execute_batch("CREATE TABLE ItemTable(key TEXT PRIMARY KEY,value BLOB); CREATE TABLE cursorDiskKV(key TEXT PRIMARY KEY,value BLOB); CREATE TABLE composerHeaders (composerId TEXT PRIMARY KEY, workspaceId TEXT, createdAt INTEGER, lastUpdatedAt INTEGER, isArchived INTEGER, isSubagent INTEGER, recency INTEGER, checkpointAt INTEGER, value TEXT, subagentTypeName TEXT); INSERT INTO ItemTable VALUES('cursor.accessToken','FAKE_TARGET_AUTH');").unwrap();
@@ -3036,6 +3050,17 @@ mod tests {
         assert_eq!(journal_after_fail.phase, "rolled-back-after-error");
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn validate_store_allows_macos_temp_root_but_rejects_other_symlinks() {
+        let temp = tempfile::tempdir().unwrap();
+        validate_store(temp.path()).unwrap();
+
+        let link = temp.path().join("store-link");
+        std::os::unix::fs::symlink(temp.path(), &link).unwrap();
+        assert!(validate_store(&link).is_err());
+    }
+
     #[test]
     fn cursor_capture_allows_orphan_bubble_and_install_refuses_preserving_target() {
         let temp = tempfile::tempdir().unwrap();
@@ -3078,7 +3103,7 @@ mod tests {
                 && e.contains("orphan bubble")
         }));
 
-        let target = home.join("AppData/Roaming/Cursor/User/globalStorage/state.vscdb");
+        let target = cursor_global_storage(&home).join("state.vscdb");
         fs::create_dir_all(target.parent().unwrap()).unwrap();
         let target_db = Connection::open(&target).unwrap();
         target_db

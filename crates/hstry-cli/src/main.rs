@@ -2485,18 +2485,17 @@ async fn cmd_search_fast(
         }
         // Only a remote-only search has nothing left to report when no remote is
         // enabled. `--scope all` must still return the local report computed above.
-        // Satellite default (implicit Remote) falls back to local instead of
-        // hard-failing (#14); explicit `--scope remote` still fails loudly (#28).
-        if scope == SearchScopeArg::Remote && !remote_list.iter().any(|r| r.enabled) {
-            if allow_local_fallback {
-                report = search_local_report(config, query, opts.clone(), mode).await?;
-                report
-                    .warnings
-                    .push("No enabled remotes to search; using local archive".into());
-                used_local_fallback = true;
-            } else {
-                anyhow::bail!("No enabled remotes to search");
-            }
+        // Implicit satellite search falls back to local when the hub is
+        // disabled or unreachable; explicit `--scope remote` still fails (#28).
+        let has_enabled_remotes = remote_list.iter().any(|r| r.enabled);
+        if !has_enabled_remotes && allow_local_fallback {
+            report = search_local_report(config, query, opts.clone(), mode).await?;
+            report
+                .warnings
+                .push("No enabled remotes to search; using local archive".into());
+            used_local_fallback = true;
+        } else if scope == SearchScopeArg::Remote && !has_enabled_remotes {
+            anyhow::bail!("No enabled remotes to search");
         } else {
             match hstry_core::remote::search_remotes(&remote_list, query, &opts).await {
                 Ok(remote) => {

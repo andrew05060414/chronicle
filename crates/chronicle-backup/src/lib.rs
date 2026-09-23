@@ -1783,15 +1783,13 @@ fn build_install_plan(
         "unknown host version: native installation is refused"
     );
     let is_verified = verified_install_host(root, app, &host_version);
-    let drill = if !is_verified {
-        hosts::validate_drill_targets(&actions, home).map_err(|e| {
-            anyhow::anyhow!(
-                "native installation has not been verified for this host version ({e}); isolate files with --target and complete host acceptance first"
-            )
-        })?;
-        true
-    } else {
-        false
+    // A plan whose targets are all drill-isolated is a drill even for a verified host.
+    let drill = match hosts::validate_drill_targets(&actions, home) {
+        Ok(()) => true,
+        Err(_) if is_verified => false,
+        Err(e) => anyhow::bail!(
+            "native installation has not been verified for this host version ({e}); isolate files with --target and complete host acceptance first"
+        ),
     };
     Ok(InstallPlan {
         kind: InstallPlanKind::Install,
@@ -1987,11 +1985,11 @@ fn apply_install_plan_with_home(
         "unknown host version: native installation is refused"
     );
     let is_verified = verified_install_host(root, &plan.app, &plan.host_version);
-    if !is_verified {
-        ensure!(
-            plan.drill,
-            "native installation has not been verified for this host version; isolate files with --target and complete host acceptance first"
-        );
+    ensure!(
+        is_verified || plan.drill,
+        "native installation has not been verified for this host version; isolate files with --target and complete host acceptance first"
+    );
+    if plan.drill {
         hosts::validate_drill_targets(&plan.actions, home).map_err(|e| {
             anyhow::anyhow!(
                 "native installation has not been verified for this host version ({e}); isolate files with --target and complete host acceptance first"
@@ -2002,7 +2000,8 @@ fn apply_install_plan_with_home(
         plan.version == VERSION && plan.kind == InstallPlanKind::Install,
         "unsupported install plan"
     );
-    ensure_host_stopped(&plan.app, force)?;
+    // Drill targets are isolated from the real host profile, so a running host cannot race them.
+    ensure_host_stopped(&plan.app, force || plan.drill)?;
     let recovered_interrupted = recover_interrupted_installs(root, &plan.app)?;
     ensure!(
         plan.target_fingerprint == install_fingerprint(&plan.actions)?,

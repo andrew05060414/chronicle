@@ -41,6 +41,9 @@ pub(super) fn merge_index(
         let mut target_conn = Connection::open(target)?;
         target_conn.execute_batch("PRAGMA foreign_keys = OFF;")?;
         let transaction = target_conn.transaction()?;
+        if !existed {
+            init_schema_from(&source, &transaction)?;
+        }
 
         let normalized = path_map
             .iter()
@@ -484,6 +487,43 @@ fn remap_path_on_boundary(path_str: &str, path_map: &BTreeMap<String, PathBuf>) 
     None
 }
 
+/// A fresh target gets the source's complete schema and migration ledger; without the
+/// ledger Codex treats the database as unmigrated and cannot resume restored threads.
+fn init_schema_from(source: &Connection, target: &Connection) -> Result<()> {
+    let schema = source
+        .prepare(
+            "SELECT sql FROM sqlite_master WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%' ORDER BY rowid",
+        )?
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for sql in schema {
+        target.execute_batch(&sql)?;
+    }
+    if table_exists(source, "_sqlx_migrations")? {
+        let columns = table_columns(source, "_sqlx_migrations")?;
+        let names = columns
+            .iter()
+            .map(|c| quote(c))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let params = vec!["?"; columns.len()].join(", ");
+        let mut insert = target.prepare(&format!(
+            "INSERT INTO _sqlx_migrations ({names}) VALUES ({params})"
+        ))?;
+        let mut select = source.prepare(&format!("SELECT {names} FROM _sqlx_migrations"))?;
+        let mut rows = select.query([])?;
+        while let Some(row) = rows.next()? {
+            let values = (0..columns.len())
+                .map(|i| row.get::<_, Value>(i))
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            insert.execute(rusqlite::params_from_iter(values))?;
+        }
+    }
+    let user_version: i64 = source.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    target.execute_batch(&format!("PRAGMA user_version = {user_version}"))?;
+    Ok(())
+}
+
 fn table_exists(connection: &Connection, name: &str) -> Result<bool> {
     Ok(connection.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
@@ -637,6 +677,15 @@ CREATE TABLE thread_spawn_edges (
         let source_db = temp.path().join("source/state.sqlite");
         fs::create_dir_all(source_db.parent().unwrap()).unwrap();
         let (s_rollout_1, s_rollout_2) = setup_source_db(&source_db);
+        Connection::open(&source_db)
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE _sqlx_migrations (version INTEGER PRIMARY KEY, description TEXT);
+                 INSERT INTO _sqlx_migrations VALUES (1, 'init'), (2, 'threads');
+                 CREATE TABLE jobs (id TEXT PRIMARY KEY);
+                 PRAGMA user_version = 7;",
+            )
+            .unwrap();
 
         let target_db = temp.path().join("target_dir/non_existent_state.sqlite");
         let t_rollout_1 = temp.path().join("target_dir/rollouts/t1.jsonl");
@@ -661,6 +710,17 @@ CREATE TABLE thread_spawn_edges (
             .query_row("SELECT COUNT(*) FROM threads", [], |r| r.get(0))
             .unwrap();
         assert_eq!(thread_count, 2);
+
+        // A fresh target carries the full schema and migration ledger, not just merged tables.
+        let migrations: i64 = target_conn
+            .query_row("SELECT COUNT(*) FROM _sqlx_migrations", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(migrations, 2);
+        assert!(table_exists(&target_conn, "jobs").unwrap());
+        let user_version: i64 = target_conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(user_version, 7);
 
         // Verify cwd mapping applied on component boundary
         let cwd_1: String = target_conn

@@ -2295,20 +2295,22 @@ async fn search_local_report(
         && config.service.enabled
         && config.service.search_api;
 
-    if service_expected {
-        if let Some(results) = hstry_core::service::try_service_search_report(query, &opts).await? {
-            return Ok(results);
-        }
-        anyhow::bail!(
-            "Search service unavailable. Run `hstry service start` or set HSTRY_NO_SERVICE=1 to use local search."
-        );
+    if service_expected
+        && let Some(results) = hstry_core::service::try_service_search_report(query, &opts).await?
+    {
+        return Ok(results);
     }
     if let Some(results) = try_api_search(query, &opts, mode).await? {
         return Ok(results);
     }
-    let db = Database::open(&config.database).await?;
-    apply_storage_config(&db, config);
-    Ok(db.search_report(query, opts).await?)
+    let db = Database::open_read_only(&config.database).await?;
+    let mut report = db.search_report(query, opts).await?;
+    if service_expected {
+        report
+            .warnings
+            .push("Search service unavailable; used the local archive".into());
+    }
+    Ok(report)
 }
 
 async fn cmd_search_fast(

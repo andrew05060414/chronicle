@@ -3362,10 +3362,7 @@ mod tests {
         assert_eq!(pulled_latest["from"], "remote");
         assert!(pulled_latest["restic_snapshot"].is_string());
         assert_eq!(pulled_latest["files"].as_u64().unwrap(), 1);
-        assert_eq!(
-            pulled_latest["next"],
-            "restore --target <dir> or restore --into <app>"
-        );
+        assert_eq!(pulled_latest["next"], "restore <id> --target <dir>");
 
         // Verify local on the pulled snapshot passes
         let manifest2 = verify_local(&disaster_root, &snapshot_id2).unwrap();

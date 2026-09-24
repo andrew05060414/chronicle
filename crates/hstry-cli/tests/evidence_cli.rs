@@ -93,6 +93,33 @@ async fn cli_reads_are_bounded_and_full_requires_opt_in() -> anyhow::Result<()> 
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn stats_does_not_create_a_missing_archive() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let database = dir.path().join("missing.db");
+    let config = Config {
+        database: database.clone(),
+        ..Default::default()
+    };
+    let config_path = dir.path().join("config.toml");
+    fs::write(&config_path, toml::to_string(&config)?)?;
+
+    let mut command = cmd(&config_path);
+    command.args(["stats", "--json"]);
+    let result = command.output()?;
+
+    anyhow::ensure!(
+        !result.status.success(),
+        "stats should fail for a missing archive"
+    );
+    anyhow::ensure!(
+        !database.exists(),
+        "stats must not create a missing archive"
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn trace_files_exclude_queries_identifiers_and_payloads() -> anyhow::Result<()> {
     let (dir, config, id) = fixture().await?;

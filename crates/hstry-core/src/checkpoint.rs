@@ -364,9 +364,9 @@ fn is_transient_lock(code: Option<i32>) -> bool {
 
 /// Remove `path` for restore, retrying transient Windows locks.
 ///
-/// Bounded at ~5s (100 x 50ms), consistent with test cleanup tolerance for
-/// hosted-runner handle/indexing latency. Any non-transient error, or a lock
-/// that does not clear within the bound, propagates: production restore must
+/// Bounded at ~15s (300 x 50ms) for hosted-runner handle/indexing latency.
+/// Any non-transient error, or a lock that does not clear within the bound,
+/// propagates: production restore must
 /// never silently continue with a stale file in place.
 /// (Shared shape with PR #30 so it rebases cleanly; the gate adds
 /// tests/workflow/guard infrastructure, not a second implementation.)
@@ -381,7 +381,7 @@ pub(crate) fn safe_remove_file(path: &Path) -> Result<()> {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(e) => {
                 attempts += 1;
-                if is_transient_lock(e.raw_os_error()) && attempts < 100 {
+                if is_transient_lock(e.raw_os_error()) && attempts < 300 {
                     std::thread::sleep(std::time::Duration::from_millis(50));
                     continue;
                 }

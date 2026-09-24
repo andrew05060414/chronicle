@@ -245,8 +245,8 @@ async fn checkpoint_mutate_restore_preserves_sentinels() -> anyhow::Result<()> {
     );
     scratch_db.close().await;
 
-    // Plant a stale WAL sidecar: restore must clear it so it can never replay
-    // over the restored database (and so Windows never sees a locked target).
+    // Restore over the mutated scratch database. Restore must replace the old
+    // contents and clear stale sidecars before reopening the restored copy.
     let stale_wal = format!("{}-wal", scratch.display());
     write_stale_sidecar(&scratch, "-wal").await?;
     restore_checkpoint(
@@ -261,6 +261,10 @@ async fn checkpoint_mutate_restore_preserves_sentinels() -> anyhow::Result<()> {
 
     let restored = Database::open(&scratch).await?;
     assert_sentinels_present(&restored).await?;
+    anyhow::ensure!(
+        restored.count_conversations().await? == 2,
+        "restore must discard the scratch-only mutation"
+    );
     restored.close().await;
     Ok(())
 }

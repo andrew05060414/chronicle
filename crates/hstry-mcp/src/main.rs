@@ -76,6 +76,8 @@ struct SearchRequest {
     after: Option<String>,
     before: Option<String>,
     remote: Option<String>,
+    /// local, remote, or all. Default: local+configured hub when hub is set.
+    scope: Option<String>,
     limit: Option<i64>,
     offset: Option<i64>,
     max_chars: Option<usize>,
@@ -153,17 +155,70 @@ impl McpServer {
                 after: req.after.map(|s| s.parse()).transpose()?,
                 before: req.before.map(|s| s.parse()).transpose()?,
             };
-            let mut report = if let Some(name) = req.remote {
-                let remote = self
-                    .config
-                    .remotes
-                    .iter()
-                    .find(|r| r.name == name && r.enabled)
-                    .ok_or_else(|| anyhow::anyhow!("Unknown or disabled remote"))?;
-                hstry_core::remote::search_remote(remote, &req.query, &opts).await?
+            let explicit_remote = req.remote.clone();
+            let remotes = if let Some(name) = &explicit_remote {
+                vec![name.clone()]
             } else {
-                self.db.search_report(&req.query, opts).await?
+                Vec::new()
             };
+            let scope = if explicit_remote.is_some() {
+                hstry_core::config::SearchScope::Remote
+            } else {
+                let explicit = match req.scope.as_deref() {
+                    Some("local") => Some(hstry_core::config::SearchScope::Local),
+                    Some("remote") => Some(hstry_core::config::SearchScope::Remote),
+                    Some("all") => Some(hstry_core::config::SearchScope::All),
+                    Some(_) => anyhow::bail!("Invalid search scope"),
+                    None => None,
+                };
+                self.config.resolve_search_scope(explicit)
+            };
+
+            if let Some(offset) = req.offset
+                && offset > 0
+                && !matches!(scope, hstry_core::config::SearchScope::Local)
+                && !(matches!(scope, hstry_core::config::SearchScope::Remote) && remotes.len() == 1)
+            {
+                anyhow::bail!(
+                    "Pagination requires a local search or one named remote; page each store separately"
+                );
+            }
+
+            let need_local = !matches!(scope, hstry_core::config::SearchScope::Remote);
+            let need_remote = !matches!(scope, hstry_core::config::SearchScope::Local);
+            let remote_list = if need_remote {
+                Some(self.config.remotes_for_search(&remotes)?)
+            } else {
+                None
+            };
+
+            let local_fut = async {
+                if need_local {
+                    Some(self.db.search_report(&req.query, opts.clone()).await)
+                } else {
+                    None
+                }
+            };
+            let remote_fut = async {
+                if let Some(list) = remote_list.as_ref() {
+                    if list.is_empty() || !list.iter().any(|r| r.enabled) {
+                        Some(Err(hstry_core::Error::Other(
+                            "No enabled remotes to search".into(),
+                        )))
+                    } else {
+                        Some(hstry_core::remote::search_remotes(list, &req.query, &opts).await)
+                    }
+                } else {
+                    None
+                }
+            };
+            let (local, remote) = tokio::join!(local_fut, remote_fut);
+            let mut report = hstry_core::recall::combine_scoped_reports(
+                scope,
+                &remotes,
+                local,
+                remote,
+            )?;
             report.available_remotes = self
                 .config
                 .remotes

@@ -56,6 +56,7 @@ struct SearchInput {
     model: Option<String>,
     harness_filter: Option<String>,
     tag: Option<String>,
+    refresh_local: Option<bool>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -253,7 +254,7 @@ enum Command {
         #[arg(long, value_enum, default_value = "auto")]
         mode: SearchModeArg,
 
-        /// Search scope (local, remote, all). Satellite + hub_remote defaults to remote.
+        /// Search scope (local, remote, all). Satellite + hub_remote defaults to all.
         #[arg(long, value_enum)]
         scope: Option<SearchScopeArg>,
 
@@ -300,6 +301,10 @@ enum Command {
         /// Show each session only once with occurrence count
         #[arg(short, long)]
         compact: bool,
+
+        /// Refresh local collection before searching (local only, never remote push)
+        #[arg(long)]
+        refresh_local: bool,
 
         /// Read JSON input from file or "-" for stdin
         #[arg(long)]
@@ -1023,7 +1028,19 @@ enum ServiceCommand {
     Start,
 
     /// Run the service in the foreground
-    Run,
+    Run {
+        /// HTTP port for browser extension ingest (defaults to config or 3000)
+        #[arg(long)]
+        http_port: Option<u16>,
+
+        /// Disable the HTTP API server
+        #[arg(long)]
+        no_http: bool,
+
+        /// Bearer token required for /ingest (falls back to config or HSTRY_API_TOKEN)
+        #[arg(long)]
+        http_token: Option<String>,
+    },
 
     /// Restart the background service
     Restart,
@@ -1172,6 +1189,7 @@ async fn run(cli: Cli, config: Config, config_path: PathBuf) -> Result<()> {
             harness_filter,
             tag,
             compact,
+            refresh_local,
             input,
         } => {
             skill::warn_if_stale();
@@ -1207,6 +1225,10 @@ async fn run(cli: Cli, config: Config, config_path: PathBuf) -> Result<()> {
                 .and_then(|v| v.harness_filter.clone())
                 .or(harness_filter);
             let tag = input.as_ref().and_then(|v| v.tag.clone()).or(tag);
+            let refresh_local = input
+                .as_ref()
+                .and_then(|v| v.refresh_local)
+                .unwrap_or(refresh_local);
             cmd_search_fast(
                 &config,
                 &query,
@@ -1227,6 +1249,7 @@ async fn run(cli: Cli, config: Config, config_path: PathBuf) -> Result<()> {
                 harness_filter,
                 tag,
                 compact,
+                refresh_local,
                 cli.json,
                 hstry_core::recall::Budget {
                     total: max_chars,
@@ -1411,7 +1434,9 @@ async fn run(cli: Cli, config: Config, config_path: PathBuf) -> Result<()> {
                     service::cmd_service(&config_path, ServiceCommand::Status).await
                 }
             }
-            ServiceCommand::Run => service::cmd_service(&config_path, ServiceCommand::Run).await,
+            run_cmd @ ServiceCommand::Run { .. } => {
+                service::cmd_service(&config_path, run_cmd).await
+            }
             other => {
                 service::cmd_service(&config_path, other).await?;
                 if cli.json {
@@ -2376,6 +2401,7 @@ async fn cmd_search_fast(
     harness_filter: Option<String>,
     tag: Option<String>,
     compact: bool,
+    refresh_local: bool,
     json: bool,
     budget: hstry_core::recall::Budget,
     raw: bool,
@@ -2447,6 +2473,16 @@ async fn cmd_search_fast(
         harness: harness_filter,
         tag,
     };
+    let mut refresh_warnings = Vec::new();
+    if refresh_local {
+        match refresh_local_collection(config).await {
+            Ok(()) => {}
+            Err(err) => refresh_warnings.push(format!(
+                "refresh-local warning: {err}; continuing with existing local snapshot"
+            )),
+        }
+    }
+
     let mut report = hstry_core::recall::SearchReport::default();
     let mut used_local_fallback = false;
 
@@ -2463,18 +2499,17 @@ async fn cmd_search_fast(
         }
         // Only a remote-only search has nothing left to report when no remote is
         // enabled. `--scope all` must still return the local report computed above.
-        // Satellite default (implicit Remote) falls back to local instead of
-        // hard-failing (#14); explicit `--scope remote` still fails loudly (#28).
-        if scope == SearchScopeArg::Remote && !remote_list.iter().any(|r| r.enabled) {
-            if allow_local_fallback {
-                report = search_local_report(config, query, opts.clone(), mode).await?;
-                report
-                    .warnings
-                    .push("No enabled remotes to search; using local archive".into());
-                used_local_fallback = true;
-            } else {
-                anyhow::bail!("No enabled remotes to search");
-            }
+        // Implicit satellite search falls back to local when the hub is
+        // disabled or unreachable; explicit `--scope remote` still fails (#28).
+        let has_enabled_remotes = remote_list.iter().any(|r| r.enabled);
+        if !has_enabled_remotes && allow_local_fallback {
+            report = search_local_report(config, query, opts.clone(), mode).await?;
+            report
+                .warnings
+                .push("No enabled remotes to search; using local archive".into());
+            used_local_fallback = true;
+        } else if scope == SearchScopeArg::Remote && !has_enabled_remotes {
+            anyhow::bail!("No enabled remotes to search");
         } else {
             match hstry_core::remote::search_remotes(&remote_list, query, &opts).await {
                 Ok(remote) => {
@@ -2507,6 +2542,7 @@ async fn cmd_search_fast(
         }
     };
     report.offset = offset;
+    report.warnings.splice(0..0, refresh_warnings);
     if !used_local_fallback
         && scope != SearchScopeArg::Local
         && !(scope == SearchScopeArg::Remote && remotes.len() == 1)
@@ -2733,6 +2769,25 @@ async fn try_api_search(
         anyhow::anyhow!("Search API predates recall protocol; upgrade it or set HSTRY_NO_API=1")
     })?;
     Ok(Some(report))
+}
+
+/// Local-only collection refresh used by `--refresh-local`.
+/// Never pushes to remotes; bounded to 5 seconds and returns warnings on failure.
+async fn refresh_local_collection(config: &Config) -> Result<()> {
+    let refresh = async {
+        let db = Database::open(&config.database).await?;
+        apply_storage_config(&db, config);
+        let runtime = Runtime::parse(&config.js_runtime).ok_or_else(|| {
+            anyhow::anyhow!("No JavaScript runtime found. Install bun, deno, or node.")
+        })?;
+        let runner = AdapterRunner::new(runtime, config.adapter_paths.clone());
+        sync_sources(&db, &runner, config, None, Some(1), false).await
+    };
+    match tokio::time::timeout(std::time::Duration::from_secs(5), refresh).await {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(err)) => Err(err),
+        Err(_) => Err(anyhow::anyhow!("local refresh timed out after 5s")),
+    }
 }
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum, serde::Deserialize, serde::Serialize)]

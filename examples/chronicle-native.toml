@@ -1,8 +1,8 @@
 # Native backup configuration. Passwords stay outside this file.
-data_root = "D:/Data/chronicle-native"
-restic = "D:/Data/chronicle-native/tools/restic.exe"
-password_file = "D:/Secrets/chronicle-restic-password.txt"
-local_repository = "D:/Data/chronicle-native/repository"
+data_root = "/path/to/chronicle-native"
+restic = "/path/to/restic"
+password_file = "/path/to/restic-password.txt"
+local_repository = "/path/to/chronicle-native/repository"
 remote_repository = "sftp:backup-host:/backups/chronicle-native/device-name"
 
 # components defaults to sessions; add only verified non-credential components.

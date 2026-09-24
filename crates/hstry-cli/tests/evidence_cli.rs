@@ -93,6 +93,33 @@ async fn cli_reads_are_bounded_and_full_requires_opt_in() -> anyhow::Result<()> 
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn stats_does_not_create_a_missing_archive() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let database = dir.path().join("missing.db");
+    let config = Config {
+        database: database.clone(),
+        ..Default::default()
+    };
+    let config_path = dir.path().join("config.toml");
+    fs::write(&config_path, toml::to_string(&config)?)?;
+
+    let mut command = cmd(&config_path);
+    command.args(["stats", "--json"]);
+    let result = command.output()?;
+
+    anyhow::ensure!(
+        !result.status.success(),
+        "stats should fail for a missing archive"
+    );
+    anyhow::ensure!(
+        !database.exists(),
+        "stats must not create a missing archive"
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn trace_files_exclude_queries_identifiers_and_payloads() -> anyhow::Result<()> {
     let (dir, config, id) = fixture().await?;
@@ -107,6 +134,66 @@ async fn trace_files_exclude_queries_identifiers_and_payloads() -> anyhow::Resul
     let value: Value = serde_json::from_str(&text)?;
     assert!(value["returned_hits"].as_u64().unwrap() > 0);
     assert!(value["ranks"][0].get("score").is_some());
+    Ok(())
+}
+
+#[tokio::test]
+async fn local_search_falls_back_when_service_is_unavailable() -> anyhow::Result<()> {
+    let (dir, config, _id) = fixture().await?;
+    let mut parsed: Config = toml::from_str(&fs::read_to_string(&config)?)?;
+    parsed.service.enabled = true;
+    parsed.service.search_api = true;
+    let service_config = dir.path().join("service-enabled.toml");
+    fs::write(&service_config, toml::to_string(&parsed)?)?;
+
+    let mut c = cmd(&service_config);
+    c.args(["search", "fixture request", "--json"])
+        .env_remove("HSTRY_NO_SERVICE")
+        .env("HSTRY_SERVICE_PORT", "1")
+        .env("HOME", dir.path().join("isolated-home"))
+        .env("XDG_CONFIG_HOME", dir.path().join("isolated-config"))
+        .env("XDG_STATE_HOME", dir.path().join("isolated-state"))
+        .env("XDG_RUNTIME_DIR", dir.path().join("isolated-runtime"));
+
+    let page = output(c)?;
+    assert!(!page["result"]["hits"].as_array().unwrap().is_empty());
+    assert!(
+        page["result"]["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| {
+                w.as_str().is_some_and(|s| {
+                    s.contains("Search service unavailable; used the local archive")
+                })
+            })
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn local_search_does_not_create_a_missing_archive() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let database = dir.path().join("missing.db");
+    hstry_core::test_guard::assert_test_path_safe(&database);
+    let config = Config {
+        database: database.clone(),
+        ..Default::default()
+    };
+    let config_path = dir.path().join("config.toml");
+    fs::write(&config_path, toml::to_string(&config)?)?;
+
+    let mut c = cmd(&config_path);
+    c.args(["search", "anything", "--json"]);
+    let result = c.output()?;
+    anyhow::ensure!(
+        !result.status.success(),
+        "search must fail when the configured archive is missing"
+    );
+    anyhow::ensure!(
+        !database.exists(),
+        "a read-only search must not create a missing archive"
+    );
     Ok(())
 }
 

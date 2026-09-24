@@ -14,6 +14,15 @@ use serde_json::json;
 
 /// Write one source plus a one-message conversation under it.
 async fn seed(db: &Database, source_id: &str, external_id: &str) -> anyhow::Result<()> {
+    seed_with_id(db, source_id, external_id, uuid::Uuid::new_v4()).await
+}
+
+async fn seed_with_id(
+    db: &Database,
+    source_id: &str,
+    external_id: &str,
+    id: uuid::Uuid,
+) -> anyhow::Result<()> {
     db.upsert_source(&Source {
         id: source_id.into(),
         adapter: "cursor".into(),
@@ -23,7 +32,7 @@ async fn seed(db: &Database, source_id: &str, external_id: &str) -> anyhow::Resu
     })
     .await?;
     let conv: Conversation = serde_json::from_value(json!({
-        "id": uuid::Uuid::new_v4(),
+        "id": id,
         "source_id": source_id,
         "external_id": external_id,
         "title": format!("conversation in {source_id}"),
@@ -139,6 +148,41 @@ async fn push_still_namespaces_local_rows_into_the_hub() -> anyhow::Result<()> {
 
     assert_eq!(result.sources_added, 1);
     assert_eq!(source_ids(&hub).await?, vec!["arknights:cursor-abc"]);
+
+    hub.close().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn merge_survives_a_conversation_id_already_used_by_another_source() -> anyhow::Result<()> {
+    // A device relays a hub row back to the hub: same conversation id, now under
+    // a longer namespace. Reusing the id verbatim would violate the primary key
+    // and fail every later push.
+    let shared = uuid::Uuid::new_v4();
+
+    let hub_dir = tempfile::tempdir()?;
+    let hub = Database::open(&hub_dir.path().join("hub.db")).await?;
+    seed_with_id(&hub, "macbook:cursor-xyz", "other-1", shared).await?;
+
+    let delta_dir = tempfile::tempdir()?;
+    let delta_path = delta_dir.path().join("delta.db");
+    let delta = Database::open(&delta_path).await?;
+    seed_with_id(&delta, "nas-lan:macbook:cursor-xyz", "other-1", shared).await?;
+    delta.close().await;
+
+    let result = merge_databases(&hub, &delta_path, "desktop").await?;
+    assert_eq!(result.conversations_added, 1);
+
+    let original = hub.get_conversation(shared).await?.expect("original row");
+    assert_eq!(
+        original.source_id, "macbook:cursor-xyz",
+        "existing row untouched"
+    );
+    assert!(
+        source_ids(&hub)
+            .await?
+            .contains(&"desktop:nas-lan:macbook:cursor-xyz".to_string())
+    );
 
     hub.close().await;
     Ok(())

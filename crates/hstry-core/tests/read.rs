@@ -59,6 +59,37 @@ async fn bounded_context_keeps_anchor_before_large_neighbors() -> anyhow::Result
 }
 
 #[tokio::test]
+async fn search_hit_exposes_conversation_version_for_anchored_reads() -> anyhow::Result<()> {
+    let (_dir, db, id) = fixture().await?;
+    let hits = db
+        .search(
+            "needle evidence",
+            hstry_core::db::SearchOptions {
+                mode: hstry_core::db::SearchMode::Exact,
+                limit: Some(5),
+                ..Default::default()
+            },
+        )
+        .await?;
+    assert!(!hits.is_empty());
+    let version = hits[0].conversation_version.expect("version present");
+    let page = db
+        .read_page(
+            id,
+            hstry_core::read::ReadOptions {
+                message_idx: Some(hits[0].message_idx),
+                version: Some(version),
+                max_chars: 3000,
+                ..Default::default()
+            },
+        )
+        .await?;
+    assert_eq!(page.version, version);
+    assert_eq!(page.records[0].relation, "anchor");
+    Ok(())
+}
+
+#[tokio::test]
 async fn field_continuations_reconstruct_unicode_without_gaps() -> anyhow::Result<()> {
     let (_dir, db, id) = fixture().await?;
     let mut offset = 0;

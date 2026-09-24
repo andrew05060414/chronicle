@@ -346,7 +346,7 @@ fn remote_path_expression(path: &str) -> String {
     expression
 }
 
-fn expand_remote_path_command(path: &str) -> String {
+pub(crate) fn expand_remote_path_command(path: &str) -> String {
     format!("printf '%s\\n' {}", remote_path_expression(path))
 }
 

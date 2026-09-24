@@ -23,6 +23,9 @@ pub mod service;
 pub mod source_registry;
 pub mod test_guard;
 
+#[cfg(test)]
+mod fork_guard_tests;
+
 pub use config::Config;
 pub use db::Database;
 pub use error::Error;

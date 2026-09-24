@@ -6,6 +6,14 @@ edition.workspace = true
 [lints]
 workspace = true
 
+[lib]
+name = "hstry_api"
+path = "src/lib.rs"
+
+[[bin]]
+name = "hstry-api"
+path = "src/main.rs"
+
 [dependencies]
 hstry-core.workspace = true
 anyhow.workspace = true

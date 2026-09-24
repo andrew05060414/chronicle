@@ -1372,6 +1372,7 @@ dependencies = [
  "dateparser",
  "dirs",
  "futures",
+ "hstry-api",
  "hstry-core",
  "hstry-runtime",
  "indicatif",

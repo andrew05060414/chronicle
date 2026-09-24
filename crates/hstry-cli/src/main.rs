@@ -116,6 +116,17 @@ struct StatsSummary {
     messages: i64,
     per_source: Vec<hstry_core::db::SourceStats>,
     activity: hstry_core::db::ActivityStats,
+    checkpoint: CheckpointHealth,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct CheckpointHealth {
+    enabled: bool,
+    count: usize,
+    newest_at: Option<chrono::DateTime<chrono::Utc>>,
+    age_seconds: Option<i64>,
+    stale_after_seconds: u64,
+    stale: bool,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -1478,9 +1489,9 @@ async fn main() -> Result<()> {
             .await
         }
         Command::Stats => {
-            let db = Database::open(&config.database).await?;
+            let db = Database::open_read_only(&config.database).await?;
             apply_storage_config(&db, &config);
-            cmd_stats(&db, cli.json).await
+            cmd_stats(&db, &config, cli.json).await
         }
         Command::Dedup {
             dry_run,
@@ -4899,6 +4910,75 @@ mod tests {
     use super::*;
     use std::io::Write;
 
+    fn checkpoint_health_config(dir: &Path, enabled: bool) -> Config {
+        let mut config = Config::default();
+        config.checkpoint.dir = Some(dir.to_path_buf());
+        config.checkpoint.enabled = enabled;
+        config.checkpoint.interval_secs = 60;
+        config
+    }
+
+    fn write_checkpoint_health_fixture(
+        dir: &Path,
+        stem: &str,
+        created_at: chrono::DateTime<chrono::Utc>,
+    ) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join(format!("{stem}.db.zst")), b"synthetic checkpoint").unwrap();
+        let manifest = hstry_core::checkpoint::CheckpointManifest {
+            version: 1,
+            created_at,
+            stem: stem.to_string(),
+            weekly: false,
+            conversations: 1,
+            messages: 1,
+            sources: 1,
+            uncompressed_bytes: 1,
+            compressed_bytes: 1,
+            integrity: "ok".to_string(),
+            live_database: "synthetic".to_string(),
+        };
+        std::fs::write(
+            dir.join(format!("{stem}.json")),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn checkpoint_health_reports_disabled_missing_fresh_and_stale_states() {
+        let temp = tempfile::tempdir().unwrap();
+
+        let disabled_dir = temp.path().join("disabled");
+        let disabled = checkpoint_health(&checkpoint_health_config(&disabled_dir, false)).unwrap();
+        assert!(!disabled.enabled);
+        assert_eq!(disabled.count, 0);
+        assert!(!disabled.stale);
+
+        let empty_dir = temp.path().join("empty");
+        let empty = checkpoint_health(&checkpoint_health_config(&empty_dir, true)).unwrap();
+        assert!(empty.enabled);
+        assert_eq!(empty.count, 0);
+        assert!(empty.newest_at.is_none());
+        assert!(empty.stale);
+
+        let fresh_dir = temp.path().join("fresh");
+        write_checkpoint_health_fixture(&fresh_dir, "fresh", chrono::Utc::now());
+        let fresh = checkpoint_health(&checkpoint_health_config(&fresh_dir, true)).unwrap();
+        assert_eq!(fresh.count, 1);
+        assert!(!fresh.stale);
+
+        let stale_dir = temp.path().join("stale");
+        write_checkpoint_health_fixture(
+            &stale_dir,
+            "stale",
+            chrono::Utc::now() - chrono::Duration::seconds(1_000),
+        );
+        let stale = checkpoint_health(&checkpoint_health_config(&stale_dir, true)).unwrap();
+        assert_eq!(stale.count, 1);
+        assert!(stale.stale);
+    }
+
     #[test]
     fn default_log_filter_suppresses_sqlx_slow_query_warnings_without_verbose() {
         assert_eq!(
@@ -6168,13 +6248,36 @@ async fn cmd_index(_config: &Config, db: &Database, rebuild: bool, json: bool) -
     Ok(())
 }
 
-async fn cmd_stats(db: &Database, json: bool) -> Result<()> {
+fn checkpoint_health(config: &Config) -> Result<CheckpointHealth> {
+    let dir = config.checkpoint.resolve_dir(&config.database);
+    let checkpoints =
+        hstry_core::checkpoint::list_checkpoints(&dir).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let newest_at = checkpoints.first().map(|c| c.manifest.created_at);
+    let age_seconds = newest_at.map(|created| (chrono::Utc::now() - created).num_seconds().max(0));
+    let stale_after_seconds = config.checkpoint.interval_secs.saturating_mul(2);
+    let stale = config.checkpoint.enabled
+        && age_seconds
+            .map(|age| age > i64::try_from(stale_after_seconds).unwrap_or(i64::MAX))
+            .unwrap_or(true);
+
+    Ok(CheckpointHealth {
+        enabled: config.checkpoint.enabled,
+        count: checkpoints.len(),
+        newest_at,
+        age_seconds,
+        stale_after_seconds,
+        stale,
+    })
+}
+
+async fn cmd_stats(db: &Database, config: &Config, json: bool) -> Result<()> {
     let sources = db.list_sources().await?;
     let conv_count = db.count_conversations().await?;
     let msg_count = db.count_messages().await?;
     let sources_count = i64::try_from(sources.len()).unwrap_or(i64::MAX);
     let per_source = db.get_source_stats().await?;
     let activity = db.get_activity_stats(30).await?;
+    let checkpoint = checkpoint_health(config)?;
 
     if json {
         return emit_json(JsonResponse {
@@ -6185,6 +6288,7 @@ async fn cmd_stats(db: &Database, json: bool) -> Result<()> {
                 messages: msg_count,
                 per_source,
                 activity,
+                checkpoint,
             }),
             error: None,
         });
@@ -6206,6 +6310,26 @@ async fn cmd_stats(db: &Database, json: bool) -> Result<()> {
     println!("  Today:      {:>6} conversations", activity.today);
     println!("  This week:  {:>6} conversations", activity.week);
     println!("  This month: {:>6} conversations", activity.month);
+    println!();
+
+    println!("\x1b[1;34mCheckpoint Health\x1b[0m");
+    if !checkpoint.enabled {
+        println!("  Checkpointing: disabled");
+    } else if let (Some(newest), Some(age)) = (checkpoint.newest_at, checkpoint.age_seconds) {
+        println!("  Checkpoints:   {}", checkpoint.count);
+        println!("  Newest:        {} ({}s ago)", newest.to_rfc3339(), age);
+        if checkpoint.stale {
+            println!(
+                "  WARNING: checkpoint is stale (threshold {}s)",
+                checkpoint.stale_after_seconds
+            );
+        } else {
+            println!("  Freshness:     ok");
+        }
+    } else {
+        println!("  Checkpoints:   0");
+        println!("  WARNING: checkpointing is enabled but no valid checkpoint exists");
+    }
     println!();
 
     // Per-source stats

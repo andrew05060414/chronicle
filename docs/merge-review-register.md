@@ -2,7 +2,7 @@
 
 一张表把 issue 和 PR 对起来，省得每次重新翻。**GitHub Issues 是这个仓库唯一的看板**——`.trx/`、`.pi/todos/`、`.octo/` 都是要冻结的历史（#21）。
 
-状态截至 2026-09-20 07:45 UTC，main 在 `c3dd891`（#44）。Arknights 现场另装了 [#45](https://github.com/andrew05060414/chronicle/pull/45) 的 Windows Instant 启动修复，合入前 PATH 上的 `c3dd891` 二进制会在短 uptime 下把服务打崩。严重度以 GitHub 标签为准。下面两张表里的 issue↔PR 对应关系不随合并变化；PR 的实时状态见「PR 面板」。
+状态截至 2026-09-26，main 在 `ff4d449`（#54）。**这张登记表的两条轴已基本收口**：轴一全部合入，轴二只剩 #25 开着（#49 已加健康检查，服务仍需重启）。下文「PR 面板」及其后的段落是 2026-09-20 的快照，之后合入的是 #45 #47 #48 #49 #52 #53 #56 #57 #58 #54，详见 [`fork-timeline.md`](./fork-timeline.md) 阶段五。Chronicle 接下来的主线是 [#61](https://github.com/andrew05060414/chronicle/issues/61)，不在这张表里。严重度以 GitHub 标签为准。
 
 背景见 [`fork-timeline.md`](./fork-timeline.md)，决策依据见 [`project-thread.md`](./project-thread.md)。
 

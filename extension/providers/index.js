@@ -1,6 +1,7 @@
 import { syncChatGPT } from './chatgpt.js';
 import { syncClaude } from './claude.js';
 import { syncGemini } from './gemini.js';
+import { syncGrok } from './grok.js';
 import { syncPerplexity } from './perplexity.js';
 
 // Shared provider seam for the worker and both extension surfaces. A provider
@@ -32,6 +33,15 @@ export const PROVIDERS = {
     sourceId: 'gemini-web',
     adapter: 'gemini',
     sync: syncGemini,
+  },
+  grok: {
+    name: 'Grok',
+    site: 'grok.com',
+    description: 'Conversations from grok.com',
+    defaultEnabled: false,
+    sourceId: 'grok-web',
+    adapter: 'grok',
+    sync: syncGrok,
   },
   perplexity: {
     name: 'Perplexity',

@@ -2,13 +2,15 @@
 
 给后续 AI 的可携带简报。口语叫 **Chronicle**；CLI 是 `chronicle`（兼容名 `hstry`）。
 
-- 仓库事实写到 **2026-09-20**（`main` = `c3dd891` / #44；Arknights 另装 #45 Instant 启动修复）。
-- 本机对话档案补遗来自同日对 live archive 的只读检索，不是云端会话。
+- 仓库事实写到 **2026-09-26**（`main` = `ff4d449` / #54）。
+- 2026-09-18 以前的本机对话补遗来自对 live archive 的只读检索；09-25 / 09-26 的部分来自云端 Claude Code 会话。
 - 部署合同以 [`archive-model.md`](./archive-model.md) 为准；恢复以 [`restore.md`](./restore.md) 为准。本页补的是「为什么会变成这样」和「Andrew 在对话里拍过什么板」。
 
 ---
 
 ## 30 秒版（可整段粘贴给其他 AI）
+
+Chronicle 是 Andrew 的个人 AI 系统 **Antiochus** 里的历史档案，也是记忆检索的名字和入口。Antiochus 是系统总代号（前身叫 Personal AI Assistant）；语音输入常把它识别成「Antigravity」，但 Antigravity 是 Google 的编码 IDE，在这里只是被采集的一个来源。
 
 Chronicle 是 Andrew 的 **AI 对话原文档案**，不是聊天 App，也不是记忆系统。它把 Cursor / Codex / Claude Code / Antigravity / Pi 等十几个本地工具的对话收进本机 SQLite，再按 `device_id` 推到 NAS hub。抽取、总结、打分是下游的事。
 
@@ -18,7 +20,7 @@ Chronicle 是 Andrew 的 **AI 对话原文档案**，不是聊天 App，也不�
 
 本机卫星：`sync.mode = satellite`，`device_id` 见本地 `config.toml`，`hub_remote = nas-lan`。禁止把带设备前缀的 hub 全库覆盖回 staging 再 push。搜索在 Windows 上用 `HSTRY_NO_SERVICE=1` 加 `--scope local`。未授权不要 `sync` / `backup` / `remote sync`。
 
-当前工程焦点：轴二还开着（#17 / #19 / #23–#27 / #33 分支保护）。轴一回归代码已在 `main`（#16 当总账）。Arknights 已从 `c3dd891` 安装 CLI，并打了服务 `Instant` 启动补丁；NAS hub 上的 `hstry` 仍是旧 CLI（没有 `--raw` / `--input`），卫星默认搜 hub 会失败并回落到本地。
+当前工程焦点：[#61](https://github.com/andrew05060414/chronicle/issues/61)。检索、索引、界面和多机汇总逐步交给 AgentsView；Chronicle 保留名字、入口（`chronicle search` 以后转发给 AgentsView）、浏览器网页对话采集和备份配置；现有 hstry 库冻结为只读档案兜底。不 fork AgentsView。第 1–3 步完成之前不删任何 hstry 代码或数据。两条审查轴基本收口，只剩 #25 还开着。
 
 ---
 
@@ -88,12 +90,34 @@ README 的清单：
 
 ---
 
-## 03 在个人 AI 栈里的位置
+## 03 在 Antiochus 里的位置
 
-Andrew 近两个月高强度做的是 **个人 AI 定制**，Chronicle 是底座，不是整套系统。对话里反复出现、后来被拆开的东西：
+Andrew 近两个月高强度做的「个人 AI 定制」，2026-09-20 起有了总代号 **Antiochus**，09-26 冻结了 v0.2 设计。Antiochus 分三部分：前台（跟人说话，现任是 ChatGPT 网页）、后台、基础设施。后台分 9 类：1 历史档案、2 长期记忆、3 记忆检索、4 记忆整理、5 任务编排、6 工具箱、7 模型网关、8 安全与权限、9 触发与通知。
+
+只有自己写的或 fork 的部件才起代号，目前只有 **Chronicle** 和 **Agent Factory**（5 任务编排）。Chronicle 管 1 历史档案，同时是 3 记忆检索对外的名字和入口，底下的检索引擎是 AgentsView（2026-09-26 Andrew 定；Antiochus 的 ADR-0004 原写「只指聊天记录程序」，以这条为准）。框架篇、现状篇和 ADR 在 Andrew 的 antiochus 仓库里，以那边为准。
+
+对话里反复出现、后来被拆开的东西：
 
 | 名字 | 现在的定位 | 不要当成 |
 |---|---|---|
+| **Chronicle / hstry** | 1 历史档案 + 3 记忆检索的名字和入口 | 记忆、日记、任务板 |
+| **AgentsView** | 3 记忆检索的引擎（#61 迁移中），入口仍叫 Chronicle。不 fork，只用它公开的 CLI、MCP 和导入格式 | Chronicle 的替代名 |
+| **OpenCodex**（`ocx`） | 7 模型网关，唯一网关；也是额度数据的来源 | 档案层 |
+| **9Router** | 被 OpenCodex 替代，逐步下线 | 现行网关 |
+| **Multica** + MCPX | 5 任务编排：MCPX 管计划与授权，Multica 管派发 | 档案层 |
+| **Andrew-Skill / ASM** | 6 工具箱。`chronicle skills` 是 opt-in 代理 | 记忆图；不要 clone AMS 来装 skill |
+| **worklog** | 人类日记与凭证。Chronicle 转交 | 不要把日报写进档案库 |
+| **Agent Memory**（`agentmemory`） | 不再使用（「效果非常差」） | Chronicle 的替代品 |
+| **CTX** | 排除 | 记忆总线 |
+| **AMS / `agent-memory-system`** | **已冻结**（2026-09-05） | 不要装 Junction，不要跑 `ams rollup` |
+| **Mem0** | 不用；不引入会话注入式记忆框架 | 记忆层 |
+| **knowledge-hub / collection-demo** | 收藏与阅读沉淀，另一条线 | Chronicle 功能 |
+
+2026-09-11 的原话（`late-lets`，Cursor）：健康检查的知识库「现在已经建好了，就是 Chronicle，这是基础」；智能体集合中心是 Multica；token 是 9Router（现在已换成 OpenCodex）。
+
+2026-09-05 的原话（`pass-yawn`，Cursor）：求职仓库和星际 setup 都不是记忆系统，最多是档案里的一类记录；真正要进包装层的是对话档案、备份手段，以及 Andrew-Skill。
+
+---|---|---|
 | **Chronicle / hstry** | 对话原文档案。日常入口 | 记忆、日记、任务板 |
 | **Andrew-Skill / ASM** | 技能安装与审计。`chronicle skills` 是 opt-in 代理 | 记忆图；不要 clone AMS 来装 skill |
 | **worklog** | 人类日记与凭证。Chronicle 转交 | 不要把日报写进档案库 |
@@ -197,6 +221,24 @@ Andrew 原话，不要再重新辩论：
 
 一个容易踩的时间差：v0.5.25 合进 git 了，PATH 上的 `chronicle 1.0.0` 是更早的安装。#3–#15 这类回归主要在代码里，重新 `cargo install` 之后才会进日常使用。
 
+### 2026-09-18 → 09-24：两条审查轴收口
+
+#35（修 #17 回流）、#32、#36 在 09-18 合入；09-20 合了 #38 #39 #40 #43 #44 #45（远程注入、设备 UUID、备份 stderr、加密备份清理、Windows 服务启动）；09-23 / 09-24 合了 #47（agent 只读打开数据库，#19）、#48（fork 不变量守卫，#24）、#49（checkpoint 健康检查，#25）、#52（远端快照清理，#27）、#53（Issues 是唯一看板，#21）。
+
+09-24 审查 #51（原生备份与恢复）：结论 FAIL，6 个阻塞问题。Andrew：「先把 A 到 D 修了……我比较在乎 1 到 5，第 6 个倒没有那么重要」。于是拆成 #56（零碎修复）、#57（原生备份只读部分）、#58（同步确认、本地加 hub 搜索、HTTP，默认关闭）；写回客户端拆成 #59，更多客户端和非会话数据拆成 #60。#51 保持打开，只当代码来源。
+
+### 2026-09-25 / 09-26：清掉回流副本，检索交给 AgentsView
+
+诊断：检索差的主因是重复和自我污染，中文分词是次要的。7911 个会话里 4067 个是 `nas-lan:<device>:*` 回流副本；#35 的修复 09-18 就合了，但一直没部署；结果返回的是碎片不是会话；当前会话会搜到自己。
+
+Andrew：「先用 main 重新编译安装，副本清理的方案给我看看（最好是先做一下数据备份，然后再清理）」。先做 2.4 GB 完整备份，再删掉 3958 个会话、约 21 万条消息，剩 3953 个。随后合入 #54 #56 #57 #58，`main` 到 `ff4d449`。
+
+20 道真实题的对比（排除评测会话本身）：AgentsView v0.44 加中文分词，前 5 命中 13/20、中位 0.8 秒；Chronicle 9/20、2.3 秒。两边数据互补：Chronicle 独有约 1430 个网页对话，AgentsView 的 Codex 等来源更全。
+
+Andrew 拍板：「我觉得记忆检索总体就叫 Chronicle……相当于只保留同步这一部分」「可以把这个步骤方案挂到 issue 里面去，相当于逐渐地把 HSTRY 给推移掉」。这就是 #61。他也不想自己包一层 restic 带来双重维护，所以备份以后改用 restic 或 Kopia 的现成配置，#57 会被替换。
+
+向量不是必需的：Andrew「个人是不太喜欢碰向量重排这些东西的」，主路径是关键词加中文分词，不做 rerank。
+
 ---
 
 ## 05 已经定下来的决策
@@ -216,51 +258,46 @@ Andrew 原话，不要再重新辩论：
 | 只 merge「某种格式怎么解析」，不整仓合 agy-reader / cass | archive-model |
 | 日常合上游：功能以 fork 为准，作者更新要能吸进来 | `pass-yawn` 最后一轮 |
 | 未授权不把 issue 报到上游 | `like-gray` 明确没发到 `byteowlz/hstry` |
+| Chronicle 是 Antiochus「1 历史档案」的部件，也是「3 记忆检索」的名字和入口；只有自研或 fork 的部件起代号 | Antiochus ADR-0004；2026-09-26 Andrew 补充入口这一条 |
+| 检索、索引、界面、多机汇总交给 AgentsView；Chronicle 保留名字、入口、网页采集、备份配置 | #61（2026-09-26） |
+| 不 fork AgentsView，不写自有备份代码 | #61 |
+| 模型网关用 OpenCodex，9Router 下线 | Antiochus ADR-0005（Proposed） |
 
 ---
 
 ## 06 悬而未决
 
-### 缺陷（有编号，还没做完）
+以 GitHub 为准。2026-09-26 还开着的 issue：
 
-| # | 严重度 | 问题 |
+| # | 问题 | 现状 |
 |---|---|---|
-| #3 | critical | 远程路径展开用了 `eval echo`。上游同样中招；**要不要上报是另一个决定** |
-| #17 | high | hub 往返把本机归档又导回来（`nas-lan:<device>:*` 双前缀）。现网 `chronicle stats` 仍能看到这批重复 source |
-| #4 | high | `device_namespace()` 退化成 `"unknown"`，与 #17 同族 |
-| #25 | high | checkpoint 陈旧且无告警。现网 `[checkpoint] enabled = false`，不只是服务挂了 |
-| #26 | high | 3-2-1 异地目标没有被排程。管道 09-09 能跑，不等于一直在跑 |
-| #19 | high | 没有只读模式。AI 读历史会以读写方式打开 live 库 |
-| #24 | enhancement | fork 不变量没有合并守卫。#34 是在补这个门 |
+| #61 | 逐步退役 hstry 核心，检索交给 AgentsView | 第 1 步评测进行中 |
+| #25 | 服务停了，checkpoint 陈旧 | #49 已加健康检查；服务要管理员重启一次 |
+| #59 | 原生安装：把快照安全写回 agent 目录 | #51 的第 6 块，优先级低 |
+| #60 | 原生备份覆盖更多 agent 和非会话数据 | 可能被 #61 第 4 步的现成备份工具替代 |
+| #55 | 合并队列 | 看 GitHub |
+| #50 | Grok 网页采集 | #54 已合 |
 
 ### 还没想清楚
 
-- #3 要不要报给上游。
-- 已经灌进来的双前缀会话：直接删，还是先比对 hub 上可能留着本机已经轮转掉的历史。
-- 是谁触发了那次 pull：后来排除了「v0.5.25 已安装」和「神秘 09:30 pull」（时区）。默认方向是 pull，一次无心调用就够造成后果。
-- main 没有分支保护；#33 的门禁方案在，ruleset 还没配。
-- Windows release zip 仍是 follow-up。CI 已经跑 Windows。
+- 向量检索要不要保留。Andrew 倾向不用。
+- AgentsView 升级后换成安装 ID，`pg push` 会不会在 NAS 的 PG 里产生重复会话；PG 汇总库的中文检索效果（中文分词只作用于 SQLite）。
+- Grok 网页对话没有 AgentsView 的导入路径，要单独处理。
+- #3 要不要报给上游（代码已修）。
 
 ### 对话里提出、档案层故意不做的
 
-- 「既能解析也能放回去」的跨机 resume（`lame-mule`）：方向对，但 resume 不是 1.0 主线。
+- 「既能解析也能放回去」的跨机 resume（`lame-mule`）：拆成 #59，不是主线。
 - 个人 AI 收藏夹 / 链接分享（`east-firm`、`brag-poll`，2026-09-17）：在 knowledge-hub / `collection-demo`，**不是 Chronicle 的 issue**。
-- Nexus 上的 Health Checker（`late-lets`）：后期想法，不要写进这个仓库。
+- 记忆提炼、决策摘要：属于 Antiochus 的「长期记忆 / 记忆整理」，不进 Chronicle。
 
 ---
 
 ## 07 现在手上正在进行的
 
-以 GitHub 为准。2026-09-18 时：6 个 draft PR 基于同一个 `main`（`0186b81`）。#34 落地后其余都要 rebase，因为它把 CI 收到 clippy `-D warnings` 和全 target 测试。
-
-| PR | 内容 | 备注 |
-|---|---|---|
-| #29 | 适配器缺陷（#10 #11 #12 #15） | 纯 TypeScript |
-| #31 | Windows 服务进程检测 | 只动 `service.rs` |
-| #30 | 备份安全（#5 #6 #7） | 与 #34 在 core 校验上有重叠 |
-| #28 | 搜索 scope + MCP 界面 | 和 #30 都改 cli |
-| #32 | 文档边界（#20 #21） | README 仍可能写着 Issues 在 `.trx/`，以本决策为准 |
-| #34 | pre-PR 记忆完整性门禁 | 合成数据、临时库、checkpoint 往返；**绝不碰 live archive** |
+- #61 第 1 步：向量建完后测整句提问；查 NAS 上 PG 的 pgvector 版本和中文检索；确认 `pg push` 不重复。
+- 第 2 步准备：`chronicle search` 改为转发给 AgentsView；整句提问先拆成关键词再搜。hstry 服务并行 2–4 周。
+- 开着的 PR 只有 #51（不合，只当代码来源）。
 
 `andrew-nas`、`feat/rip-out-tantivy`、`release/1.0` 已并入 main，只是没删的旧指针。
 
@@ -268,7 +305,7 @@ Andrew 原话，不要再重新辩论：
 
 ## 08 给后续 AI 的操作纪律
 
-1. 先读本文和 [`archive-model.md`](./archive-model.md)，再改代码。
+1. 先读本文和 [`archive-model.md`](./archive-model.md)，再改代码。碰检索相关的改动先看 #61，别再往 hstry 的检索上加功能。
 2. 检索用 `--scope local` 加 `HSTRY_NO_SERVICE=1`。未授权不要 `sync` / `remote sync` / `backup` / `reseed`。
 3. 不要把 live archive 路径写进测试或 CI。#34 的门就是为这个而开。
 4. 不要把 CTX / AMS / Agent Memory / Mem0 接回来「增强」Chronicle。
@@ -276,6 +313,7 @@ Andrew 原话，不要再重新辩论：
 6. 合上游时保留 fork 已有的安全机制和证明它们的测试（#16 就是因为这次没守住）。
 7. Windows / Linux / macOS 行为对等，不为旧系统写 shim。
 8. 公开树里不要写本机绝对路径、NAS hostname、rclone token。09-16 专门清过一次。
+9. 项目总名写 Antiochus。只有指 Google 那个 IDE（Chronicle 的采集来源）时才写 Antigravity。
 
 ---
 
@@ -312,4 +350,4 @@ chronicle peek pass-yawn
 
 ---
 
-整理于 2026-09-18。仓库依据：`andrew05060414/chronicle` 在 `0186b81` 上的文档、提交、issue 与 PR，以及当时工作分支 `ci/pre-pr-memory-integrity-gate`（#34）。本机依据：live archive 只读检索 + 上表会话的 `peek`。未包含 claude.ai 网页会话正文，也未把 `config.toml` 里的 host 与绝对路径抄进本页。
+整理于 2026-09-18，2026-09-26 更新。仓库依据：`andrew05060414/chronicle` 在 `ff4d449` 上的文档、提交、issue 与 PR。本机依据（09-18 以前）：live archive 只读检索 + 上表会话的 `peek`。09-24 到 09-26 的部分来自云端 Claude Code 会话（#51 审查、Chronicle 架构评估与演进、Antiochus v0.2 冻结）。未包含 claude.ai 网页会话正文，也未把 `config.toml` 里的 host 与绝对路径抄进本页。

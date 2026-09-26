@@ -3,7 +3,7 @@
 这个 fork 每一步是什么时候、为了解决什么问题做的。提交列表以 `git log` 为准，日期是提交日期。
 配套阅读：为什么会这样决定，见 [`project-thread.md`](./project-thread.md)；部署合同见 [`archive-model.md`](./archive-model.md)。
 
-仓库事实截至 2026-09-18。
+仓库事实截至 2026-09-26（`main` = `ff4d449`）。Chronicle 现在是 Andrew 的个人 AI 系统 Antiochus 里「历史档案」的部件，见 [`project-thread.md`](./project-thread.md) 第 03 节。
 
 ---
 
@@ -21,7 +21,7 @@
 
 ---
 
-## 四个阶段
+## 五个阶段
 
 ### 阶段一：把 Windows 变成一等公民（2026-07-24 → 07-30）
 
@@ -99,9 +99,22 @@ v1.0.0 之前做的一次本机盘点（记在 [`archive-model.md`](./archive-mo
 
 分别是远程路径的 printf 转义（#3）、持久化 UUID 设备身份（#4）、SQLite `quick_check` 校验（#7）。13 条发现记在 #16，全部登记见 [`merge-review-register.md`](./merge-review-register.md)。
 
-修复在 2026-09-18 上午一次性落地：`2829434` 合入 #30、`3b1396e` 合入 #29、`b36cad3` 合入 #31、`c436a65` 合入 #34（记忆完整性门禁，从此 CI 是 `clippy --all-targets -- -D warnings` 加全 target 测试），随后 #28 和本套文档 `fddb223` 也合了进去。main 现在在 `fddb223`。
+修复在 2026-09-18 上午一次性落地：`2829434` 合入 #30、`3b1396e` 合入 #29、`b36cad3` 合入 #31、`c436a65` 合入 #34（记忆完整性门禁，从此 CI 是 `clippy --all-targets -- -D warnings` 加全 target 测试），随后 #28、#35（修 #17 的 pull 方向）、#32（文档边界）和本套文档 `fddb223` 也合了进去。
 
-还在飞的是 #35（修 #17 的 pull 方向）和 #32（文档边界）。
+09-20 合入 #38 #39 #40 #43 #44 #45（`c3dd891` → `fce5f66`），09-23 / 09-24 合入 #47 #48 #49 #52 #53（`f6ad49b`）。两条审查轴到这里基本收口，只剩 #25。
+
+### 阶段五：清理回流副本，检索交给 AgentsView（2026-09-24 →）
+
+| 提交 | 日期 | 内容 |
+|---|---|---|
+| `98c4f93` | 2026-09-25 | #56：#51 拆出的零碎修复 |
+| `2d689f9` | 2026-09-25 | #57：原生备份（agent 会话文件的 restic 复制，只读部分） |
+| `c61f868` | 2026-09-25 | #58：同步确认、本地加 hub 搜索、服务内 HTTP 接口（默认关闭） |
+| `ff4d449` | 2026-09-25 | #54：Grok 网页采集 |
+
+#51 审查结论 FAIL，拆成 #56 #57 #58，写回客户端另开 #59，更多客户端另开 #60。#51 保持打开，只当代码来源。
+
+同一天在本机清掉了 #17 留下的回流副本（先做完整备份）。随后对比 AgentsView，开了 [#61](https://github.com/andrew05060414/chronicle/issues/61)：检索、索引、界面和多机汇总逐步交给 AgentsView，Chronicle 保留名字、入口、网页采集和备份配置，现有 hstry 库冻结为只读档案。第 1–3 步完成之前不删任何代码或数据。
 
 ---
 
@@ -109,13 +122,13 @@ v1.0.0 之前做的一次本机盘点（记在 [`archive-model.md`](./archive-mo
 
 | 分支 | 最后一笔 | 状态 |
 |---|---|---|
-| `main` | `fddb223`（2026-09-18） | 当前 base |
+| `main` | `ff4d449`（2026-09-25） | 当前 base |
 | `andrew-nas` | `4b77288`（2026-07-30） | **已并入 main**，旧指针 |
 | `feat/rip-out-tantivy` | `740bcbb`（2026-04-26） | **已并入 main**，旧指针 |
 | `release/1.0` | `179aaba`（2026-08-25） | **已并入 main**，旧指针 |
 | `fix/ci-baseline` | `90dcb5a` | 已通过 PR #2 合并 |
 | `fix/backup-safety-5-6-7`、`fix/adapter-defects-batch`、`fix/windows-service-process-detection`、`ci/pre-pr-memory-integrity-gate`、`fix/search-scope-and-mcp-surface` | — | 2026-09-18 上午已合并 |
-| `docs/chronicle-boundary-20-21`、`claude/project-thread-rgec62` | 见 [`merge-review-register.md`](./merge-review-register.md) | 进行中 |
+| `docs/chronicle-boundary-20-21`、`claude/project-thread-rgec62` | — | 已合并（#32、#35） |
 
 前三个分支上没有任何未并入 main 的提交。它们是遗留指针，不是搁置的探索——删掉不会丢东西。
 

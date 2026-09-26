@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
   "crates/hstry-core",
+  "crates/chronicle-backup",
   "crates/hstry-runtime",
   "crates/hstry-cli",
   "crates/hstry-tui",

@@ -34,15 +34,15 @@ jobs:
 
       - name: Install protoc (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler restic
 
       - name: Install protoc (macOS)
         if: runner.os == 'macOS'
-        run: brew install protobuf
+        run: brew install protobuf restic
 
       - name: Install protoc (Windows)
         if: runner.os == 'Windows'
-        run: choco install protoc -y
+        run: choco install protoc restic -y
 
       - name: Check formatting
         run: cargo fmt --all --check
@@ -55,6 +55,9 @@ jobs:
 
       - name: Test workspace
         run: cargo test --workspace --all-targets --no-fail-fast
+        env:
+          # Native backup restic round trips must run in CI, not skip.
+          CHRONICLE_REQUIRE_RESTIC: "1"
 
       - name: Memory-integrity gate (explicit)
         run: cargo test -p hstry-core --test memory_integrity --no-fail-fast -- --nocapture

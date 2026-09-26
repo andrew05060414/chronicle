@@ -1109,10 +1109,23 @@ fn default_log_filter(verbose: u8) -> &'static str {
 const MAIN_STACK_SIZE: usize = 8 * 1024 * 1024;
 
 fn main() -> Result<()> {
+    // Native backup has its own CLI so a broken archive config or database
+    // never blocks capture or recovery.
+    let is_native = std::env::args().nth(1).as_deref() == Some("native");
+
     std::thread::Builder::new()
         .name("cli-main".into())
         .stack_size(MAIN_STACK_SIZE)
-        .spawn(real_main)?
+        .spawn(move || {
+            if is_native {
+                use clap::Parser as _;
+                let mut args: Vec<_> = std::env::args_os().collect();
+                args.remove(1);
+                chronicle_backup::run(chronicle_backup::NativeArgs::parse_from(args))
+            } else {
+                real_main()
+            }
+        })?
         .join()
         .unwrap_or_else(|e| std::panic::resume_unwind(e))
 }

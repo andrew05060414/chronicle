@@ -19,6 +19,7 @@ path = "src/main.rs"
 [dependencies]
 hstry-core.workspace = true
 hstry-runtime.workspace = true
+chronicle-backup = { path = "../chronicle-backup" }
 anyhow.workspace = true
 clap.workspace = true
 clap_complete.workspace = true

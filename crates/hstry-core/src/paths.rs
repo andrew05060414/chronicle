@@ -16,3 +16,8 @@ pub fn service_port_path() -> PathBuf {
 pub fn service_socket_path() -> PathBuf {
     state_dir().join("service.sock")
 }
+
+/// Path to the HTTP API port file.
+pub fn http_port_path() -> PathBuf {
+    state_dir().join("http.port")
+}

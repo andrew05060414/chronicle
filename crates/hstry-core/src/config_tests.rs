@@ -86,6 +86,15 @@ mod default_config_tests {
     }
 
     #[test]
+    fn default_http_api_disabled() {
+        let config = Config::default();
+        assert!(!config.service.http_api);
+        assert_eq!(config.service.http_port, Some(3000));
+        let parsed: Config = toml::from_str("[service]\nenabled = true\n").unwrap();
+        assert!(!parsed.service.http_api, "HTTP API must stay opt-in");
+    }
+
+    #[test]
     fn standalone_does_not_prefer_hub_search() {
         let config = Config::default();
         assert!(!config.prefers_hub_search());
@@ -131,11 +140,11 @@ mod search_scope_tests {
     }
 
     #[test]
-    fn satellite_with_hub_defaults_to_remote_search() {
+    fn satellite_with_hub_defaults_to_all_search() {
         let mut config = Config::default();
         config.sync.mode = SyncMode::Satellite;
         config.sync.hub_remote = Some("nas".into());
-        assert_eq!(config.resolve_search_scope(None), SearchScope::Remote);
+        assert_eq!(config.resolve_search_scope(None), SearchScope::All);
     }
 
     #[test]
@@ -297,7 +306,7 @@ mod service_config_tests {
     #[test]
     fn default_poll_interval() {
         let config = ServiceConfig::default();
-        assert_eq!(config.poll_interval_secs, 1_200);
+        assert_eq!(config.poll_interval_secs, 300);
     }
 
     #[test]

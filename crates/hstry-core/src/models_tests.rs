@@ -363,6 +363,7 @@ mod search_hit_tests {
             source_adapter: "opencode".to_string(),
             source_path: Some("/home/user/.opencode".to_string()),
             host: None,
+            conversation_version: Some(3),
             occurrences: None,
         };
 

@@ -1105,8 +1105,19 @@ fn default_log_filter(verbose: u8) -> &'static str {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+/// Deep commands overflow the default 1 MiB Windows main-thread stack.
+const MAIN_STACK_SIZE: usize = 8 * 1024 * 1024;
+
+fn main() -> Result<()> {
+    std::thread::Builder::new()
+        .name("cli-main".into())
+        .stack_size(MAIN_STACK_SIZE)
+        .spawn(real_main)?
+        .join()
+        .unwrap_or_else(|e| std::panic::resume_unwind(e))
+}
+
+fn real_main() -> Result<()> {
     let cli = Cli::parse();
 
     if cli.no_color {
@@ -1124,9 +1135,19 @@ async fn main() -> Result<()> {
         .init();
 
     // Load config
-    let config_path = cli.config.unwrap_or_else(Config::default_config_path);
+    let config_path = cli
+        .config
+        .clone()
+        .unwrap_or_else(Config::default_config_path);
     let config = Config::ensure_at(&config_path)?;
 
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    rt.block_on(Box::pin(run(cli, config, config_path)))
+}
+
+async fn run(cli: Cli, config: Config, config_path: PathBuf) -> Result<()> {
     match cli.command {
         Command::Search {
             query,

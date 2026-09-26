@@ -1,6 +1,7 @@
 import { mkdtemp, mkdir, readFile, writeFile, rm } from 'fs/promises';
 import { join } from 'path';
 import { tmpdir } from 'os';
+import { fileURLToPath } from 'node:url';
 
 const root = await mkdtemp(join(tmpdir(), 'hstry-gemini-cli-'));
 const source = join(root, '.gemini', 'tmp');
@@ -9,8 +10,9 @@ const fixture = await readFile(new URL('../../testdata/gemini-cli/chats/session-
 await writeFile(join(source, 'chats', 'session-test.jsonl'), fixture);
 
 function request(method, params = {}) {
-  const result = Bun.spawnSync(['bun', 'run', new URL('./adapter.ts', import.meta.url).pathname], {
-    env: { ...process.env, HOME: root, HSTRY_REQUEST: JSON.stringify({ method, params }) },
+  const adapter = fileURLToPath(new URL('./adapter.ts', import.meta.url));
+  const result = Bun.spawnSync(['bun', 'run', adapter], {
+    env: { ...process.env, HOME: root, USERPROFILE: root, HSTRY_REQUEST: JSON.stringify({ method, params }) },
   });
   if (!result.success) throw new Error(result.stderr.toString());
   return JSON.parse(result.stdout.toString());

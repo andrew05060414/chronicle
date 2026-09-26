@@ -10,7 +10,7 @@
 
 ## 30 秒版（可整段粘贴给其他 AI）
 
-Chronicle 是 Andrew 的个人 AI 系统 **Antiochus** 里「历史档案」这一类的部件。Antiochus 是系统总代号（前身叫 Personal AI Assistant）；语音输入常把它识别成「Antigravity」，但 Antigravity 是 Google 的编码 IDE，在这里只是被采集的一个来源。
+Chronicle 是 Andrew 的个人 AI 系统 **Antiochus** 里的历史档案，也是记忆检索的名字和入口。Antiochus 是系统总代号（前身叫 Personal AI Assistant）；语音输入常把它识别成「Antigravity」，但 Antigravity 是 Google 的编码 IDE，在这里只是被采集的一个来源。
 
 Chronicle 是 Andrew 的 **AI 对话原文档案**，不是聊天 App，也不是记忆系统。它把 Cursor / Codex / Claude Code / Antigravity / Pi 等十几个本地工具的对话收进本机 SQLite，再按 `device_id` 推到 NAS hub。抽取、总结、打分是下游的事。
 
@@ -94,14 +94,14 @@ README 的清单：
 
 Andrew 近两个月高强度做的「个人 AI 定制」，2026-09-20 起有了总代号 **Antiochus**，09-26 冻结了 v0.2 设计。Antiochus 分三部分：前台（跟人说话，现任是 ChatGPT 网页）、后台、基础设施。后台分 9 类：1 历史档案、2 长期记忆、3 记忆检索、4 记忆整理、5 任务编排、6 工具箱、7 模型网关、8 安全与权限、9 触发与通知。
 
-只有自己写的或 fork 的部件才起代号，目前只有 **Chronicle**（1 历史档案）和 **Agent Factory**（5 任务编排）。代号只指那个部件，不指整个类别。框架篇、现状篇和 ADR 在 Andrew 的 antiochus 仓库里，以那边为准。
+只有自己写的或 fork 的部件才起代号，目前只有 **Chronicle** 和 **Agent Factory**（5 任务编排）。Chronicle 管 1 历史档案，同时是 3 记忆检索对外的名字和入口，底下的检索引擎是 AgentsView（2026-09-26 Andrew 定；Antiochus 的 ADR-0004 原写「只指聊天记录程序」，以这条为准）。框架篇、现状篇和 ADR 在 Andrew 的 antiochus 仓库里，以那边为准。
 
 对话里反复出现、后来被拆开的东西：
 
 | 名字 | 现在的定位 | 不要当成 |
 |---|---|---|
-| **Chronicle / hstry** | 1 历史档案。对人说的名字和日常入口 | 记忆、日记、任务板 |
-| **AgentsView** | 3 记忆检索的现任（#61 迁移中）。不 fork，只用它公开的 CLI、MCP 和导入格式 | Chronicle 的替代名 |
+| **Chronicle / hstry** | 1 历史档案 + 3 记忆检索的名字和入口 | 记忆、日记、任务板 |
+| **AgentsView** | 3 记忆检索的引擎（#61 迁移中），入口仍叫 Chronicle。不 fork，只用它公开的 CLI、MCP 和导入格式 | Chronicle 的替代名 |
 | **OpenCodex**（`ocx`） | 7 模型网关，唯一网关；也是额度数据的来源 | 档案层 |
 | **9Router** | 被 OpenCodex 替代，逐步下线 | 现行网关 |
 | **Multica** + MCPX | 5 任务编排：MCPX 管计划与授权，Multica 管派发 | 档案层 |
@@ -258,7 +258,7 @@ Andrew 拍板：「我觉得记忆检索总体就叫 Chronicle……相当于只
 | 只 merge「某种格式怎么解析」，不整仓合 agy-reader / cass | archive-model |
 | 日常合上游：功能以 fork 为准，作者更新要能吸进来 | `pass-yawn` 最后一轮 |
 | 未授权不把 issue 报到上游 | `like-gray` 明确没发到 `byteowlz/hstry` |
-| Chronicle 是 Antiochus「1 历史档案」的部件；只有自研或 fork 的部件起代号 | Antiochus ADR-0004（2026-09-26） |
+| Chronicle 是 Antiochus「1 历史档案」的部件，也是「3 记忆检索」的名字和入口；只有自研或 fork 的部件起代号 | Antiochus ADR-0004；2026-09-26 Andrew 补充入口这一条 |
 | 检索、索引、界面、多机汇总交给 AgentsView；Chronicle 保留名字、入口、网页采集、备份配置 | #61（2026-09-26） |
 | 不 fork AgentsView，不写自有备份代码 | #61 |
 | 模型网关用 OpenCodex，9Router 下线 | Antiochus ADR-0005（Proposed） |

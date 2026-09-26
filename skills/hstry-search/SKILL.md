@@ -21,6 +21,7 @@ that command by name.
 hstry search "remembered fact" --json --workspace PROJECT
 hstry search "exact/path/orIdentifier" --mode exact --json
 hstry search "query" --remote MACHINE --json
+hstry search "query" --refresh-local --json
 ```
 
 Auto search routes identifiers through literal matching before disclosed fallbacks.
@@ -28,6 +29,13 @@ Exact is case-sensitive literal-only; regex must be explicit or a reported retry
 Inspect attempts, provenance, filters, truncation, and the best evidence role. Tool
 results can be stronger evidence than assistant narration. Search responses default
 to 3,000 serialized characters. Do not use --raw just to avoid choosing a scope.
+
+Default CLI/MCP search covers local plus the configured hub in parallel when a hub
+is configured. Explicit `--scope` / `scope` and `--remote` / `remote` still win.
+If one side fails, the other side is returned with an explicit coverage warning;
+both failing is an error. CLI `--refresh-local` refreshes only the local
+collection for up to 5s and never pushes remotely; MCP search never writes the
+archive and has no refresh option.
 
 Start with one query, inspect the best few hits, then narrow using identifiers
 found in those hits. Reformulate or widen scope if needed; do not repeatedly rerun

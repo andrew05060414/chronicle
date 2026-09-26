@@ -654,8 +654,12 @@ pub async fn cmd_service(config_path: &Path, command: ServiceCommand) -> Result<
         ServiceCommand::Start => {
             start_service(config_path)?;
         }
-        ServiceCommand::Run => {
-            run_service(config_path).await?;
+        ServiceCommand::Run {
+            http_port,
+            no_http,
+            http_token,
+        } => {
+            run_service(config_path, http_port, no_http, http_token).await?;
         }
         ServiceCommand::Restart => {
             stop_service()?;
@@ -779,6 +783,9 @@ fn terminate_process(pid: u32) -> Result<()> {
 
 #[cfg(unix)]
 fn is_process_running(pid: u32) -> bool {
+    if pid == std::process::id() {
+        return true;
+    }
     use nix::sys::signal::kill;
     use nix::unistd::Pid;
 
@@ -842,6 +849,9 @@ fn tasklist_csv_contains_pid(stdout: &str, pid: u32) -> bool {
 
 #[cfg(windows)]
 fn is_process_running(pid: u32) -> bool {
+    if pid == std::process::id() {
+        return true;
+    }
     use std::os::windows::process::CommandExt;
     use std::process::Command;
 
@@ -934,7 +944,12 @@ fn write_pid_file(pid: u32) -> Result<()> {
     Ok(())
 }
 
-async fn run_service(config_path: &Path) -> Result<()> {
+async fn run_service(
+    config_path: &Path,
+    cli_http_port: Option<u16>,
+    no_http: bool,
+    cli_http_token: Option<String>,
+) -> Result<()> {
     let mut state = ServiceState::load(config_path).await?;
     let server_handle = if state.config.service.search_api {
         Some(
@@ -944,6 +959,28 @@ async fn run_service(config_path: &Path) -> Result<()> {
                 state.db.clone(),
             )
             .await?,
+        )
+    } else {
+        None
+    };
+
+    let http_handle = if !no_http && state.config.service.http_api {
+        let port = cli_http_port
+            .or(state.config.service.http_port)
+            .unwrap_or(3000);
+        let token = cli_http_token
+            .or_else(|| state.config.service.http_token.clone())
+            .or_else(|| std::env::var("HSTRY_API_TOKEN").ok())
+            .filter(|t| !t.is_empty());
+        Some(
+            start_http_api_server(
+                port,
+                Arc::new(state.config.clone()),
+                state.db.clone(),
+                token,
+            )
+            .await?
+            .0,
         )
     } else {
         None
@@ -1006,7 +1043,40 @@ async fn run_service(config_path: &Path) -> Result<()> {
     if let Some(handle) = server_handle {
         handle.abort();
     }
+    if let Some(handle) = http_handle {
+        handle.abort();
+    }
     Ok(())
+}
+
+async fn start_http_api_server(
+    port: u16,
+    config: Arc<Config>,
+    db: Arc<Database>,
+    token: Option<String>,
+) -> Result<(tokio::task::JoinHandle<()>, u16)> {
+    let has_token = token.is_some();
+    let app_state = hstry_api::AppState::new(config, db, token);
+    let (handle, local_addr) = hstry_api::start_http_server(port, app_state)
+        .await
+        .with_context(|| format!("Failed to bind HTTP API server on port {port}"))?;
+
+    let port_path = hstry_core::paths::http_port_path();
+    if let Some(parent) = port_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(&port_path, local_addr.port().to_string());
+
+    println!(
+        "Service listening on http://{local_addr} (HTTP ingest API, auth: {})",
+        if has_token {
+            "token required"
+        } else {
+            "open on loopback"
+        }
+    );
+
+    Ok((handle, local_addr.port()))
 }
 
 async fn start_search_server(
@@ -1163,7 +1233,8 @@ struct ServiceState {
     auto_sync_by_id: HashMap<String, bool>,
     watcher: RecommendedWatcher,
     event_rx: mpsc::Receiver<PathBuf>,
-    last_remote_sync: Instant,
+    last_remote_sync: Option<Instant>,
+    last_remote_sync_failed: bool,
     /// Run expensive workspace discovery infrequently to avoid idle CPU spikes.
     last_workspace_discovery: Instant,
     /// Track when the last event-triggered sync completed to enforce a cooldown.
@@ -1238,9 +1309,10 @@ impl ServiceState {
             auto_sync_by_id,
             watcher,
             event_rx,
-            last_remote_sync: Instant::now(),
+            last_remote_sync: None,
+            last_remote_sync_failed: false,
             last_workspace_discovery: instant_ago(Duration::from_secs(3600)),
-            last_event_sync: instant_ago(Duration::from_secs(300)), // allow immediate first sync
+            last_event_sync: instant_ago(Duration::from_secs(300)), // allow immediate first sync when uptime allows
             source_backoff: HashMap::new(),
             source_quiet_until: HashMap::new(),
             source_schedule: HashMap::new(),
@@ -1467,11 +1539,17 @@ impl ServiceState {
             return Ok(());
         }
 
-        let interval_secs = self.config.sync.auto_sync_interval_secs.max(30);
-        if self.last_remote_sync.elapsed() < Duration::from_secs(interval_secs) {
+        let interval_secs = if self.last_remote_sync_failed {
+            300 // 5-minute fallback on remote sync error
+        } else {
+            self.config.sync.auto_sync_interval_secs.max(60)
+        };
+        if let Some(last) = self.last_remote_sync
+            && last.elapsed() < Duration::from_secs(interval_secs)
+        {
             return Ok(());
         }
-        self.last_remote_sync = Instant::now();
+        self.last_remote_sync = Some(Instant::now());
 
         let direction = match self.config.sync.mode {
             hstry_core::config::SyncMode::Hub => hstry_core::remote::SyncDirection::Pull,
@@ -1489,8 +1567,9 @@ impl ServiceState {
             self.config.remotes.iter().filter(|r| r.enabled).collect()
         };
 
+        let mut any_error = false;
         for remote_config in remotes {
-            let _ = match direction {
+            let res = match direction {
                 hstry_core::remote::SyncDirection::Pull => hstry_core::remote::sync_from_remote(
                     &self.db,
                     remote_config,
@@ -1509,7 +1588,21 @@ impl ServiceState {
                 .map(|_| ()),
                 hstry_core::remote::SyncDirection::Bidirectional => Ok(()),
             };
+
+            if let Err(err) = res {
+                any_error = true;
+                tracing::warn!(remote = %remote_config.name, error = %err, "remote sync failed");
+                let error_msg = err.to_string();
+                if let Err(e) = self
+                    .db
+                    .record_push_error(&remote_config.name, chrono::Utc::now(), &error_msg)
+                    .await
+                {
+                    tracing::error!(error = %e, "failed to record push error in db");
+                }
+            }
         }
+        self.last_remote_sync_failed = any_error;
 
         Ok(())
     }
@@ -1806,6 +1899,35 @@ impl ServiceState {
         Ok(())
     }
 
+    async fn persist_sync_state(
+        &self,
+        source: &Source,
+        pending: bool,
+        error: Option<&str>,
+        ingested_at: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<()> {
+        let Some(mut updated) = self.db.get_source(&source.id).await? else {
+            return Ok(());
+        };
+        let mut config = match updated.config {
+            serde_json::Value::Object(map) => map,
+            _ => serde_json::Map::default(),
+        };
+        let now = chrono::Utc::now().to_rfc3339();
+        config.insert("last_attempt_at".into(), now.into());
+        config.insert("ingest_pending".into(), pending.into());
+        config.insert(
+            "last_ingest_error".into(),
+            error.map_or(serde_json::Value::Null, Into::into),
+        );
+        if let Some(time) = ingested_at {
+            config.insert("last_ingest_at".into(), time.to_rfc3339().into());
+        }
+        updated.config = serde_json::Value::Object(config);
+        self.db.upsert_source(&updated).await?;
+        Ok(())
+    }
+
     async fn sync_one_source(
         &mut self,
         source: &Source,
@@ -1826,6 +1948,8 @@ impl ServiceState {
             None => return Ok(SourceSyncOutcome::Skipped),
         };
         if !source_path.exists() {
+            self.persist_sync_state(source, true, Some("source path missing"), None)
+                .await?;
             return Ok(SourceSyncOutcome::Skipped);
         }
 
@@ -1883,6 +2007,7 @@ impl ServiceState {
             id = source.id,
             adapter = source.adapter
         );
+        self.persist_sync_state(source, true, None, None).await?;
         let sync_fut = sync::sync_source(&self.db, &self.runner, source);
         let outcome_result = if budget_ms > 0 {
             match tokio::time::timeout(Duration::from_millis(budget_ms), sync_fut).await {
@@ -1955,9 +2080,13 @@ impl ServiceState {
                     self.persist_source_fingerprint(source, &fingerprint)
                         .await?;
                 }
+                self.persist_sync_state(source, false, None, Some(chrono::Utc::now()))
+                    .await?;
                 Ok(SourceSyncOutcome::Synced)
             }
             Err(err) => {
+                self.persist_sync_state(source, true, Some(&err.to_string()), None)
+                    .await?;
                 {
                     let mut metrics = self.metrics.lock().await;
                     metrics.syncs_failed += 1;
@@ -2356,5 +2485,120 @@ mod tests {
         assert!(tasklist_csv_contains_pid(stdout, 1234));
         assert!(tasklist_csv_contains_pid(stdout, 1111));
         assert!(!tasklist_csv_contains_pid(stdout, 15));
+    }
+
+    #[tokio::test]
+    async fn http_api_server_starts_and_handles_health() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let db = Arc::new(Database::open(&dir.path().join("service_http.db")).await?);
+        let config = Arc::new(Config::default());
+        let (handle, port) = start_http_api_server(0, config, db, None).await?;
+        let client = reqwest::Client::new();
+        let resp = client
+            .get(format!("http://127.0.0.1:{port}/health"))
+            .send()
+            .await?;
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        let body: serde_json::Value = resp.json().await?;
+        assert_eq!(body["status"], "ok");
+        handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sync_remotes_first_run_immediate_and_fallback_on_error() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let db_path = dir.path().join("service_remote_sync.db");
+        let db = Arc::new(Database::open(&db_path).await?);
+        let source = hstry_core::models::Source {
+            id: "src1".into(),
+            adapter: "pi".into(),
+            path: None,
+            last_sync_at: None,
+            config: serde_json::json!({}),
+        };
+        db.upsert_source(&source).await?;
+
+        let mut config = Config {
+            database: db_path.clone(),
+            ..Default::default()
+        };
+        config.sync.mode = hstry_core::config::SyncMode::Satellite;
+        config.sync.auto_sync = true;
+        config.sync.hub_remote = Some("hub".into());
+        config.remotes.push(hstry_core::config::RemoteConfig {
+            name: "hub".into(),
+            host: "127.0.0.1".into(),
+            port: Some(1), // will fail connection immediately
+            identity_file: None,
+            database_path: None,
+            enabled: true,
+        });
+
+        let (event_tx, event_rx) = mpsc::channel(64);
+        let watcher = build_watcher(event_tx)?;
+        let mut state = ServiceState {
+            config_path: dir.path().join("config.toml"),
+            config,
+            config_mtime: None,
+            db: db.clone(),
+            runner: AdapterRunner::new(
+                Runtime::from_kind(hstry_runtime::RuntimeKind::Node),
+                vec![],
+            ),
+            enabled_adapters: HashSet::new(),
+            auto_sync_by_id: HashMap::new(),
+            watcher,
+            event_rx,
+            last_remote_sync: None,
+            last_remote_sync_failed: false,
+            last_workspace_discovery: instant_ago(Duration::from_secs(3600)),
+            last_event_sync: instant_ago(Duration::from_secs(300)),
+            source_backoff: HashMap::new(),
+            source_quiet_until: HashMap::new(),
+            source_schedule: HashMap::new(),
+            sync_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
+            metrics: Arc::new(tokio::sync::Mutex::new(ServiceMetrics::default())),
+            last_events_compaction: instant_ago(Duration::from_secs(86400)),
+        };
+
+        // 1. Initial state: last_remote_sync is None (first run must be immediate)
+        assert!(state.last_remote_sync.is_none());
+        assert!(!state.last_remote_sync_failed);
+
+        // 2. Run sync_remotes_if_due. Because port 1 is unreachable, sync will fail.
+        let res = state.sync_remotes_if_due().await;
+        assert!(
+            res.is_ok(),
+            "sync_remotes_if_due handles remote errors internally without crashing"
+        );
+
+        // 3. Verify error is persisted and fallback engaged
+        assert!(
+            state.last_remote_sync.is_some(),
+            "last_remote_sync was recorded"
+        );
+        assert!(
+            state.last_remote_sync_failed,
+            "last_remote_sync_failed was flagged on error"
+        );
+
+        // Error persisted in database search state
+        let last_err = db.get_search_state("push_last_error:hub").await?;
+        assert!(last_err.is_some(), "error persisted in search_state");
+
+        // Error persisted in source config
+        let updated_src = db.get_source("src1").await?.unwrap();
+        assert!(updated_src.config.get("last_error").is_some());
+
+        // 4. Second immediate call must be skipped because of 5-minute fallback
+        let prev_sync_time = state.last_remote_sync;
+        state.sync_remotes_if_due().await?;
+        assert_eq!(
+            state.last_remote_sync, prev_sync_time,
+            "remote sync skipped during 5-minute fallback period"
+        );
+
+        Ok(())
     }
 }
